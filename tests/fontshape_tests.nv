@@ -1,0 +1,227 @@
+// fontshape_tests.nv — the line: metrics, kerning, ligatures, and the
+// refusal.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: font-nv.<module>.<fn>`.
+//
+// THE THREE ASSERTIONS THIS SUITE EXISTS FOR:
+//
+//   `hmtx` does NOT have one entry per glyph — a monospaced font
+//   stores exactly one, and every glyph past `numberOfHMetrics` takes
+//   the last advance;
+//
+//   a font with BOTH a `kern` table and a `GPOS` `kern` feature must
+//   use one, and using both makes every line subtly too tight;
+//
+//   a script this package will not lay out is REFUSED, because bad
+//   Arabic looks like text and would ship.
+//
+// THE VECTORS are the OpenType specification's `hmtx` rule and the
+// `ffi` ligature every Latin font carries.
+
+use std.test
+use std.list
+use std.bytes
+use fontmetric
+use fontkern
+use fontgsub
+use fontshape
+use fonterror
+
+// A monospaced font's metrics: 2048 units to the em, one advance in
+// `hmtx` for 300 glyphs.
+fn mono_metrics() -> fontmetric.FontMetrics
+    FontMetrics { units_per_em: 2048, x_min: 0, y_min: 0 - 500, x_max: 1229,
+                  y_max: 1556, num_glyphs: 300, num_h_metrics: 1,
+                  advance_max: 1229, long_loca: false }
+
+// One pair, four advances: the shape of a real `hmtx` for a
+// proportional font.
+fn prop_hmtx() -> Bytes
+    bytes.concat([bytes.u16_be(600), bytes.u16_be(30),
+                  bytes.u16_be(700), bytes.u16_be(40),
+                  bytes.u16_be(25), bytes.u16_be(35)])
+
+@test
+fn test_hmtx_stores_one_advance_for_a_monospaced_font() [io]
+    let m = mono_metrics()
+
+    test.case("THE CLAIM: a fixed-pitch font stores ONE pair, and that is the design")
+    test.assert(fontmetric.is_monospaced(m))
+
+    test.case("glyph 0 and glyph 299 take the SAME advance out of one entry")
+    let hmtx = bytes.concat([bytes.u16_be(1229), bytes.u16_be(0)])
+    test.assert(fontmetric.advance_of(hmtx, 1, 300, 0) == 1229)
+    test.assert(fontmetric.advance_of(hmtx, 1, 300, 299) == 1229)
+
+    test.case("which a reader that indexed hmtx directly would get right ONCE and then not")
+    test.assert(fontmetric.hmtx_len(1, 300) == 602)
+
+    test.case("and a proportional font's later glyphs still take the last pair's advance")
+    test.assert(fontmetric.advance_of(prop_hmtx(), 2, 4, 0) == 600)
+    test.assert(fontmetric.advance_of(prop_hmtx(), 2, 4, 1) == 700)
+    test.assert(fontmetric.advance_of(prop_hmtx(), 2, 4, 3) == 700)
+
+@test
+fn test_a_glyph_past_the_end_answers_rather_than_refuses() [io]
+    test.case("THE CLAIM: h_metrics cannot fail, so it is not a Result to be trapped in")
+    let hm = fontmetric.h_metrics(prop_hmtx(), 2, 4, 9)
+    test.assert(hm.advance == 700)
+    test.assert(hm.lsb == 0)
+
+@test
+fn test_font_units_are_not_pixels_and_the_rounding_happens_once() [io]
+    let m = mono_metrics()
+
+    test.case("THE CLAIM: one em at 16 pixels per em is 16 pixels")
+    test.assert(fontmetric.units_to_px(m, 2048, 16.0) == 16.0)
+
+    test.case("half an em is half of that, unrounded")
+    test.assert(fontmetric.units_to_px(m, 1024, 16.0) == 8.0)
+
+    test.case("and the inverse is the same fact read the other way")
+    test.assert(fontmetric.px_to_units(m, 16.0, 16.0) == 2048)
+
+    test.case("twelve points at 96 dpi is sixteen pixels per em, and the 72 is published")
+    test.assert(fontmetric.ppem_for_points(12.0, 96.0) == 16.0)
+
+@test
+fn test_the_three_ascents_have_no_default_because_the_default_is_the_bug() [io]
+    let hhea = FontHhea { ascender: 1901, descender: 0 - 483, line_gap: 0,
+                          advance_max: 1229, caret_slope_rise: 1, caret_slope_run: 0,
+                          num_h_metrics: 1 }
+    let os2 = FontOs2 { typo_ascender: 1556, typo_descender: 0 - 492, typo_line_gap: 410,
+                        win_ascent: 1901, win_descent: 483, x_height: 1120,
+                        cap_height: 1493, fs_selection: 128, version: 4 }
+
+    test.case("THE CLAIM: the three disagree, and this font disagrees by 345 units")
+    test.assert(fontmetric.ascent_sets_disagree(hhea, os2, 100))
+
+    test.case("hhea's set comes back as the table has it")
+    let a = fontmetric.line_metrics(hhea, os2, FontAscentHhea)
+    test.assert(a.ascent == 1901)
+    test.assert(a.descent == 0 - 483)
+
+    test.case("the typographic set is the designer's, and is different")
+    let b = fontmetric.line_metrics(hhea, os2, FontAscentTypo)
+    test.assert(b.ascent == 1556)
+
+    test.case("usWinDescent is stored POSITIVE and comes back NEGATIVE, once, here")
+    let c = fontmetric.line_metrics(hhea, os2, FontAscentWin)
+    test.assert(c.descent == 0 - 483)
+
+    test.case("and fsSelection bit 7 is the font asking for the typographic set")
+    test.assert(fontmetric.ascent_recommended(os2) == FontAscentTypo)
+
+    test.case("line height uses the already-negative descent, so the sign is spent once")
+    test.assert(fontmetric.line_height(b) == 1556 + 492 + 410)
+
+@test
+fn test_kerning_has_one_source_and_never_two() [io]
+    test.case("THE CLAIM: GPOS wins whenever it has a kern feature, even with a kern table")
+    test.assert(fontkern.kern_source(true, true) == FontKernGpos)
+    test.assert(fontkern.kern_source(true, false) == FontKernGpos)
+
+    test.case("the legacy table is used only when GPOS has nothing for the script")
+    test.assert(fontkern.kern_source(false, true) == FontKernLegacy)
+
+    test.case("and no kerning is a normal answer, not an error — most monospaced fonts")
+    test.assert(fontkern.kern_source(false, false) == FontKernNone)
+
+    test.case("a font with both is REPORTABLE, because that is the double-kerning case")
+    test.assert(fontkern.has_both_sources(true, true))
+    test.assert(fontkern.has_both_sources(true, false) == false)
+
+@test
+fn test_an_unkerned_pair_is_zero_and_not_an_absence() [io]
+    let p = fontkern.no_kerning()
+
+    test.case("THE CLAIM: no adjustment and zero adjustment are one instruction")
+    test.assert(fontkern.pair_value(p, 36, 57) == 0)
+    test.assert(fontkern.kerns_nothing(p))
+    test.assert(fontkern.pair_count(p) == 0)
+
+    test.case("a run answers one value per GAP, so the list is one shorter than the glyphs")
+    let vs = fontkern.run_values(p, [1, 2, 3, 4])
+    test.assert(list.len(vs) == 3)
+
+@test
+fn test_the_gpos_lookup_types_applied_are_named_and_the_rest_refuse() [io]
+    test.case("THE CLAIM: type 2 is pair adjustment and is all this module applies")
+    let ok = fontkern.gpos_lookup_types_covered()
+    test.assert(list.len(ok) == 1)
+    test.assert(ok[0] == 2)
+
+    test.case("and the refused list names mark attachment and the contextual lookups")
+    test.assert(list.len(fontkern.gpos_lookup_types_refused()) >= 7)
+
+    test.case("a lookup type outside the set degrades rather than kills the text")
+    test.assert(fonterror.severity(FontLookupType(0, 4)) == FontDegraded)
+    test.assert(fonterror.is_recoverable(FontLookupType(0, 4)))
+
+@test
+fn test_ligatures_are_off_until_a_caller_asks_for_them() [io]
+    let none = fontgsub.no_substitutions()
+
+    test.case("THE CLAIM: a terminal gets the shaping loop with no liga in it")
+    test.assert(list.len(fontgsub.apply(none, [1, 2, 3])) == 3)
+    test.assert(fontgsub.changes_anything(none, [1, 2, 3]) == false)
+
+    test.case("and the usual set for prose is published rather than applied")
+    test.assert(list.len(fontgsub.default_features()) >= 2)
+
+    test.case("the applied lookup types are 1 and 4, and the list says so")
+    let types = fontgsub.lookup_types_covered()
+    test.assert(list.len(types) == 2)
+    test.assert(types[0] == 1)
+    test.assert(types[1] == 4)
+
+    test.case("everything else refuses by number rather than half-applying a feature")
+    test.assert(list.len(fontgsub.lookup_types_refused()) >= 6)
+
+@test
+fn test_a_ligature_makes_the_cluster_map_the_only_way_back_to_the_text() [io]
+    let ffi = FontLigature { components: [73, 73, 76], glyph: 500 }
+    let p = FontSubstPlan { ligatures: [ffi], singles: [], features: [] }
+
+    test.case("THE CLAIM: three glyphs become one, so the two runs differ in length")
+    test.assert(fontgsub.ligature_len(ffi) == 3)
+    test.assert(list.len(fontgsub.apply(p, [73, 73, 76])) == 1)
+
+    test.case("and the mapping back is one index per OUTPUT glyph, naming the first input")
+    let m = fontgsub.apply_mapped(p, [73, 73, 76])
+    test.assert(list.len(m) == 1)
+    test.assert(m[0] == 0)
+
+    test.case("a longer ligature is tried before a shorter one that shares its start")
+    let fi = FontLigature { components: [73, 76], glyph: 501 }
+    let both = FontSubstPlan { ligatures: [ffi, fi], singles: [], features: [] }
+    let out = fontgsub.apply(both, [73, 73, 76])
+    test.assert(list.len(out) == 1)
+    test.assert(out[0] == 500)
+
+@test
+fn test_a_script_this_package_will_not_lay_out_is_refused_by_name() [io]
+    test.case("THE CLAIM: Latin, Greek and Cyrillic are this pipeline's subject")
+    test.assert(fontshape.is_simple_script(65))
+    test.assert(fontshape.is_simple_script(0x03B1))
+    test.assert(fontshape.is_simple_script(0x0410))
+
+    test.case("Arabic, Devanagari and Thai are HarfBuzz's, and are not approximated")
+    test.assert(fontshape.is_simple_script(0x0627) == false)
+    test.assert(fontshape.is_simple_script(0x0915) == false)
+    test.assert(fontshape.is_simple_script(0x0E01) == false)
+
+    test.case("a mixed string names the FIRST codepoint it cannot lay out")
+    test.assert(fontshape.first_complex("hello") == 0 - 1)
+    test.assert(fontshape.first_complex("hello \u{0627}") == 0x0627)
+
+    test.case("and the refusal is FATAL for that run — there is no partial answer")
+    test.assert(fonterror.severity(FontComplexScript(0x0627)) == FontFatal)
+
+    test.case("right-to-left is ANSWERED so a caller can route, and never reordered here")
+    test.assert(fontshape.is_right_to_left(0x05D0))
+    test.assert(fontshape.is_right_to_left(65) == false)
+
+    test.case("punctuation and digits take latn, because that is the table that always exists")
+    test.assert(fontshape.script_of(32) == fontshape.script_of(65))

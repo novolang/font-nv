@@ -1,0 +1,246 @@
+// fontshape.nv — a line of Latin text, turned into glyphs with
+// positions.  And a refusal for everything else.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// WHAT SHAPING IS HERE.  Four steps, in this order: characters to
+// glyph ids through `cmap`; ligatures and single substitutions through
+// the `GSUB` plan; advances from `hmtx`; pair adjustments from the
+// kerning plan.  That is the whole of what a line of English, French,
+// German, Spanish, Polish, Turkish or Vietnamese needs, and it is what
+// a terminal, a plot label and a static site's heading all want.
+//
+// WHAT IT IS NOT, AND WHY IT REFUSES RATHER THAN APPROXIMATES.
+// Arabic joins letters into four contextual forms and lays out right
+// to left.  Devanagari reorders a vowel sign to the LEFT of the
+// consonant it follows in the string.  Thai stacks marks above and
+// below with no spaces between words.  Hebrew is right to left with
+// point marks.  None of those is this pipeline with more tables — they
+// need reordering, joining state and mark attachment, which is what
+// HarfBuzz is for and what `libharfbuzz-sys` is on the bindings shelf
+// for.
+//
+// So `shape` REFUSES a run containing one, with `FontComplexScript`
+// carrying the codepoint, rather than laying it out left to right in
+// isolated forms.  The difference matters because bad Arabic is not
+// slightly wrong text, it is unreadable text that LOOKS like text — a
+// caller would ship it, and a reader would not be able to say what was
+// wrong beyond "this is nonsense".  A refusal at the call is a bug
+// report; a plausible line is a defect that reaches a user.
+//
+// BIDIRECTIONAL TEXT IS NOT HERE EITHER, and it is not the same
+// omission: the Unicode bidirectional algorithm operates on characters
+// before any font is involved, so it belongs in a `unicode-nv` that
+// the grid does not yet have.  `script_of` names the script so a caller
+// can route; it does not reorder.
+
+use fonterror
+use fontcmap
+use fontgsub
+use fontkern
+use fontmetric
+
+// One glyph, placed.
+//
+// Positions are in FONT UNITS and are relative to the run's own
+// origin, which sits on the baseline at the run's start.  A caller
+// translates by the pen position it chose and scales by
+// `fontmetric.scale_for_px`; nothing here has been rounded, because
+// rounding per glyph is what makes a long line come out the wrong
+// length.
+//
+// `@value`: three integers, held in a list on `FontShaped`.  The list
+// is what the boxed struct holds, which is legal; the struct itself
+// never occupies a `Result`, an optional or a boxed field, which is
+// what SPEC § 14.5 asks.
+pub @value
+struct FontPlaced
+    // The glyph to draw.
+    glyph: Int
+    // Where its origin sits along the baseline, from the run's start.
+    x: Int
+    // The index of the first character of the text this glyph came
+    // from.  A ligature makes the two runs different lengths, so this
+    // is the only way a caret or a selection can be put back where the
+    // user pointed.
+    cluster: Int
+
+// A shaped run.
+//
+// A struct rather than a bare list because the run's own width is a
+// fact about the whole run — the last glyph's advance is part of it —
+// and a caller that summed the placements would leave it out.
+pub struct FontShaped
+    // The glyphs, in visual order, which for this package is always
+    // the logical order.
+    glyphs: [FontPlaced]
+    // The whole run's advance, in font units, including the last
+    // glyph's own.
+    width: Int
+    // How many characters went in, so a caller can see at a glance
+    // that a ligature fired.
+    char_count: Int
+
+// Everything a run needs, gathered once.
+//
+// The value that makes shaping a loop over characters rather than a
+// loop over table lookups.  Building one costs the `cmap` parse and
+// the two plans; using one costs a binary search per character.
+//
+// A struct of the four halves rather than four arguments at every call
+// because a caller that passed a `cmap` from one font and an `hmtx`
+// from another would get silently wrong text, and a single value is
+// harder to mix up than four.
+pub struct FontPlan
+    // The character-to-glyph map.
+    cmap: fontcmap.FontCmap
+    // The substitutions to apply, possibly none.
+    subst: fontgsub.FontSubstPlan
+    // The kerning to apply, possibly none.
+    kern: fontkern.FontKernPlan
+    // The `hmtx` table's bytes, which the advances are read out of
+    // directly — expanding it into a list per font would cost a
+    // megabyte for a CJK font to answer the same question.
+    hmtx: Bytes
+    // The metrics the advances are indexed with.
+    metrics: fontmetric.FontMetrics
+
+// Build a plan from the parts.
+pub fn plan(cmap: fontcmap.FontCmap, subst: fontgsub.FontSubstPlan, kern: fontkern.FontKernPlan,
+            hmtx: Bytes, metrics: fontmetric.FontMetrics) -> FontPlan []
+    todo("font-nv.fontshape.plan")
+
+// ── Shaping ──────────────────────────────────────────────────────────
+
+// Shape a run of text.
+//
+// `FontComplexScript` when the text contains a script this package
+// will not lay out, carrying the first such codepoint — see this
+// module's header for why that is a refusal rather than a best effort.
+//
+// A character the font has no glyph for becomes glyph 0 and is drawn
+// as the font's `.notdef` box, which is `fontcmap.glyph_for`'s rule
+// and not a separate decision here.
+//
+// ```novo ignore
+// match fontshape.shape(plan, "Waffle")
+//     Ok(run)  => println("${run.width} units, ${list.len(run.glyphs)} glyphs")
+//     Err(e)   => println(e.message())
+// ```
+pub fn shape(p: FontPlan, text: Str) -> Result<FontShaped, fonterror.FontFault> []
+    todo("font-nv.fontshape.shape")
+
+// Shape a run already decoded into codepoints.
+//
+// For a caller that has them — a terminal holds codepoints, not a
+// string — and so that the `Str` decoding is not paid twice.
+pub fn shape_codepoints(p: FontPlan,
+                        codepoints: [Int]) -> Result<FontShaped, fonterror.FontFault> []
+    todo("font-nv.fontshape.shape_codepoints")
+
+// The run's advance width in font units, without building the
+// placements.
+//
+// The call a layout engine makes far more often than it draws: fitting
+// a paragraph means measuring every candidate line break, and only the
+// chosen breaks are ever shaped.  Same four steps, and the
+// intermediate list is never built.
+pub fn measure(p: FontPlan, text: Str) -> Result<Int, fonterror.FontFault> []
+    todo("font-nv.fontshape.measure")
+
+// The run's width in pixels at `px` per em, rounded ONCE.
+//
+// The convenience that is correct: a caller that converted each
+// advance and summed them would accumulate the rounding error this
+// avoids, which is visible as a line that overflows its box by a few
+// pixels for no reason a reader can see.
+pub fn measure_px(p: FontPlan, text: Str, px: Float) -> Result<Float, fonterror.FontFault> []
+    todo("font-nv.fontshape.measure_px")
+
+// The longest prefix of the text that fits in `limit` font units.
+//
+// Answers a CHARACTER count, not a glyph count, so a caller can slice
+// its own string with it.  The break is at a character boundary and
+// makes no attempt at word wrapping: line breaking is textwrap-nv's
+// subject, and this is the width question it would ask.
+pub fn fit_prefix(p: FontPlan, text: Str, limit: Int) -> Result<Int, fonterror.FontFault> []
+    todo("font-nv.fontshape.fit_prefix")
+
+// ── Scripts ──────────────────────────────────────────────────────────
+
+// Whether this package will lay out a run containing this codepoint.
+//
+// False for every script that needs reordering, joining or mark
+// attachment.  Published so a caller can route a string to another
+// renderer BEFORE it calls `shape` and has to handle a refusal.
+pub fn is_simple_script(codepoint: Int) -> Bool []
+    todo("font-nv.fontshape.is_simple_script")
+
+// The first codepoint in the text that this package will not lay out,
+// or -1 when there is none.
+//
+// The whole-string form of the check, for a caller sorting a document
+// into runs it can draw and runs it must hand on.
+pub fn first_complex(text: Str) -> Int []
+    todo("font-nv.fontshape.first_complex")
+
+// The OpenType script tag a codepoint belongs to — `latn`, `grek`,
+// `cyrl`, `arab` and the rest.
+//
+// Needed to build the `GSUB` and `GPOS` plans, which are per script,
+// and useful to a caller splitting a mixed string into runs.  Answers
+// `latn` for characters common to every script — spaces, digits,
+// punctuation — because a run of them takes the surrounding script's
+// tables and `latn` is the one that always exists.
+pub fn script_of(codepoint: Int) -> Int []
+    todo("font-nv.fontshape.script_of")
+
+// Whether the codepoint's script is written right to left.
+//
+// Answered so a caller can refuse or route, NOT so this package can
+// reorder: reordering is the Unicode bidirectional algorithm's, it
+// happens before a font is chosen, and doing half of it here would
+// produce text that is correct in one-script strings and wrong in
+// mixed ones.
+pub fn is_right_to_left(codepoint: Int) -> Bool []
+    todo("font-nv.fontshape.is_right_to_left")
+
+// ── Reading a shaped run ─────────────────────────────────────────────
+
+// How many glyphs the run holds.
+pub fn glyph_count(run: FontShaped) -> Int []
+    todo("font-nv.fontshape.glyph_count")
+
+// The `i`-th placed glyph.
+//
+// An index past the end answers a placement whose `glyph` and
+// `cluster` are both -1, rather than an optional — `FontPlaced` is
+// `@value` and SPEC § 14.5 keeps an unboxed struct out of an `?T`
+// payload, so a sentinel is the shape left.  `glyph_count` is the
+// bound a caller should be checking against anyway, and `run.glyphs`
+// is a public field for the caller that would rather index it.
+pub fn placed_at(run: FontShaped, i: Int) -> FontPlaced []
+    todo("font-nv.fontshape.placed_at")
+
+// The glyph index at or before a given x offset, for a caret.
+//
+// -1 when the run is empty.  The x is in font units, so a caller with
+// a mouse position converts it with `fontmetric.px_to_units` first —
+// which is one call rather than a second pixel-flavoured API here.
+pub fn glyph_at_x(run: FontShaped, x: Int) -> Int []
+    todo("font-nv.fontshape.glyph_at_x")
+
+// The character index a glyph came from.
+//
+// The cluster, which is what a selection and a caret are measured in.
+pub fn cluster_at(run: FontShaped, i: Int) -> Int []
+    todo("font-nv.fontshape.cluster_at")
+
+// Whether any ligature fired in this run.
+//
+// True when the glyph count is less than the character count.  Worth
+// a name because it is the condition under which a caller's naive
+// one-glyph-per-character assumption breaks, and a test that asserts
+// it is asserting the feature worked.
+pub fn has_ligature(run: FontShaped) -> Bool []
+    todo("font-nv.fontshape.has_ligature")

@@ -1,0 +1,168 @@
+// fontcmap_tests.nv — the lookup, and the decision it rests on.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: font-nv.<module>.<fn>`.
+//
+// THE ASSERTION THIS SUITE EXISTS FOR: a character the font does not
+// have answers GLYPH 0, not `None`.  Glyph 0 is `.notdef`, it is the
+// box a reader recognises, it has an advance like any other glyph, and
+// answering it is what stops a caller's `match` from silently dropping
+// the character and shortening the line.
+//
+// THE VECTORS are the OpenType specification's own format 4 worked
+// example — segments `[0..=0]`, `[10..=20]`, `[30..=90]`, `[153..=156]`
+// with the 0xFFFF terminator — and the format 12 group encoding.
+
+use std.test
+use std.list
+use fontsrc
+use fontcmap
+use fonterror
+
+// The specification's format 4 example, already parsed: four segments
+// using deltas, with no `idRangeOffset` indirection.
+fn spec_format4() -> fontcmap.FontCmap
+    FontCmap { format: 4,
+               starts: [0, 10, 30, 153, 65535],
+               ends: [0, 20, 90, 156, 65535],
+               deltas: [0, 1, 3, 7, 1],
+               offsets: [0 - 1, 0 - 1, 0 - 1, 0 - 1, 0 - 1],
+               glyph_ids: [],
+               symbol: false }
+
+// A format 12 table covering one astral range, which format 4 cannot
+// reach at all.
+fn astral_format12() -> fontcmap.FontCmap
+    FontCmap { format: 12,
+               starts: [65, 128512],
+               ends: [90, 128591],
+               deltas: [1, 200],
+               offsets: [],
+               glyph_ids: [],
+               symbol: false }
+
+@test
+fn test_a_missing_character_is_glyph_zero_and_never_an_absence() [io]
+    let c = spec_format4()
+
+    test.case("THE CLAIM: a mapped codepoint answers its glyph")
+    test.assert(fontcmap.glyph_for(c, 10) == 11)
+
+    test.case("and an UNMAPPED one answers 0 — .notdef, the box a reader sees")
+    test.assert(fontcmap.glyph_for(c, 25) == 0)
+    test.assert(fontcmap.glyph_for(c, 5) == 0)
+
+    test.case("which is a DIFFERENT question from coverage, and coverage has its own call")
+    test.assert(fontcmap.has_codepoint(c, 10))
+    test.assert(fontcmap.has_codepoint(c, 25) == false)
+
+    test.case("a run answers one glyph per codepoint, zeroes included, so nothing shortens")
+    let gs = fontcmap.glyphs_for(c, [10, 25, 30])
+    test.assert(list.len(gs) == 3)
+    test.assert(gs[1] == 0)
+
+@test
+fn test_the_segments_are_searched_rather_than_expanded() [io]
+    let c = spec_format4()
+
+    test.case("the last segment of a format 4 table is the 0xFFFF terminator")
+    test.assert(fontcmap.max_codepoint(c) == 65535)
+
+    test.case("THE CLAIM: a segment's delta applies across its whole span")
+    test.assert(fontcmap.glyph_for(c, 20) == 21)
+    test.assert(fontcmap.glyph_for(c, 30) == 33)
+    test.assert(fontcmap.glyph_for(c, 90) == 93)
+
+    test.case("a boundary is INCLUSIVE at both ends, which is where an off-by-one hides")
+    test.assert(fontcmap.glyph_for(c, 21) == 0)
+    test.assert(fontcmap.glyph_for(c, 29) == 0)
+
+    test.case("and the coverage comes back as ranges rather than a million questions")
+    let r = fontcmap.covered_ranges(c)
+    test.assert(list.len(r) % 2 == 0)
+    test.assert(list.len(r) >= 8)
+
+@test
+fn test_format_four_cannot_reach_an_emoji_and_says_so() [io]
+    let four = spec_format4()
+    let twelve = astral_format12()
+
+    test.case("THE CLAIM: a format 4 subtable stops at 0xFFFF, by construction")
+    test.assert(fontcmap.covers_astral(four) == false)
+
+    test.case("so an emoji out of a format 4 font is .notdef because of the SUBTABLE")
+    test.assert(fontcmap.glyph_for(four, 128512) == 0)
+
+    test.case("and a format 12 subtable reaches it")
+    test.assert(fontcmap.covers_astral(twelve))
+    test.assert(fontcmap.glyph_for(twelve, 128512) == 200)
+
+    test.case("which is why the preference order puts (3, 10) first")
+    let order = fontcmap.preference_order()
+    test.assert(list.len(order) >= 2)
+    test.assert(order[0] == 3)
+    test.assert(order[1] == 10)
+
+@test
+fn test_the_readable_formats_are_named_and_the_rest_refuse_by_number() [io]
+    test.case("THE CLAIM: 4 and 12, and the list says so rather than a paragraph")
+    let ok = fontcmap.formats_covered()
+    test.assert(list.len(ok) == 2)
+    test.assert(ok[0] == 4)
+    test.assert(ok[1] == 12)
+
+    test.case("the refused set names 0, 2, 6, 8, 10, 13 and 14")
+    let no = fontcmap.formats_refused()
+    test.assert(list.len(no) >= 6)
+
+    test.case("and a subtable in one of them is not readable")
+    let sub = FontCmapSub { platform: 1, encoding: 0, format: 6,
+                            range: fontsrc.range(0, 10) }
+    test.assert(fontcmap.is_readable(sub) == false)
+
+    test.case("while a format 4 Windows BMP subtable is")
+    let ok_sub = FontCmapSub { platform: 3, encoding: 1, format: 4,
+                               range: fontsrc.range(0, 10) }
+    test.assert(fontcmap.is_readable(ok_sub))
+
+@test
+fn test_a_font_with_nothing_readable_refuses_with_a_name() [io]
+    let subs = [
+        FontCmapSub { platform: 1, encoding: 0, format: 0, range: fontsrc.range(0, 262) },
+        FontCmapSub { platform: 3, encoding: 0, format: 6, range: fontsrc.range(262, 40) }]
+
+    test.case("THE CLAIM: nothing usable is a named answer, not an empty map")
+    test.assert(fontcmap.best_subtable(subs) == None)
+
+    test.case("and FontNoUsableCmap is fatal — there is no fallback inside this file")
+    test.assert(fonterror.severity(FontNoUsableCmap) == FontFatal)
+    test.assert(fonterror.is_recoverable(FontNoUsableCmap) == false)
+
+@test
+fn test_a_symbol_subtable_is_looked_up_twice_inside_the_call() [io]
+    let sym = FontCmap { format: 4,
+                         starts: [61440],
+                         ends: [61695],
+                         deltas: [0 - 61439],
+                         offsets: [0 - 1],
+                         glyph_ids: [],
+                         symbol: true }
+
+    test.case("THE CLAIM: a symbol font maps 0xF041, not 0x41 — and the retry is INSIDE")
+    test.assert(fontcmap.glyph_for(sym, 61505) == 66)
+    test.assert(fontcmap.glyph_for(sym, 65) == 66)
+
+    test.case("which a caller that had to know about it would get wrong")
+    test.assert(fontcmap.has_codepoint(sym, 65))
+
+@test
+fn test_the_subtable_ranges_are_file_offsets_and_not_cmap_offsets() [io]
+    let cmap_at = fontsrc.range(5000, 400)
+
+    test.case("THE CLAIM: the conversion happens once, where the table is walked")
+    let list_r = fontcmap.list_range(cmap_at, 3)
+    test.assert(list_r.at == 5004)
+    test.assert(list_r.len == 24)
+
+    test.case("and the header is four bytes, which is the size of the first read")
+    test.assert(fontcmap.header_len() == 4)

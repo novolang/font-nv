@@ -1,0 +1,251 @@
+// fontkern.nv — pair kerning, from `GPOS` or from `kern`, and NEVER
+// from both.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE RULE THIS MODULE EXISTS TO ENFORCE.  A font may carry a legacy
+// `kern` table AND a `GPOS` table with a `kern` feature, and a great
+// many do — the `kern` table for old software, `GPOS` for everything
+// since 1998, with the same pairs in both.  Applying both moves the
+// letters twice, and the result is text that is subtly, consistently
+// too tight: not broken enough to notice, wrong on every line.
+//
+// So `kern_source` answers ONE source, `FontKernPlan` carries which
+// one it chose, and there is no call that reads both.  The rule the
+// OpenType specification gives is that a shaper which applies `GPOS`
+// must ignore `kern` entirely, and it is written here as a value
+// rather than as a paragraph in a README, because a paragraph is
+// something the second implementation does not read.
+//
+// WHAT IS IN SCOPE.  Horizontal pair adjustment for Latin text: the
+// `kern` table's format 0, and `GPOS` lookup type 2 in both its
+// formats — pairs listed one by one, and pairs by class.  Both answer
+// ONE number, the advance adjustment for the left glyph, because that
+// is what pair kerning is and the other five fields of a
+// `ValueRecord` are used by marks and cursive attachment, which are
+// HarfBuzz's subject and not this package's.
+//
+// WHAT IS NOT, AND IS NAMED.  Mark-to-base, mark-to-mark, cursive
+// attachment, contextual positioning, and the device tables that adjust
+// a value per pixel size.  `gpos_lookup_types_covered` lists what is
+// applied and `FontLookupType` carries the number of anything else, so
+// a font that needs more says so instead of coming out unkerned and
+// unexplained.
+
+use fonterror
+
+// Where a font's kerning comes from.
+pub enum FontKernSource
+    // The `GPOS` table's `kern` feature.  Preferred whenever it is
+    // present, even if the font also has a `kern` table.
+    FontKernGpos
+    // The legacy `kern` table, used only when `GPOS` has no `kern`
+    // feature for the script.
+    FontKernLegacy
+    // Neither.  Not an error: most monospaced fonts have no kerning at
+    // all, because a fixed advance is the whole point.
+    FontKernNone
+
+// One pair and the adjustment between them, in font units.
+//
+// `@value`: three integers, held in LISTS and looked up.  A list of
+// unboxed structs is a legal field of a boxed struct and a legal
+// argument; what SPEC § 14.5 refuses is the struct ITSELF in a
+// `Result`, an optional or a boxed field, and on this toolchain a
+// `Result<[FontKernPair], _>` as well — see `FontKernTable`.
+pub @value
+struct FontKernPair
+    // The glyph on the left.
+    left: Int
+    // The glyph on the right.
+    right: Int
+    // How much to add to the left glyph's advance.  NEGATIVE for the
+    // pairs that matter — `AV`, `To`, `Yo` all pull together — so a
+    // reader that treated it as a gap would push them apart.
+    value: Int
+
+// The legacy `kern` table, read.
+//
+// A struct around the pair list rather than a bare `[FontKernPair]`,
+// and the reason is a language constraint worth stating: a `@value`
+// struct may not be a `Result` payload, and on this toolchain that
+// extends to a LIST of them — `Result<[FontKernPair], FontFault>` is
+// `E2015`.  So a fallible read of `@value` records answers a boxed
+// wrapper, which is the shape `docs/publishing.md` describes for a
+// fallible codec over unboxed values.
+//
+// The wrapper earns its place rather than only satisfying the
+// compiler: which header the table used and how many subtables were
+// skipped are facts a font validator wants and a bare list has
+// nowhere to put.
+pub struct FontKernTable
+    // The pairs from every horizontal format 0 subtable, in the order
+    // they were read.
+    pairs: [FontKernPair]
+    // Whether the table used Apple's header rather than Microsoft's.
+    is_apple: Bool
+    // How many subtables the header declared.
+    subtable_count: Int
+    // How many were skipped as vertical, cross-stream, or in a format
+    // this module does not read.  Non-zero is not an error; it is the
+    // number a report should mention.
+    skipped: Int
+
+// The decision, made once and carried.
+//
+// Built by `plan` from what the face has, and passed to `pair_value`
+// for every pair in a run — which is what keeps the choice from being
+// re-made, and differently, per character.
+pub struct FontKernPlan
+    // Which table the values come from.
+    source: FontKernSource
+    // The pairs, when the source is the legacy table or a
+    // pair-by-pair `GPOS` lookup: sorted by (left, right) so a lookup
+    // is a binary search.
+    pairs: [FontKernPair]
+    // Class assignments for the left glyph, when the source is a
+    // class-based `GPOS` lookup: one class per glyph id, 0 for "not in
+    // any class".
+    left_classes: [Int]
+    // Class assignments for the right glyph.
+    right_classes: [Int]
+    // The class matrix, `left_class_count * right_class_count` values
+    // in row-major order.  Empty when the plan is pair-by-pair.
+    class_values: [Int]
+    // How many right-hand classes there are, which is the matrix's row
+    // stride.
+    right_class_count: Int
+
+// ── Choosing a source ────────────────────────────────────────────────
+
+// Which source the face should use.
+//
+// `GPOS` when it carries a `kern` feature for the script, the legacy
+// table when it does not, nothing when neither.  The whole of the
+// double-kerning rule, in one call.
+pub fn kern_source(has_gpos_kern: Bool, has_kern_table: Bool) -> FontKernSource []
+    todo("font-nv.fontkern.kern_source")
+
+// Whether the face would kern twice if both tables were applied.
+//
+// True when a font has both.  Published so a font validator can report
+// it and a renderer can log it — the situation is common, legal, and
+// the reason this module has a plan rather than two readers.
+pub fn has_both_sources(has_gpos_kern: Bool, has_kern_table: Bool) -> Bool []
+    todo("font-nv.fontkern.has_both_sources")
+
+// ── The legacy `kern` table ──────────────────────────────────────────
+
+// How many subtables the `kern` header declares.
+//
+// The table has TWO incompatible headers — Apple's and Microsoft's —
+// distinguished by the version word, and a reader that assumes one
+// reads the other's subtable count out of the middle of a length
+// field.
+pub fn kern_subtable_count(data: Bytes) -> Int []
+    todo("font-nv.fontkern.kern_subtable_count")
+
+// Whether the `kern` table uses Apple's header rather than
+// Microsoft's.
+pub fn kern_is_apple(data: Bytes) -> Bool []
+    todo("font-nv.fontkern.kern_is_apple")
+
+// Every pair in the `kern` table's horizontal format 0 subtables.
+//
+// Vertical and cross-stream subtables are skipped rather than
+// refused: a font that carries them is not broken, and a horizontal
+// renderer has no use for them.
+pub fn kern_pairs(data: Bytes) -> Result<FontKernTable, fonterror.FontFault> []
+    todo("font-nv.fontkern.kern_pairs")
+
+// ── `GPOS` ───────────────────────────────────────────────────────────
+
+// The `GPOS` lookup types this module applies.
+//
+// `[2]`: pair adjustment, in both its formats.  A list rather than a
+// constant so it reads the same way as `fontgsub`'s and so an
+// assertion can compare the two.
+pub fn gpos_lookup_types_covered() -> [Int] []
+    todo("font-nv.fontkern.gpos_lookup_types_covered")
+
+// The `GPOS` lookup types it does not, and what each one is for.
+//
+// 1 single adjustment, 3 cursive attachment, 4 mark-to-base, 5
+// mark-to-ligature, 6 mark-to-mark, 7 contextual, 8 chained
+// contextual, 9 extension.  Every one of them is needed by a script
+// this package already refuses to shape, which is why the two
+// refusals are stated together rather than separately.
+pub fn gpos_lookup_types_refused() -> [Int] []
+    todo("font-nv.fontkern.gpos_lookup_types_refused")
+
+// Whether `GPOS` has a `kern` feature for a script and language.
+//
+// `script` and `language` are four-byte tags — `fontdir.tag_of("latn")`
+// builds one — and a language of 0 means the script's default.
+pub fn gpos_has_kern(gpos: Bytes, script: Int, language: Int) -> Bool []
+    todo("font-nv.fontkern.gpos_has_kern")
+
+// The scripts `GPOS` declares, as tags.
+//
+// For a caller choosing a font for a language, and for a report that
+// wants to say what a font supports rather than guessing from its
+// name.
+pub fn gpos_scripts(gpos: Bytes) -> [Int] []
+    todo("font-nv.fontkern.gpos_scripts")
+
+// ── The plan ─────────────────────────────────────────────────────────
+
+// Build the plan from whichever tables the face has.
+//
+// `gpos` and `kern` are the tables' bytes, either of which may be
+// empty; `script` and `language` are tags.  The source is decided
+// inside, once, and is then a field a caller can read and assert on.
+pub fn plan(gpos: Bytes, kern: Bytes, script: Int,
+            language: Int) -> Result<FontKernPlan, fonterror.FontFault> []
+    todo("font-nv.fontkern.plan")
+
+// A plan that kerns nothing.
+//
+// For a monospaced font, and for a caller that wants kerning off
+// without a second code path: `pair_value` on this answers 0 for every
+// pair, so the shaping loop stays one loop.
+pub fn no_kerning() -> FontKernPlan []
+    todo("font-nv.fontkern.no_kerning")
+
+// The adjustment between two glyphs, in font units.
+//
+// 0 when the pair is not kerned, which is most pairs.  A plain `Int`
+// rather than an optional for the same reason `fontcmap.glyph_for`
+// answers 0: "no adjustment" and "zero adjustment" are the same
+// instruction to a renderer, and a signature that distinguished them
+// would make every call site write a `??` that means nothing.
+//
+// ```novo
+// use fontkern
+//
+// fn main() [io]
+//     let p = fontkern.no_kerning()
+//     println("${fontkern.pair_value(p, 36, 57)}")      // 0
+// ```
+pub fn pair_value(p: FontKernPlan, left: Int, right: Int) -> Int []
+    todo("font-nv.fontkern.pair_value")
+
+// Every adjustment along a run, one per gap.
+//
+// `glyphs.len - 1` values, so index `i` is the adjustment between
+// glyph `i` and glyph `i + 1`, and a caller adds it to glyph `i`'s
+// advance.  One pass with the search position carried, which is what
+// makes a line cheaper than its pairs looked up separately.
+pub fn run_values(p: FontKernPlan, glyphs: [Int]) -> [Int] []
+    todo("font-nv.fontkern.run_values")
+
+// How many pairs the plan can adjust.
+//
+// For a report, and for the test that says a font's kerning was
+// actually read rather than silently emptied.
+pub fn pair_count(p: FontKernPlan) -> Int []
+    todo("font-nv.fontkern.pair_count")
+
+// Whether the plan adjusts anything at all.
+pub fn kerns_nothing(p: FontKernPlan) -> Bool []
+    todo("font-nv.fontkern.kerns_nothing")

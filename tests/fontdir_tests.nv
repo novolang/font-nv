@@ -1,0 +1,213 @@
+// fontdir_tests.nv — the index: magics, tags, ranges and the two
+// checksums.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: font-nv.<module>.<fn>`.
+//
+// THE VECTORS are the OpenType specification's own: the four sfnt
+// version words, the tag encoding, and the 12 + 16n offset table
+// arithmetic.  `ttf-parser`'s own test fonts are built the same way —
+// a directory in front of the tables it names — so a font assembled
+// here byte by byte is the same fixture its suite uses.
+
+use std.test
+use std.list
+use std.bytes
+use fontsrc
+use fontdir
+use fonterror
+
+// A face with three tables at made-up but consistent offsets, which is
+// what every assertion below looks up in.
+fn face_of() -> fontdir.FontFace
+    let tables = [
+        FontTable { tag: fontdir.tag_of("cmap"), checksum: 0,
+                    range: fontsrc.range(200, 100) },
+        FontTable { tag: fontdir.tag_of("glyf"), checksum: 0,
+                    range: fontsrc.range(300, 900) },
+        FontTable { tag: fontdir.tag_of("head"), checksum: 0,
+                    range: fontsrc.range(100, 54) }]
+    FontFace { sfnt: 65536, index: 0, face_count: 1, tables: tables }
+
+@test
+fn test_the_offset_table_is_twelve_bytes_and_the_directory_sixteen_each() [io]
+    test.case("THE CLAIM: a reader knows both read sizes before it reads")
+    test.assert(fontdir.header_len() == 12)
+
+    test.case("and the directory is sixteen bytes per table")
+    test.assert(fontdir.directory_len(1) == 16)
+    test.assert(fontdir.directory_len(12) == 192)
+
+    test.case("the header range starts at zero, because a face's own start is added later")
+    let h = fontdir.header_range()
+    test.assert(h.at == 0)
+    test.assert(h.len == 12)
+
+    test.case("and the directory follows an offset table at a given offset")
+    let d = fontdir.directory_range(0, 3)
+    test.assert(d.at == 12)
+    test.assert(d.len == 48)
+
+@test
+fn test_the_four_magics_are_accepted_and_type_one_is_not() [io]
+    test.case("0x00010000 is TrueType outlines")
+    test.assert(fontdir.is_sfnt(bytes.from_byte_list([0, 1, 0, 0])))
+
+    test.case("OTTO is CFF outlines")
+    test.assert(fontdir.is_sfnt(bytes.from_str("OTTO")))
+
+    test.case("true is Apple's older spelling of the first, and is accepted")
+    test.assert(fontdir.is_sfnt(bytes.from_str("true")))
+
+    test.case("ttcf is a collection")
+    test.assert(fontdir.is_sfnt(bytes.from_str("ttcf")))
+
+    test.case("typ1 is sfnt-wrapped Type 1 and is NOT read")
+    test.assert(fontdir.is_sfnt(bytes.from_str("typ1")) == false)
+
+    test.case("and neither is a zip file that happens to be handed over")
+    test.assert(fontdir.is_sfnt(bytes.from_str("PK\u{3}\u{4}")) == false)
+
+@test
+fn test_the_flavour_decides_which_module_reads_the_glyphs() [io]
+    test.case("0x00010000 and true both mean glyf")
+    test.assert(fontdir.flavour_of(65536) == FontOutlinesGlyf)
+    test.assert(fontdir.flavour_of(fontdir.tag_of("true")) == FontOutlinesGlyf)
+
+    test.case("OTTO means CFF")
+    test.assert(fontdir.flavour_of(fontdir.tag_of("OTTO")) == FontOutlinesCff)
+
+    test.case("ttcf is not a face at all")
+    test.assert(fontdir.flavour_of(fontdir.tag_of("ttcf")) == FontOutlinesCollection)
+
+@test
+fn test_a_tag_is_four_bytes_big_endian_and_the_spaces_are_part_of_it() [io]
+    test.case("THE CLAIM: cmap is 0x636D6170")
+    test.assert(fontdir.tag_of("cmap") == 1668112752)
+    test.assert(fontdir.tag(99, 109, 97, 112) == 1668112752)
+
+    test.case("and the round trip through tag_name is the identity")
+    test.assert(fontdir.tag_name(fontdir.tag_of("head")) == "head")
+
+    test.case("CFF's trailing SPACE is part of the tag, which a hand-written compare loses")
+    test.assert(fontdir.tag_cff() == fontdir.tag_of("CFF "))
+    test.assert(fontdir.tag_cff() != fontdir.tag_of("CFF"))
+
+    test.case("and OS/2's slash is part of it too")
+    test.assert(fontdir.tag_os2() == fontdir.tag_of("OS/2"))
+
+    test.case("a name that is not four bytes is 0, which no table uses")
+    test.assert(fontdir.tag_of("cmapx") == 0)
+    test.assert(fontdir.tag_of("") == 0)
+
+@test
+fn test_the_named_tags_are_the_tags_they_name() [io]
+    test.case("every convenience tag agrees with its spelling")
+    test.assert(fontdir.tag_head() == fontdir.tag_of("head"))
+    test.assert(fontdir.tag_hhea() == fontdir.tag_of("hhea"))
+    test.assert(fontdir.tag_hmtx() == fontdir.tag_of("hmtx"))
+    test.assert(fontdir.tag_maxp() == fontdir.tag_of("maxp"))
+    test.assert(fontdir.tag_cmap() == fontdir.tag_of("cmap"))
+    test.assert(fontdir.tag_loca() == fontdir.tag_of("loca"))
+    test.assert(fontdir.tag_glyf() == fontdir.tag_of("glyf"))
+    test.assert(fontdir.tag_kern() == fontdir.tag_of("kern"))
+    test.assert(fontdir.tag_gpos() == fontdir.tag_of("GPOS"))
+    test.assert(fontdir.tag_gsub() == fontdir.tag_of("GSUB"))
+
+@test
+fn test_a_lookup_answers_a_range_and_a_missing_table_answers_nothing() [io]
+    let face = face_of()
+
+    test.case("THE CLAIM: a face is an index, and a lookup is a range")
+    match fontdir.table_range(face, fontdir.tag_glyf())
+        Some(r) =>
+            test.assert(r.at == 300)
+            test.assert(r.len == 900)
+        None    => test.assert(false)
+
+    test.case("a table the font does not have is nothing, not an empty range")
+    test.assert(fontdir.table_range(face, fontdir.tag_kern()) == None)
+    test.assert(fontdir.has_table(face, fontdir.tag_kern()) == false)
+    test.assert(fontdir.has_table(face, fontdir.tag_cmap()))
+
+    test.case("and the directory reports its own size and order")
+    test.assert(fontdir.table_count(face) == 3)
+    test.assert(list.len(fontdir.table_tags(face)) == 3)
+
+@test
+fn test_a_directory_pointing_past_the_end_is_caught_before_anything_is_read() [io]
+    let face = face_of()
+
+    test.case("THE CLAIM: one whole-file check, not one per table")
+    test.assert(fontdir.ranges_fit(face, 1200))
+
+    test.case("a file truncated by one byte fails it")
+    test.assert(fontdir.ranges_fit(face, 1199) == false)
+
+    test.case("which is what a half-finished download looks like from inside")
+    test.assert(fontdir.ranges_fit(face, 12) == false)
+
+@test
+fn test_the_required_tables_are_named_rather_than_one_refusal() [io]
+    let face = face_of()
+
+    test.case("a glyf font needs head, hhea, hmtx, maxp, cmap, loca and glyf")
+    let req = fontdir.required_tags(FontOutlinesGlyf)
+    test.assert(list.len(req) >= 7)
+
+    test.case("a CFF font needs CFF and NOT loca, which is the difference")
+    let reqc = fontdir.required_tags(FontOutlinesCff)
+    test.assert(list.len(reqc) >= 5)
+
+    test.case("THE CLAIM: a subset font names every table it lost, not just the first")
+    let missing = fontdir.missing_required(face)
+    test.assert(list.len(missing) >= 3)
+
+@test
+fn test_the_tables_a_text_run_needs_are_published_for_one_fetch() [io]
+    test.case("THE CLAIM: a caller with an expensive source asks once")
+    let tags = fontdir.tags_for_text()
+    test.assert(list.len(tags) >= 4)
+
+    test.case("and cmap and hmtx are in it, because a run cannot be laid out without them")
+    test.assert(list.contains(tags, fontdir.tag_cmap()))
+    test.assert(list.contains(tags, fontdir.tag_hmtx()))
+
+@test
+fn test_a_collection_is_read_by_index_and_refuses_past_the_end() [io]
+    let head = bytes.concat([bytes.from_str("ttcf"), bytes.u32_be(0x00010000),
+                             bytes.u32_be(2), bytes.u32_be(12), bytes.u32_be(1000)])
+
+    test.case("THE CLAIM: a ttcf header says how many faces before any is opened")
+    test.assert(fontdir.is_collection(head))
+    test.assert(fontdir.collection_faces(head) == 2)
+
+    test.case("the header's own range grows by four bytes per face")
+    let r = fontdir.collection_header_range(2)
+    test.assert(r.len == 20)
+
+    test.case("face 0 begins where the header says")
+    match fontdir.collection_face_at(head, 0)
+        Ok(at) => test.assert(at == 12)
+        Err(_) => test.assert(false)
+
+    test.case("and face 4 of 2 is a refusal carrying BOTH numbers")
+    match fontdir.collection_face_at(head, 4)
+        Ok(_)  => test.assert(false)
+        Err(e) =>
+            test.assert(fonterror.severity(e) == FontFatal)
+            test.assert(e.message() != "")
+
+@test
+fn test_the_head_table_is_the_checksum_exception_every_font_trips() [io]
+    test.case("THE CLAIM: an sfnt checksum is a sum of big-endian words")
+    test.assert(fontdir.checksum(bytes.from_byte_list([0, 0, 0, 1])) == 1)
+    test.assert(fontdir.checksum(bytes.from_byte_list([0, 0, 0, 1, 0, 0, 0, 2])) == 3)
+
+    test.case("a trailing partial word is zero-padded rather than dropped")
+    test.assert(fontdir.checksum(bytes.from_byte_list([0, 0, 1])) == 256)
+
+    test.case("and head excludes its own checkSumAdjustment, or every font fails")
+    let head_tbl = FontTable { tag: fontdir.tag_head(), checksum: 0,
+                               range: fontsrc.range(0, 8) }
+    test.assert(fontdir.checksum_matches(head_tbl, bytes.from_byte_list([0, 0, 0, 0, 9, 9, 9, 9])))

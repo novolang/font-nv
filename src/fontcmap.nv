@@ -1,0 +1,224 @@
+// fontcmap.nv — `cmap`: characters in, glyph ids out.  Formats 4 and
+// 12, and a named refusal for the rest.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE DECISION THIS MODULE IS BUILT ON: `glyph_for` ANSWERS AN `Int`,
+// NEVER AN OPTIONAL, AND 0 MEANS `.notdef`.
+//
+// A `cmap` lookup that finds nothing is not an error and is not an
+// absence — it is the font saying "I have a glyph for that, and it is
+// the box".  Glyph 0 is `.notdef` in every conformant font, it is the
+// hollow rectangle a reader recognises as a missing character, and it
+// has an advance width like any other glyph so the line it is in still
+// measures correctly.
+//
+// An `?Int` would invite the three lines every caller writes next —
+// `match g { None => continue, Some(g) => draw(g) }` — and a `continue`
+// there is text silently shortened: the missing character vanishes, the
+// line comes out narrower than the layout reserved, and nothing in the
+// output says a character was dropped.  Answering 0 makes the visible
+// failure the default and the deliberate skip the thing a caller has to
+// write, which is the right way round.
+//
+// `has_codepoint` exists for the caller that genuinely is asking about
+// coverage — a font picker choosing between four fallbacks — and that
+// is a different question from "what do I draw".
+//
+// WHICH SUBTABLE, AND WHY IT IS PICKED RATHER THAN MERGED.  A `cmap`
+// holds several subtables for several platform encodings, and they do
+// not agree: a symbol font's (3, 0) subtable maps `U+F041`, not `A`.
+// `best_subtable` picks ONE by a published order and the pick is
+// visible in the value, because a renderer that merged them would
+// answer a different glyph depending on which font it read.
+
+use fonterror
+use fontsrc
+
+// One row of the `cmap` header: a platform, an encoding, and where
+// that subtable lives.
+//
+// The format is read from the subtable's own first two bytes, so it is
+// here too — it is the field `best_subtable` sorts on, and reading it
+// costs two bytes the caller has already fetched.
+pub struct FontCmapSub
+    // Platform: 0 Unicode, 1 Macintosh, 3 Windows.
+    platform: Int
+    // Encoding, whose meaning depends on the platform.  (3, 1) is
+    // Windows BMP, (3, 10) is Windows full Unicode, (3, 0) is Windows
+    // symbol, (0, x) is Unicode.
+    encoding: Int
+    // The subtable's format: 0, 2, 4, 6, 8, 10, 12, 13 or 14.  Only 4
+    // and 12 are read.
+    format: Int
+    // Where the subtable lives, relative to the FILE.
+    range: fontsrc.FontRange
+
+// A subtable parsed into something that can be looked up.
+//
+// Holds the format's own arrays rather than a map: a format 4 subtable
+// for a 200-glyph font is a few hundred bytes of segments and expanding
+// it into a codepoint-keyed map would cost a megabyte to answer the
+// same questions no faster.  A lookup is a binary search over
+// `starts`, which is what the format was designed for.
+pub struct FontCmap
+    // 4 or 12.
+    format: Int
+    // Segment or group start codepoints, ascending.
+    starts: [Int]
+    // Segment or group end codepoints, inclusive, ascending.
+    ends: [Int]
+    // Per segment: the delta (format 4) or the first glyph id
+    // (format 12).
+    deltas: [Int]
+    // Format 4's `idRangeOffset` indirection, resolved into an index
+    // into `glyph_ids`; -1 where the segment uses its delta instead.
+    // Format 12 leaves it empty.
+    offsets: [Int]
+    // Format 4's `glyphIdArray`, flattened.  Empty for format 12.
+    glyph_ids: [Int]
+    // Whether this came from a (3, 0) symbol subtable, which changes
+    // how a codepoint is looked up — see `glyph_for`.
+    symbol: Bool
+
+// How many bytes the `cmap` header needs before the subtable list can
+// be walked: 4.
+pub fn header_len() -> Int []
+    todo("font-nv.fontcmap.header_len")
+
+// How many subtables the `cmap` header declares.
+pub fn subtable_count(head: Bytes) -> Int []
+    todo("font-nv.fontcmap.subtable_count")
+
+// The range of the whole subtable list, given the count.
+pub fn list_range(cmap: fontsrc.FontRange, n: Int) -> fontsrc.FontRange []
+    todo("font-nv.fontcmap.list_range")
+
+// Every subtable the `cmap` declares, in the order the file wrote
+// them.
+//
+// `cmap` is the range the table occupies in the file, so the ranges
+// that come back are file offsets and not `cmap`-relative ones — the
+// conversion that every `cmap` reader gets wrong once.
+pub fn subtables(data: Bytes,
+                 cmap: fontsrc.FontRange) -> Result<[FontCmapSub], fonterror.FontFault> []
+    todo("font-nv.fontcmap.subtables")
+
+// The subtable to use, by the published preference order.
+//
+// (3, 10) full Unicode, then (0, 4) and (0, 6) full Unicode, then
+// (3, 1) Windows BMP, then (0, 3) and (0, 1) BMP, then (3, 0) symbol,
+// then nothing.  Among equals the LAST is taken, because a font that
+// carries two of one encoding has usually appended the corrected one.
+//
+// The order is published as `preference_order` rather than only
+// applied, because a caller that disagrees — a tool that wants the Mac
+// Roman subtable specifically — needs to see what it is overriding.
+pub fn best_subtable(subs: [FontCmapSub]) -> ?FontCmapSub []
+    todo("font-nv.fontcmap.best_subtable")
+
+// The preference order, as (platform, encoding) pairs flattened into
+// one list of even length, best first.
+pub fn preference_order() -> [Int] []
+    todo("font-nv.fontcmap.preference_order")
+
+// Whether this package can read the subtable's format.
+//
+// True for 4 and 12.  Asked before `parse_subtable` by a caller that
+// would rather try the next subtable than handle a refusal.
+pub fn is_readable(sub: FontCmapSub) -> Bool []
+    todo("font-nv.fontcmap.is_readable")
+
+// The subtable formats this package reads.
+pub fn formats_covered() -> [Int] []
+    todo("font-nv.fontcmap.formats_covered")
+
+// The subtable formats it refuses, and which are worth adding.
+//
+// 0 and 6 are single-byte and trimmed tables from before Unicode, 2 is
+// the mixed-width CJK legacy encodings, 8 and 10 are formats no
+// shipped font uses, 13 is many-to-one (a last-resort font), and 14 is
+// variation selectors — the one on this list a text renderer will
+// eventually want, and the README says so rather than leaving it as an
+// omission.
+pub fn formats_refused() -> [Int] []
+    todo("font-nv.fontcmap.formats_refused")
+
+// Parse one subtable into a lookup.
+//
+// `data` is the subtable's own bytes — `sub.range` says which they
+// are.  `FontCmapFormat` when the format is not 4 or 12, carrying the
+// number, so a caller can try the next subtable by name.
+pub fn parse_subtable(data: Bytes, sub: FontCmapSub) -> Result<FontCmap, fonterror.FontFault> []
+    todo("font-nv.fontcmap.parse_subtable")
+
+// ── Lookup ───────────────────────────────────────────────────────────
+
+// The glyph a codepoint maps to, or 0 for `.notdef`.
+//
+// Never an optional.  See this module's header for the argument; the
+// short form is that a missing character should draw a box, and a
+// signature that makes skipping it the easy path produces text that is
+// silently short.
+//
+// A symbol subtable is looked up twice: the codepoint as given, and
+// then `0xF000 + (codepoint & 0xFF)`, which is where a symbol font
+// actually puts its glyphs.  The retry is inside this call because a
+// caller that had to know about it would get it wrong, and because
+// `sub.symbol` is already recorded on the value.
+//
+// ```novo
+// use fontcmap
+//
+// fn main() [io]
+//     let c = FontCmap { format: 4, starts: [], ends: [], deltas: [],
+//                        offsets: [], glyph_ids: [], symbol: false }
+//     println("${fontcmap.glyph_for(c, 65)}")
+// ```
+pub fn glyph_for(c: FontCmap, codepoint: Int) -> Int []
+    todo("font-nv.fontcmap.glyph_for")
+
+// Whether the font has a glyph for the codepoint at all.
+//
+// The coverage question, which is a different question from "what do I
+// draw" and has its own call so neither is answered with the other.  A
+// font picker walking four fallbacks asks this; a renderer does not.
+pub fn has_codepoint(c: FontCmap, codepoint: Int) -> Bool []
+    todo("font-nv.fontcmap.has_codepoint")
+
+// Glyph ids for a whole run, one per codepoint, zeroes included.
+//
+// The call a shaper makes.  One pass over the segments with the
+// search position carried between characters, which is what makes a
+// run cheaper than the same number of separate lookups on the text
+// people actually set.
+pub fn glyphs_for(c: FontCmap, codepoints: [Int]) -> [Int] []
+    todo("font-nv.fontcmap.glyphs_for")
+
+// How many codepoints the subtable maps.
+pub fn mapped_count(c: FontCmap) -> Int []
+    todo("font-nv.fontcmap.mapped_count")
+
+// The codepoint ranges the subtable covers, as start/end pairs
+// flattened into one list of even length.
+//
+// For a font picker or a subsetter that wants to report coverage
+// without asking about a million codepoints one at a time.
+pub fn covered_ranges(c: FontCmap) -> [Int] []
+    todo("font-nv.fontcmap.covered_ranges")
+
+// The highest codepoint the subtable maps.
+//
+// 0xFFFF at most for a format 4 table, which is how a caller sees that
+// a font has no astral coverage without walking the ranges.
+pub fn max_codepoint(c: FontCmap) -> Int []
+    todo("font-nv.fontcmap.max_codepoint")
+
+// Whether the subtable can map anything outside the Basic Multilingual
+// Plane.
+//
+// False for every format 4 table.  The check a caller makes before
+// deciding that an emoji rendered as `.notdef` is the font's fault
+// rather than the subtable's.
+pub fn covers_astral(c: FontCmap) -> Bool []
+    todo("font-nv.fontcmap.covers_astral")

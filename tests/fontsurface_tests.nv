@@ -1,0 +1,301 @@
+// fontsurface_tests.nv — every entry point, named once, with the types
+// it declares.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: font-nv.<module>.<fn>`.
+//
+// WHAT THIS SUITE IS FOR, WHICH IS NOT COVERAGE FOR ITS OWN SAKE.  An
+// interface package's claim is that the signatures COMPOSE: that the
+// value one call answers is the value the next one takes, with no
+// conversion the author forgot to publish.  A suite that reaches every
+// entry point with the types the package itself produces is the only
+// way to check that before a body exists — and the check bites, because
+// a missing accessor or a type that cannot be constructed from outside
+// is a compile error here rather than a discovery in the first
+// consumer.
+//
+// It is also the smoke test the implementation inherits: the day
+// `todo()` comes out of `fontdir.header_len`, the first assertion here
+// starts answering, and the file becomes a walk through the whole
+// package in the order a reader would use it.
+
+use std.test
+use std.list
+use std.bytes
+use fontsrc
+use fontdir
+use fontmetric
+use fontcmap
+use fontglyf
+use fontcff
+use fontkern
+use fontgsub
+use fontshape
+use fontread
+use fonterror
+
+// Four bytes that open like a TrueType font and are followed by
+// nothing, which is what every parser here is handed.
+fn stub_file() -> Bytes
+    bytes.concat([bytes.u32_be(0x00010000), bytes.u16_be(0), bytes.u16_be(0),
+                  bytes.u16_be(0), bytes.u16_be(0)])
+
+fn stub_face() -> fontdir.FontFace
+    FontFace { sfnt: 65536, index: 0, face_count: 1, tables: [] }
+
+fn stub_metrics() -> fontmetric.FontMetrics
+    FontMetrics { units_per_em: 1000, x_min: 0, y_min: 0, x_max: 1000, y_max: 1000,
+                  num_glyphs: 1, num_h_metrics: 1, advance_max: 500, long_loca: false }
+
+@test
+fn test_the_range_arithmetic_is_reachable_and_composes() [io]
+    let r = fontsrc.range(100, 40)
+
+    test.case("a range knows where it ends without the caller adding")
+    test.assert(fontsrc.range_end(r) == 140)
+
+    test.case("and whether it fits a file, which is the check before every seek")
+    test.assert(fontsrc.range_fits(r, 200))
+    test.assert(fontsrc.range_fits(r, 139) == false)
+
+    test.case("`enough` and `short` are the pair every parser opens with")
+    test.assert(fontsrc.enough(40, 40))
+    test.assert(fontsrc.enough(39, 40) == false)
+    test.assert(fonterror.fault_table(fontsrc.short(fontdir.tag_head(), 54, 12))
+                == fontdir.tag_head())
+
+    test.case("slicing a file the caller holds is the other end of the same type")
+    test.assert(bytes.len(fontsrc.slice(stub_file(), fontsrc.range(0, 4))) == 4)
+
+    test.case("and a fault describes itself in one line a person reads")
+    test.assert(fonterror.describe(FontNotSfnt(0)) != "")
+
+@test
+fn test_the_directory_is_parsed_from_bytes_the_caller_read() [io]
+    test.case("the table count comes out of the first twelve bytes")
+    test.assert(fontdir.table_count_of(stub_file()) == 0)
+
+    test.case("and the directory parses into a face whose flavour is readable")
+    match fontdir.parse_directory(stub_file(), 0)
+        Err(_) => test.assert(false)
+        Ok(f)  =>
+            test.assert(fontdir.flavour(f) == FontOutlinesGlyf)
+            test.assert(fontdir.table_at(f, 0) == None)
+
+@test
+fn test_the_four_metric_tables_parse_into_the_one_value_a_layout_takes() [io]
+    let d = stub_file()
+
+    test.case("head, hhea and maxp each answer their own struct")
+    match fontmetric.parse_head(d)
+        Err(_) => test.assert(true)
+        Ok(h)  =>
+            test.assert(h.units_per_em > 0)
+            test.assert(fontmetric.head_flag(h, 0) == fontmetric.head_flag(h, 0))
+
+    match fontmetric.parse_hhea(d)
+        Err(_) => test.assert(true)
+        Ok(hh) => test.assert(fontmetric.descender_sign_is_wrong(hh) == false)
+
+    match fontmetric.parse_maxp(d)
+        Err(_) => test.assert(true)
+        Ok(mx) => test.assert(mx.num_glyphs >= 0)
+
+    test.case("OS/2 is optional, and its version decides which fields exist")
+    match fontmetric.parse_os2(d)
+        Err(_) => test.assert(true)
+        Ok(o)  =>
+            test.assert(fontmetric.has_x_height(o) == fontmetric.has_x_height(o))
+            test.assert(fontmetric.has_cap_height(o) == fontmetric.has_cap_height(o))
+
+@test
+fn test_the_two_style_claims_are_compared_rather_than_one_being_trusted() [io]
+    let head = FontHead { units_per_em: 1000, x_min: 0, y_min: 0, x_max: 1000,
+                          y_max: 1000, flags: 0, mac_style: 1, index_to_loc_format: 0,
+                          lowest_rec_ppem: 8 }
+    let os2 = FontOs2 { typo_ascender: 800, typo_descender: 0 - 200, typo_line_gap: 0,
+                        win_ascent: 800, win_descent: 200, x_height: 0, cap_height: 0,
+                        fs_selection: 64, version: 0 }
+
+    test.case("THE CLAIM: head says bold and OS/2 says regular, and both are published")
+    test.assert(fontmetric.style_disagrees(head, os2))
+
+@test
+fn test_the_pixel_transform_is_a_matrix_and_a_box() [io]
+    let m = stub_metrics()
+
+    test.case("the units-to-pixels transform is a value the caller applies")
+    test.assert(geomxform.is_identity(fontmetric.scale_for_px(m, 16.0)) == false)
+
+    test.case("and the y-up form exists for a caller whose space already grows up")
+    test.assert(geomxform.is_identity(fontmetric.scale_for_px_y_up(m, 16.0)) == false)
+
+    test.case("the design box in pixels is what an atlas allocator sizes a cell from")
+    test.assert(geomrect.width(fontmetric.px_bounds(m, 16.0)) >= 0.0)
+
+@test
+fn test_the_cmap_walk_is_reachable_from_the_table_bytes() [io]
+    let cmap_at = fontsrc.range(0, 4)
+
+    test.case("the subtable count comes out of the header")
+    test.assert(fontcmap.subtable_count(stub_file()) >= 0)
+
+    test.case("and the list parses into subtables whose ranges are file offsets")
+    match fontcmap.subtables(stub_file(), cmap_at)
+        Err(_) => test.assert(true)
+        Ok(ss) => test.assert(list.len(ss) >= 0)
+
+    test.case("a subtable parses into a lookup that knows how much it maps")
+    let sub = FontCmapSub { platform: 3, encoding: 1, format: 4,
+                            range: fontsrc.range(0, 8) }
+    match fontcmap.parse_subtable(stub_file(), sub)
+        Err(_) => test.assert(true)
+        Ok(c)  => test.assert(fontcmap.mapped_count(c) >= 0)
+
+@test
+fn test_the_cff_half_is_reachable_from_the_table_range() [io]
+    let table = fontsrc.range(0, 12)
+
+    test.case("the top DICT gives the charstrings INDEX and the two subroutine sets")
+    match fontcff.parse_top(stub_file(), table)
+        Err(_) => test.assert(true)
+        Ok(t)  =>
+            test.assert(fontcff.glyph_count(t, stub_file()) >= 0)
+            test.assert(fontcff.charstring_range(stub_file(), t, 0) == None)
+
+            test.case("and a charstring answers a path and a width separately")
+            match fontcff.charstring_outline(stub_file(), stub_file(), t, 0)
+                Err(_) => test.assert(true)
+                Ok(p)  => test.assert(svgpath.command_count(p) >= 0)
+            test.assert(fontcff.charstring_width(stub_file(), t).explicit == false)
+
+    test.case("a dry run says whether a glyph would draw, before anything is built")
+    test.assert(fontcff.is_interpretable(stub_file()) == false)
+
+@test
+fn test_the_kerning_tables_are_reachable_and_the_plan_is_built_once() [io]
+    let d = stub_file()
+
+    test.case("the legacy table's two headers are told apart before it is read")
+    test.assert(fontkern.kern_subtable_count(d) >= 0)
+    test.assert(fontkern.kern_is_apple(d) == false)
+
+    test.case("and its pairs come back inside a value that also says what was skipped")
+    match fontkern.kern_pairs(d)
+        Err(_) => test.assert(true)
+        Ok(t)  => test.assert(t.skipped >= 0)
+
+    test.case("GPOS answers which scripts it has and whether one of them kerns")
+    test.assert(list.len(fontkern.gpos_scripts(d)) >= 0)
+    test.assert(fontkern.gpos_has_kern(d, fontdir.tag_of("latn"), 0) == false)
+
+    test.case("and the plan is the one place the source is chosen")
+    match fontkern.plan(d, d, fontdir.tag_of("latn"), 0)
+        Err(_) => test.assert(true)
+        Ok(p)  => test.assert(p.source == FontKernNone)
+
+@test
+fn test_the_gsub_half_is_reachable_and_reports_what_a_font_offers() [io]
+    let d = stub_file()
+    let latn = fontdir.tag_of("latn")
+
+    test.case("a font's scripts and features are readable before anything is applied")
+    test.assert(list.len(fontgsub.scripts_present(d)) >= 0)
+    test.assert(list.len(fontgsub.features_present(d, latn, 0)) >= 0)
+    test.assert(fontgsub.has_feature(d, latn, 0, fontdir.tag_of("liga")) == false)
+
+    test.case("and the plan is built from the features the CALLER named")
+    match fontgsub.plan(d, latn, 0, fontgsub.default_features())
+        Err(_) => test.assert(true)
+        Ok(p)  => test.assert(list.len(fontgsub.singles(p)) >= 0)
+
+@test
+fn test_a_plan_composes_out_of_the_four_halves_and_measures_a_run() [io]
+    let p = fontshape.plan(FontCmap { format: 4, starts: [], ends: [], deltas: [],
+                                      offsets: [], glyph_ids: [], symbol: false },
+                           fontgsub.no_substitutions(),
+                           fontkern.no_kerning(),
+                           stub_file(),
+                           stub_metrics())
+
+    test.case("THE CLAIM: the four halves make ONE value, so they cannot be mixed up")
+    match fontshape.shape_codepoints(p, [65, 66])
+        Err(_)  => test.assert(true)
+        Ok(run) =>
+            test.assert(fontshape.glyph_count(run) >= 0)
+            test.assert(fontshape.has_ligature(run) == false)
+            test.assert(fontshape.placed_at(run, 99).glyph == 0 - 1)
+            test.assert(fontshape.glyph_at_x(run, 0) >= 0 - 1)
+            test.assert(fontshape.cluster_at(run, 0) >= 0 - 1)
+
+    test.case("measuring is a separate call because a layout measures far more than it draws")
+    match fontshape.measure(p, "hello")
+        Err(_) => test.assert(true)
+        Ok(w)  => test.assert(w >= 0)
+
+    test.case("and the pixel form rounds ONCE, which is why it exists at all")
+    match fontshape.measure_px(p, "hello", 16.0)
+        Err(_) => test.assert(true)
+        Ok(w)  => test.assert(w >= 0.0)
+
+    test.case("a prefix that fits is answered in CHARACTERS, so a caller can slice its own string")
+    match fontshape.fit_prefix(p, "hello", 1000)
+        Err(_) => test.assert(true)
+        Ok(n)  => test.assert(n >= 0)
+
+@test
+fn test_every_effect_polymorphic_loop_costs_nothing_over_a_buffer() [io]
+    // THE CLAIM THIS TEST IS FOR: `FontBuffer` implements `FontSource[]`,
+    // so every function below is called from a `[io]` test with NO
+    // effect of its own — the same code that costs `[io, fs]` over a
+    // `File` costs nothing here, which is what the effect parameter buys.
+    let src = fontread.buffer(stub_file())
+
+    test.case("the face and the face count")
+    match fontread.read_face(src, 0)
+        Err(_) => test.assert(true)
+        Ok(f)  => test.assert(fontdir.table_count(f) >= 0)
+    match fontread.read_face_count(src)
+        Err(_) => test.assert(true)
+        Ok(n)  => test.assert(n >= 1)
+
+    let face = stub_face()
+
+    test.case("one table, and several in one pass")
+    match fontread.read_table(src, face, fontdir.tag_cmap())
+        Err(_) => test.assert(true)
+        Ok(b)  => test.assert(bytes.len(b) >= 0)
+    match fontread.read_tables(src, face, fontdir.tags_for_text())
+        Err(_) => test.assert(true)
+        Ok(bs) => test.assert(list.len(bs) >= 0)
+
+    test.case("the metrics, the cmap and the loca, each a dependent read")
+    match fontread.read_metrics(src, face)
+        Err(_) => test.assert(true)
+        Ok(m)  => test.assert(m.units_per_em >= 0)
+    match fontread.read_cmap(src, face)
+        Err(_) => test.assert(true)
+        Ok(c)  => test.assert(c.format == 4 or c.format == 12)
+    match fontread.read_loca(src, face, stub_metrics())
+        Err(_) => test.assert(true)
+        Ok(l)  => test.assert(fontglyf.loca_glyph_count(l) >= 0)
+
+    test.case("one outline and many, with the composite recursion inside")
+    let loca = FontLoca { offsets: [0, 0], long_format: false }
+    match fontread.read_outline(src, face, loca, 0)
+        Err(_) => test.assert(true)
+        Ok(p)  => test.assert(svgpath.command_count(p) >= 0)
+    match fontread.read_outlines(src, face, loca, [0])
+        Err(_) => test.assert(true)
+        Ok(ps) => test.assert(list.len(ps) >= 0)
+
+    test.case("and the three plan reads, which are the calls a consumer actually makes")
+    match fontread.read_plan(src, face, fontdir.tag_of("latn"), [])
+        Err(_) => test.assert(true)
+        Ok(pl) => test.assert(pl.metrics.units_per_em >= 0)
+    match fontread.read_subst(src, face, fontdir.tag_of("latn"), 0, [])
+        Err(_) => test.assert(true)
+        Ok(s)  => test.assert(list.len(s.features) >= 0)
+    match fontread.read_kerning(src, face, fontdir.tag_of("latn"), 0)
+        Err(_) => test.assert(true)
+        Ok(k)  => test.assert(fontkern.pair_count(k) >= 0)

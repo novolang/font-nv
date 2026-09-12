@@ -1,0 +1,233 @@
+// fontread.nv — the loops, written once, over whatever the host can
+// read with.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// EVERY FUNCTION HERE IS EFFECT-POLYMORPHIC, and that is the whole
+// module.  `S: FontSource[e]` binds the effect parameter of this
+// package's own trait (`fontsrc`), and every clause is `[e]`, so the
+// row means "whatever the impl behind `S` supplies": `[io, fs]` when
+// the source is a `File`, nothing at all when it is a buffer the
+// caller already holds.  The package has named no effect of its own
+// and stays `core` either way (SPEC § 5.6, and `docs/publishing.md`
+// § Design, third shape).
+//
+// WHY THESE LOOPS ARE IN THE PACKAGE AND NOT IN THE README.  Each one
+// is a sequence of dependent reads where the SECOND read's offset
+// comes out of the first read's bytes:
+//
+//   the offset table says how many tables, so the directory's length
+//   is not known until the first twelve bytes are in;
+//
+//   `head.indexToLocFormat` says how wide `loca`'s entries are, so
+//   `loca` cannot be parsed before `head` has been read;
+//
+//   `loca` says where the glyph is, so the glyph cannot be read until
+//   `loca` has;
+//
+//   and a composite glyph names components whose records are found the
+//   same way, recursively.
+//
+// Written out by a caller, that is twenty lines with four places to
+// get an offset base wrong, repeated in every consumer.  Written here,
+// it is one function each and the consumer writes the four-line impl
+// of `FontSource` instead.
+//
+// A CALLER THAT HOLDS THE WHOLE FILE PAYS NOTHING FOR THIS.  A
+// `FontSource` over a `Bytes` is `fontsrc.slice` with an `Ok` around
+// it, its effect row is empty, and these functions are then ordinary
+// pure calls — the same code, charged nothing.
+
+use fonterror
+use fontsrc
+use fontdir
+use fontmetric
+use fontcmap
+use fontglyf
+use fontgsub
+use fontkern
+use fontshape
+use svgpath
+
+// Read a face's table directory.
+//
+// Two reads for a plain font — the twelve-byte offset table, then the
+// directory whose length it declares — and three for a collection,
+// where the first read is the `ttcf` header and `index` selects the
+// face.
+//
+// `FontNoSuchFace` when the index is past the end of a collection,
+// carrying both numbers.  A non-zero `index` on a file that is not a
+// collection is the same fault with a count of 1, rather than a
+// silently ignored argument.
+//
+// ```novo ignore
+// fn open_font(path: Str) -> Result<FontFace, FontFault> [io, fs]
+//     match File.open_read(path)
+//         None    => Err(FontSourceFailed("not found"))
+//         Some(f) => fontread.read_face(FontFile { handle: f }, 0)
+// ```
+pub fn read_face<S: FontSource[e]>(src: S,
+                                   index: Int) -> Result<fontdir.FontFace, fonterror.FontFault> [e]
+    todo("font-nv.fontread.read_face")
+
+// How many faces the file holds.
+//
+// One read.  For a font manager listing a `.ttc` before it opens any
+// of them.
+pub fn read_face_count<S: FontSource[e]>(src: S) -> Result<Int, fonterror.FontFault> [e]
+    todo("font-nv.fontread.read_face_count")
+
+// Read one whole table by tag.
+//
+// `FontNoTable` when the directory has no entry — which is the answer
+// for `kern` in most fonts and for `GPOS` in old ones.  A refusal
+// rather than an empty `Bytes`, because "the font has no kerning" and
+// "the font has an empty kern table" are different facts and a caller
+// reporting on a font needs both.
+pub fn read_table<S: FontSource[e]>(src: S, face: fontdir.FontFace,
+                                    tag: Int) -> Result<Bytes, fonterror.FontFault> [e]
+    todo("font-nv.fontread.read_table")
+
+// Read several tables, in the order the tags are given.
+//
+// For the caller whose source charges per request — an HTTP range
+// reader, a flash controller — where four separate asks are four round
+// trips.  A missing table is an EMPTY `Bytes` in its slot rather than
+// a refusal, because the common use is "read what is there";
+// `fontdir.has_table` is how a caller asks the other question.
+pub fn read_tables<S: FontSource[e]>(src: S, face: fontdir.FontFace,
+                                     tags: [Int]) -> Result<[Bytes], fonterror.FontFault> [e]
+    todo("font-nv.fontread.read_tables")
+
+// Read `head`, `hhea` and `maxp` and gather the metrics.
+//
+// Three reads, and the value every other call needs.  `FontNoTable`
+// naming whichever is missing, because a font without `head` is not a
+// font and a caller deserves to be told which one it was.
+pub fn read_metrics<S: FontSource[e]>(src: S,
+                                      face: fontdir.FontFace) -> Result<fontmetric.FontMetrics, fonterror.FontFault> [e]
+    todo("font-nv.fontread.read_metrics")
+
+// Read `cmap` and parse the subtable `fontcmap.best_subtable` picks.
+//
+// Two reads: the header and subtable list, then the one subtable.  The
+// rest of the table — the Mac Roman subtable, the symbol subtable a
+// Unicode font also carries — is never fetched, which on a large font
+// is most of the table.
+//
+// `FontNoUsableCmap` when nothing in the list is format 4 or 12.
+pub fn read_cmap<S: FontSource[e]>(src: S,
+                                   face: fontdir.FontFace) -> Result<fontcmap.FontCmap, fonterror.FontFault> [e]
+    todo("font-nv.fontread.read_cmap")
+
+// Read `loca`, having first read `head` for its format.
+//
+// The dependent pair this module exists for: `loca`'s entries are two
+// bytes or four depending on a field in a different table, and a
+// `loca` read with the wrong width parses as noise rather than
+// failing.
+pub fn read_loca<S: FontSource[e]>(src: S, face: fontdir.FontFace,
+                                   m: fontmetric.FontMetrics) -> Result<fontglyf.FontLoca, fonterror.FontFault> [e]
+    todo("font-nv.fontread.read_loca")
+
+// Read one glyph's outline, following composites to their components.
+//
+// The loop: `loca` says where the record is, the record says whether
+// it is simple or composite, and a composite's components are read the
+// same way to `fontglyf.component_limit` and no further.
+//
+// The path is in FONT UNITS.  `fontmetric.scale_for_px` is the
+// transform to pixels, and the two are separate calls because a
+// rasteriser caches an outline per glyph and applies a transform per
+// size — see the README's § Font units are not pixels.
+//
+// Reads exactly the glyph records it needs: one for a simple glyph,
+// one plus its components for a composite.  Nothing else in `glyf` is
+// touched, which is why a terminal can draw ASCII out of a CJK font
+// without reading twenty megabytes.
+pub fn read_outline<S: FontSource[e]>(src: S, face: fontdir.FontFace, loca: fontglyf.FontLoca,
+                                      glyph: Int) -> Result<svgpath.SvgPath, fonterror.FontFault> [e]
+    todo("font-nv.fontread.read_outline")
+
+// Read several glyphs' outlines in one pass.
+//
+// The call an atlas builder makes: a terminal wants the 95 printable
+// ASCII glyphs and wants them without 95 round trips.  Reads are
+// sorted by file offset inside, so a source that charges for a seek
+// pays for one forward pass rather than a random walk.
+pub fn read_outlines<S: FontSource[e]>(src: S, face: fontdir.FontFace, loca: fontglyf.FontLoca,
+                                       glyphs: [Int]) -> Result<[svgpath.SvgPath], fonterror.FontFault> [e]
+    todo("font-nv.fontread.read_outlines")
+
+// Read the four tables a Latin run needs and build the shaping plan.
+//
+// `cmap`, `hmtx`, and whichever of `GPOS` and `kern` the font has,
+// with the double-kerning rule already applied by
+// `fontkern.kern_source`.  `features` is the `GSUB` feature list to
+// apply — `fontgsub.default_features` for prose, an empty list for a
+// terminal — and `GSUB` is only read when the list is non-empty.
+//
+// THE ONE CALL A CONSUMER USUALLY WANTS, and the reason the four
+// halves are a single value: a plan built from one font's `cmap` and
+// another's `hmtx` produces text that is wrong in a way nothing
+// reports.
+pub fn read_plan<S: FontSource[e]>(src: S, face: fontdir.FontFace, script: Int,
+                                   features: [Int]) -> Result<fontshape.FontPlan, fonterror.FontFault> [e]
+    todo("font-nv.fontread.read_plan")
+
+// Read the `GSUB` plan alone.
+//
+// For a caller that already has the rest and is changing only which
+// features are on — a text editor toggling small capitals.
+pub fn read_subst<S: FontSource[e]>(src: S, face: fontdir.FontFace, script: Int, language: Int,
+                                    features: [Int]) -> Result<fontgsub.FontSubstPlan, fonterror.FontFault> [e]
+    todo("font-nv.fontread.read_subst")
+
+// Read the kerning plan alone, choosing its one source.
+//
+// Reads `GPOS` first, and reads `kern` ONLY when `GPOS` has no `kern`
+// feature for the script — so the double-kerning rule saves a read as
+// well as a mistake.
+pub fn read_kerning<S: FontSource[e]>(src: S, face: fontdir.FontFace, script: Int,
+                                      language: Int) -> Result<fontkern.FontKernPlan, fonterror.FontFault> [e]
+    todo("font-nv.fontread.read_kerning")
+
+// ── For a caller that holds the whole file ───────────────────────────
+
+// A `FontSource` over a buffer the caller already has.
+//
+// The other end of the trait, and the one that costs nothing: its
+// `font_bytes` is `fontsrc.slice` with an `Ok` around it and its
+// effect row is empty, so every function above becomes a pure call.
+//
+// Published so that the common case — a font read into memory at
+// startup, which is what a terminal and a plot renderer both do — does
+// not have to write an impl to use a package built around not needing
+// the file.
+pub struct FontBuffer
+    // The whole font file.
+    bytes: Bytes
+
+// Wrap a buffer as a source.
+//
+// ```novo ignore
+// let src = fontread.buffer(file_bytes)
+// let face = fontread.read_face(src, 0)!
+// ```
+pub fn buffer(bytes: Bytes) -> FontBuffer []
+    todo("font-nv.fontread.buffer")
+
+// Reading a buffer costs nothing, which is what the empty row says.
+//
+// ```novo
+// use fontread
+// use bytes
+//
+// fn main() [io]
+//     let src = fontread.buffer(bytes.from_str(""))
+//     println("${bytes.len(src.bytes)}")      // 0
+// ```
+impl FontSource[] for FontBuffer
+    fn font_bytes(self, r: fontsrc.FontRange) -> Result<Bytes, fonterror.FontFault> []
+        todo("font-nv.fontread.buffer_bytes")

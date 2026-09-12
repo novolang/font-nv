@@ -1,0 +1,72 @@
+[package]
+name        = "font-nv"
+version     = "0.0.1"
+description = "TrueType and OpenType read as an INDEX rather than a file: the table directory answers byte RANGES, `FontSource[e]` is the trait the host implements, and shaping a line of Latin text touches four tables out of twenty.  Glyph outlines come back as svg-nv paths in FONT UNITS with the pixel transform named separately; `cmap` answers glyph 0 for a character the font lacks rather than an optional; kerning has ONE source and never two.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`.  A font file is bytes somebody else read, and everything this
+# package does to them is arithmetic: a directory lookup, a binary
+# search, a quadratic curve, an advance width.  Nothing is opened and
+# nothing is written.
+#
+# The one place that could have gone the other way is answered with a
+# trait rather than an effect: a font is INDEXED, so the interesting
+# reader is the one that asks for byte ranges as it needs them, and a
+# `core` package may not perform a read.  `fontsrc.FontSource[e]` is
+# that seam — the package declares the trait, the host implements it
+# over a file, a socket or a buffer it already holds, and
+# `fontsrc.read_face` binds the trait's effect parameter and is charged
+# exactly what the caller's source costs (`docs/publishing.md` § How a
+# `core` package takes a stream from its host, third shape).
+layer       = "core"
+
+category    = "graphics"
+
+tags        = ["font", "truetype", "opentype", "sfnt", "glyph", "outline", "cmap", "kerning", "shaping", "sans-io"]
+repository  = "https://github.com/novolang/font-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "A font read as an index, and an outline that is not yet a picture"
+
+[dependencies]
+# geometry-nv, for the transform and the rectangle.
+#
+# A glyph's bounding box is a rectangle, the composite-glyph component
+# record IS a 2x3 affine matrix, and turning font units into pixels is
+# one more of those.  `GeomXform` is already the grid's affine matrix
+# and `GeomRectF` its rectangle, so declaring a second pair here would
+# put two incompatible matrices in one program — which
+# `docs/publishing.md` § Public type names are globally unique says is
+# not a style question but an `E2004` in the consumer.
+geometry-nv = "^0.0.1"
+
+# svg-nv, for `SvgPath` and `SvgPathCmd` — and the reason is the same
+# one, with a finding attached.
+#
+# A glyph outline is a path: move, line, quadratic, close.  The plan's
+# own note for this row says "geometry-nv path commands", and
+# geometry-nv HAS NO PATH TYPE — it stops at `GeomPoly`, a closed list
+# of points, which cannot hold a curve at all.  The only typed path on
+# the grid is svg-nv's, it has the `SvgQuadTo` variant TrueType needs
+# with the control point kept exact, and svg-nv is `core` with
+# geometry-nv under it.
+#
+# So outlines are `SvgPath`, and the README's § Where the path type
+# belongs says plainly that this dependency is the wrong shape for the
+# right reason: a rasteriser and a font reader should not both be
+# downloading an XML writer to agree on four curve commands.  Moving
+# `SvgPath` into geometry-nv and leaving svg-nv to re-export it is a
+# one-package change that this row would take the day it lands.
+svg-nv = "^0.0.1"

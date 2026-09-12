@@ -1,0 +1,181 @@
+// fontglyf_tests.nv — `loca`, `glyf`, and the two things a first
+// implementation gets wrong.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: font-nv.<module>.<fn>`.
+//
+// THE TWO ASSERTIONS THIS SUITE EXISTS FOR:
+//
+//   `loca`'s entries are TWO bytes or FOUR depending on a field in a
+//   DIFFERENT table, and a short `loca` read as long gives every glyph
+//   the wrong offset — which parses as noise rather than failing.
+//
+//   a composite glyph is ANSWERED, not followed, because following it
+//   means reading, and reading is the host's half.
+//
+// THE VECTORS are `ttf-parser`'s own fixture shape: a `loca` built by
+// hand beside a `glyf` whose records are at the offsets it names.
+
+use std.test
+use std.list
+use std.bytes
+use fontsrc
+use fontglyf
+use fonterror
+use svgpath
+
+// Short `loca` for four glyphs: the format stores HALVES of the real
+// offsets, so 0, 32, 32, 100 on disk means 0, 64, 64, 200 in `glyf` —
+// and glyph 1 is empty because its two entries are equal.
+fn short_loca() -> Bytes
+    bytes.from_byte_list([0, 0, 0, 32, 0, 32, 0, 50, 0, 100])
+
+// The same four glyphs as 32-bit offsets, where the numbers are the
+// offsets themselves.
+fn long_loca() -> Bytes
+    bytes.concat([bytes.u32_be(0), bytes.u32_be(64), bytes.u32_be(64),
+                  bytes.u32_be(100), bytes.u32_be(200)])
+
+@test
+fn test_the_loca_width_comes_from_head_and_halving_is_not_optional() [io]
+    test.case("THE CLAIM: a short loca stores HALF the offset")
+    match fontglyf.parse_loca(short_loca(), 4, false)
+        Err(_) => test.assert(false)
+        Ok(l)  =>
+            test.assert(l.long_format == false)
+            test.assert(fontglyf.loca_glyph_count(l) == 4)
+            match fontglyf.glyph_range(l, 0)
+                Some(r) => test.assert(r.len == 64)
+                None    => test.assert(false)
+
+    test.case("and a long loca stores it whole")
+    match fontglyf.parse_loca(long_loca(), 4, true)
+        Err(_) => test.assert(false)
+        Ok(l)  =>
+            test.assert(l.long_format)
+            match fontglyf.glyph_range(l, 0)
+                Some(r) => test.assert(r.len == 64)
+                None    => test.assert(false)
+
+    test.case("the two tables are DIFFERENT LENGTHS, which is how a guess would work")
+    test.assert(fontglyf.loca_len(4, false) == 10)
+    test.assert(fontglyf.loca_len(4, true) == 20)
+
+@test
+fn test_an_empty_glyph_is_a_space_and_not_a_failure() [io]
+    match fontglyf.parse_loca(short_loca(), 4, false)
+        Err(_) => test.assert(false)
+        Ok(l)  =>
+            test.case("THE CLAIM: two equal loca entries mean the glyph has no outline")
+            match fontglyf.glyph_range(l, 1)
+                Some(r) =>
+                    test.assert(r.len == 0)
+                    test.assert(fontsrc.is_empty(r))
+                None    => test.assert(false)
+
+            test.case("which is how every font in the world spells a space")
+            test.assert(fontglyf.glyph_kind(bytes.from_str("")) == FontGlyphEmpty)
+
+            test.case("and a glyph id past the end is nothing, not an empty range")
+            test.assert(fontglyf.glyph_range(l, 9) == None)
+
+@test
+fn test_a_glyph_range_is_glyf_relative_until_it_is_asked_to_be_a_file_offset() [io]
+    let glyf = fontsrc.range(10000, 5000)
+    match fontglyf.parse_loca(long_loca(), 4, true)
+        Err(_) => test.assert(false)
+        Ok(l)  =>
+            test.case("THE CLAIM: loca's own numbers start at glyf, not at the file")
+            match fontglyf.glyph_range(l, 3)
+                Some(r) => test.assert(r.at == 100)
+                None    => test.assert(false)
+
+            test.case("and the file-offset form is a separate call, so the base is never guessed")
+            match fontglyf.glyph_file_range(l, glyf, 3)
+                Some(r) =>
+                    test.assert(r.at == 10100)
+                    test.assert(r.len == 100)
+                None    => test.assert(false)
+
+@test
+fn test_a_negative_contour_count_is_a_composite_and_says_so_in_two_bytes() [io]
+    let simple = bytes.concat([bytes.u16_be(2), bytes.u16_be(0), bytes.u16_be(0),
+                               bytes.u16_be(100), bytes.u16_be(200)])
+    let composite = bytes.concat([bytes.from_byte_list([255, 255]), bytes.u16_be(0),
+                                  bytes.u16_be(0), bytes.u16_be(100), bytes.u16_be(200)])
+
+    test.case("THE CLAIM: the first two bytes decide, before anything is parsed")
+    test.assert(fontglyf.glyph_kind(simple) == FontGlyphSimple)
+    test.assert(fontglyf.contour_count(simple) == 2)
+
+    test.case("and a negative count is the composite marker")
+    test.assert(fontglyf.glyph_kind(composite) == FontGlyphComposite)
+    test.assert(fontglyf.contour_count(composite) == 0 - 1)
+
+@test
+fn test_a_composite_is_answered_rather_than_followed() [io]
+    let composite = bytes.concat([bytes.from_byte_list([255, 255]), bytes.u16_be(0),
+                                  bytes.u16_be(0), bytes.u16_be(100), bytes.u16_be(200)])
+
+    test.case("THE CLAIM: the package names the components; the HOST reads them")
+    match fontglyf.components(composite)
+        Err(_) => test.assert(false)
+        Ok(cs) =>
+            test.assert(list.len(cs) >= 1)
+            test.assert(list.len(fontglyf.component_glyphs(cs)) == list.len(cs))
+
+    test.case("and a caller that supplies no paths is told WHICH component is missing")
+    match fontglyf.compose(composite, [])
+        Ok(_)  => test.assert(false)
+        Err(e) =>
+            test.assert(fonterror.severity(e) == FontGlyphOnly)
+            test.assert(fonterror.substitute_glyph(e) == 0)
+
+@test
+fn test_the_recursion_is_bounded_because_a_cycle_is_a_hang() [io]
+    test.case("THE CLAIM: five, which is the specification's own guidance")
+    test.assert(fontglyf.component_limit() == 5)
+
+    test.case("a glyph that names itself is caught at one level, cheaply")
+    let comps = [FontComponent { glyph: 7, xform: geomxform.identity(),
+                                 point_match: false, parent_point: 0, child_point: 0,
+                                 use_my_metrics: false, scaled_offset: false }]
+    test.assert(fontglyf.names_itself(7, comps))
+    test.assert(fontglyf.names_itself(8, comps) == false)
+
+    test.case("and the deep case is a fault, not a stack that runs out")
+    test.assert(fonterror.severity(FontCompositeTooDeep(7, 6)) == FontGlyphOnly)
+
+@test
+fn test_use_my_metrics_is_how_an_accented_glyph_gets_the_right_advance() [io]
+    let comps = [
+        FontComponent { glyph: 40, xform: geomxform.identity(), point_match: false,
+                        parent_point: 0, child_point: 0, use_my_metrics: true,
+                        scaled_offset: false },
+        FontComponent { glyph: 200, xform: geomxform.identity(), point_match: false,
+                        parent_point: 0, child_point: 0, use_my_metrics: false,
+                        scaled_offset: false }]
+
+    test.case("THE CLAIM: the flagged component's metrics win, and it is NOT the first by rule")
+    test.assert(fontglyf.metrics_component(comps) == 0)
+
+    test.case("a composite with no flag takes its own hmtx entry")
+    let none_flagged = [comps[1]]
+    test.assert(fontglyf.metrics_component(none_flagged) == 0 - 1)
+
+@test
+fn test_the_outline_is_quadratic_and_the_bounds_have_two_answers() [io]
+    let simple = bytes.concat([bytes.u16_be(1), bytes.u16_be(0), bytes.u16_be(0),
+                               bytes.u16_be(100), bytes.u16_be(200)])
+
+    test.case("THE CLAIM: the record's own box is what a font says, read from its header")
+    let b = fontglyf.glyph_bounds(simple)
+    test.assert(geomrect.width(b) >= 0.0)
+
+    test.case("and the tight one is computed from the curve, for a caller that has it")
+    let p = svgpath.empty()
+    let tight = fontglyf.bounds_from_points(p)
+    test.assert(geomrect.is_empty(tight))
+
+    test.case("a point count is available without building the outline")
+    test.assert(fontglyf.point_count(simple) >= 0)

@@ -1,0 +1,251 @@
+// fontglyf.nv — `loca` and `glyf`: where a glyph is, and what shape it
+// is when you get there.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// QUADRATICS, KEPT QUADRATIC.  A TrueType outline is a sequence of
+// points, each flagged on-curve or off-curve, and the curve between
+// two on-curve points with one off-curve point between them is a
+// quadratic Bézier.  `SvgQuadTo` holds exactly that — one control
+// point — so nothing is converted on the way out.  A reader that
+// promoted every quadratic to a cubic would be doing arithmetic on
+// every point of every glyph to produce a curve that draws the same
+// and rounds differently, and svg-nv's `svgpath.quads_to_cubics` is
+// there for the caller that genuinely wants it.
+//
+// THE IMPLIED ON-CURVE POINT.  TrueType omits the on-curve point
+// between two consecutive off-curve points, because it is always their
+// midpoint.  Every first implementation of a `glyf` reader draws the
+// wrong shape until it puts those back, and this is the one piece of
+// arithmetic in the module that is not a field read.
+//
+// COMPOSITES ARE ANSWERED, NOT FOLLOWED.  An `é` is one glyph record
+// naming two others with a matrix each.  Resolving it means READING
+// two more glyphs, and this package reads nothing — so `components`
+// answers the list and `compose` takes the resolved paths back.
+// `fontread.read_outline` is that loop written once over a
+// `FontSource[e]`; a caller holding the whole file can write the four
+// lines itself.
+
+use geomrect
+use geomxform
+use svgpath
+use fonterror
+use fontsrc
+
+// `loca`, parsed: one file offset per glyph, plus the terminator.
+//
+// A separate type rather than raw bytes because reading it needs
+// `head.indexToLocFormat`, and a `loca` read with the wrong format
+// produces offsets that are wrong by a factor of two and glyph records
+// that parse as noise rather than failing.  Carrying the format on the
+// value means the mistake can only be made once, where the table is
+// parsed.
+pub struct FontLoca
+    // The glyph offsets, relative to the start of `glyf`, with
+    // `num_glyphs + 1` entries: the last is where `glyf` ends.
+    offsets: [Int]
+    // Whether the table was read as 32-bit offsets.  Kept so a caller
+    // can report it and so a re-serialisation knows which to write.
+    long_format: Bool
+
+// What a glyph record turned out to be.
+pub enum FontGlyphKind
+    // No record at all: `loca[i] == loca[i+1]`.  This is how a font
+    // spells a space, and it is not an error.
+    FontGlyphEmpty
+    // Contours of points, which `outline` reads directly.
+    FontGlyphSimple
+    // Other glyphs placed by matrices, which `components` lists.
+    FontGlyphComposite
+
+// One component of a composite glyph.
+pub struct FontComponent
+    // The glyph id being placed.
+    glyph: Int
+    // How it is placed: scale, skew and offset together as one affine
+    // matrix.  The format stores four different encodings of this
+    // (`WE_HAVE_A_SCALE`, `X_AND_Y_SCALE`, `TWO_BY_TWO`, or none) and
+    // they all mean a matrix, so they arrive as one.
+    xform: geomxform.GeomXform
+    // Whether the offset is given as two point indices to align rather
+    // than as numbers.  Rare, legal, and silently wrong if ignored:
+    // the numbers in the record are point indices and using them as
+    // coordinates puts the accent somewhere else entirely.
+    point_match: Bool
+    // The parent's point index to align, when `point_match`.
+    parent_point: Int
+    // The component's point index to align, when `point_match`.
+    child_point: Int
+    // Whether this component's own metrics become the composite's —
+    // `USE_MY_METRICS`, which is how an `é` takes the advance of the
+    // `e` rather than of the accent.
+    use_my_metrics: Bool
+    // Whether the offset is scaled by the component's own matrix
+    // before being applied.  Apple and Microsoft disagreed about the
+    // default, so both flags exist and a font may set neither.
+    scaled_offset: Bool
+
+// How deep a composite may nest before this package refuses.
+//
+// 5, which is what the specification's `maxComponentDepth` guidance
+// says and what every renderer enforces.  The limit exists because a
+// glyph that names itself is a legal-looking record that makes a
+// naive reader recurse until the stack is gone — a hang rather than a
+// crash, which is worse.
+pub fn component_limit() -> Int []
+    todo("font-nv.fontglyf.component_limit")
+
+// ── `loca` ───────────────────────────────────────────────────────────
+
+// How many bytes `loca` should be, for `num_glyphs` in the given
+// format.
+//
+// `(num_glyphs + 1) * (2 or 4)`.  Published so a caller sizes its read
+// before it makes it.
+pub fn loca_len(num_glyphs: Int, long_format: Bool) -> Int []
+    todo("font-nv.fontglyf.loca_len")
+
+// Parse `loca`.
+//
+// `long_format` comes from `head.indexToLocFormat`, and there is no
+// default: guessing it from the table's length works until a font is
+// subset to exactly the wrong size.
+pub fn parse_loca(data: Bytes, num_glyphs: Int,
+                  long_format: Bool) -> Result<FontLoca, fonterror.FontFault> []
+    todo("font-nv.fontglyf.parse_loca")
+
+// Where a glyph's record lives, relative to the start of `glyf`.
+//
+// An empty range for a glyph with no outline, which is the answer for
+// a space and not a failure.  Nothing when the id is past the end of
+// the font.
+pub fn glyph_range(loca: FontLoca, glyph: Int) -> ?fontsrc.FontRange []
+    todo("font-nv.fontglyf.glyph_range")
+
+// The same, as a file offset, given where `glyf` begins.
+//
+// The conversion a caller with a `FontSource` needs and the one that
+// is easy to forget — `loca`'s numbers are `glyf`-relative and the
+// source wants file offsets.
+pub fn glyph_file_range(loca: FontLoca, glyf: fontsrc.FontRange,
+                        glyph: Int) -> ?fontsrc.FontRange []
+    todo("font-nv.fontglyf.glyph_file_range")
+
+// How many glyphs `loca` describes.
+pub fn loca_glyph_count(loca: FontLoca) -> Int []
+    todo("font-nv.fontglyf.loca_glyph_count")
+
+// ── A glyph record ───────────────────────────────────────────────────
+
+// What the record is, before anything is parsed out of it.
+//
+// Reads the first two bytes: a negative contour count is a composite,
+// zero bytes is empty, anything else is simple.
+pub fn glyph_kind(glyph: Bytes) -> FontGlyphKind []
+    todo("font-nv.fontglyf.glyph_kind")
+
+// The glyph's own bounding box, in font units.
+//
+// Read from the record's header rather than computed from the points,
+// because that is what the font says and a renderer allocating an
+// atlas cell wants the font's answer.  It is occasionally WRONG —
+// subsetters have shipped tight boxes that clip a curve's bulge — and
+// `bounds_from_points` is the honest one for a caller that has already
+// read the outline.
+pub fn glyph_bounds(glyph: Bytes) -> geomrect.GeomRectF []
+    todo("font-nv.fontglyf.glyph_bounds")
+
+// How many contours a simple glyph has; 0 for empty, -1 for a
+// composite.
+pub fn contour_count(glyph: Bytes) -> Int []
+    todo("font-nv.fontglyf.contour_count")
+
+// A simple glyph's outline, in font units.
+//
+// Contours come out closed, in the order the font wrote them, with the
+// implied on-curve points restored and the winding left exactly as the
+// font has it: TrueType's fill rule is non-zero and the outer contour
+// runs clockwise, so reversing anything here would turn every counter
+// into a blob.
+//
+// `FontBadField` when the record's flags run past its points, which is
+// what a truncated glyph looks like from inside.
+//
+// ```novo
+// use fontglyf
+// use svgpath
+// use bytes
+//
+// fn main() [io]
+//     match fontglyf.outline(bytes.from_str(""))
+//         Ok(p)  => println("${svgpath.command_count(p)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn outline(glyph: Bytes) -> Result<svgpath.SvgPath, fonterror.FontFault> []
+    todo("font-nv.fontglyf.outline")
+
+// The outline's own bounding box, computed from the points.
+//
+// The curve's actual extrema, not the control points' box, so it is
+// tight and correct where `glyph_bounds` is fast and occasionally
+// wrong.
+pub fn bounds_from_points(p: svgpath.SvgPath) -> geomrect.GeomRectF []
+    todo("font-nv.fontglyf.bounds_from_points")
+
+// How many points a simple glyph has, without building its outline.
+//
+// For a subsetter or a reporter measuring a font; also the number a
+// caller sizing a buffer needs.
+pub fn point_count(glyph: Bytes) -> Int []
+    todo("font-nv.fontglyf.point_count")
+
+// ── Composites ───────────────────────────────────────────────────────
+
+// The components a composite glyph names, with their matrices.
+//
+// Empty for a simple or empty glyph, so a caller can ask without
+// checking the kind first.
+pub fn components(glyph: Bytes) -> Result<[FontComponent], fonterror.FontFault> []
+    todo("font-nv.fontglyf.components")
+
+// Place resolved component outlines into one path.
+//
+// `parts` must be one path per entry of `components`, in the same
+// order — the caller read them, because reading is the host's half.
+// `FontComponentMissing` when the lists do not line up, naming the
+// component that has no path, because a silent short list would drop
+// an accent and produce a plausible-looking wrong glyph.
+//
+// `point_match` components are placed by aligning the two named
+// points, which needs the parent's points as well; a component that
+// asks for it in a composite whose parent has none is a
+// `FontBadField`.
+pub fn compose(glyph: Bytes,
+               parts: [svgpath.SvgPath]) -> Result<svgpath.SvgPath, fonterror.FontFault> []
+    todo("font-nv.fontglyf.compose")
+
+// Which component's metrics the composite takes, or -1 when none is
+// flagged.
+//
+// `USE_MY_METRICS` is how `é` gets the advance of `e`; a composite
+// with no such flag uses its own `hmtx` entry.  An accented glyph laid
+// out with the accent's advance is a visible bug that only appears in
+// the fonts that use the flag.
+pub fn metrics_component(comps: [FontComponent]) -> Int []
+    todo("font-nv.fontglyf.metrics_component")
+
+// Every glyph id a composite names, one level deep.
+//
+// The list a caller feeds back to its source, and what a subsetter
+// walks transitively to find a glyph's closure.
+pub fn component_glyphs(comps: [FontComponent]) -> [Int] []
+    todo("font-nv.fontglyf.component_glyphs")
+
+// Whether a composite names itself at this level.
+//
+// The cheap half of the cycle check.  The expensive half — a cycle
+// through two glyphs — is what `component_limit` catches, and
+// `FontCompositeTooDeep` is what both answer with.
+pub fn names_itself(glyph_id: Int, comps: [FontComponent]) -> Bool []
+    todo("font-nv.fontglyf.names_itself")

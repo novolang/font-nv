@@ -1,0 +1,314 @@
+// fontdir.nv — the table directory: twelve bytes, then sixteen per
+// table, and after that a font is a list of places.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// WHAT A FACE IS HERE.  `FontFace` holds no font bytes.  It is the
+// directory — the sfnt version, the face's index inside a collection,
+// and one `FontTable` per table saying its tag, its checksum and its
+// range — and that is the whole value a caller carries around between
+// reads.  A face for a 20 MB font is a few hundred bytes, which is
+// what makes it reasonable to keep one per font in a cache.
+//
+// THE FOUR MAGICS, AND WHY `true` IS IN THE LIST.  `0x00010000` is
+// TrueType outlines, `OTTO` is CFF outlines, `ttcf` is a collection of
+// either, and `true` is Apple's older spelling of the first — still in
+// the fonts that shipped with a decade of macOS, still handed to
+// renderers today, and rejecting it buys nothing.  `typ1` is NOT in
+// the list: it is sfnt-wrapped Type 1, which needs a different
+// charstring interpreter, and this package names the refusal rather
+// than half-reading it.
+
+use fonterror
+use fontsrc
+
+// Which outline format the face carries, which decides whether
+// `fontglyf` or `fontcff` reads its glyphs.
+pub enum FontFlavour
+    // `glyf` and `loca`: quadratic outlines.  `0x00010000` or `true`.
+    FontOutlinesGlyf
+    // `CFF ` or `CFF2`: cubic charstrings.  `OTTO`.
+    FontOutlinesCff
+    // A `ttcf` header rather than a face.  `fontdir.collection_faces`
+    // is the next call; a collection has no tables of its own.
+    FontOutlinesCollection
+
+// One row of the table directory.
+pub struct FontTable
+    // The four-byte tag as a big-endian integer: `cmap` is
+    // `0x636D6170`.  An `Int` rather than a `Str` because it is
+    // compared far more often than printed, and because a tag with a
+    // byte outside ASCII is legal in the format and would not survive
+    // a round trip through a string.
+    tag: Int
+    // The table's own checksum as the directory records it.  Kept
+    // rather than verified on the way in: checking it means reading
+    // the whole table, which is exactly what this package exists to
+    // avoid doing until asked.  `fontdir.checksum_matches` is the
+    // check, for the caller that has the bytes anyway.
+    checksum: Int
+    // Where the table lives in the file.
+    range: fontsrc.FontRange
+
+// A face's index — everything needed to find any table, and no font
+// bytes at all.
+pub struct FontFace
+    // The sfnt version word, as read.  `fontdir.flavour` is the
+    // reading of it.
+    sfnt: Int
+    // Which face this is inside a collection, 0 for a plain font.
+    index: Int
+    // How many faces the file holds: 1 for a plain font.
+    face_count: Int
+    // The directory, in the order the file wrote it — which is
+    // alphabetical by tag in a conformant font, and is not relied on.
+    tables: [FontTable]
+
+// How many bytes the first read needs: the offset table.
+//
+// 12: the sfnt version, the table count, and three fields a reader
+// does not need (`searchRange`, `entrySelector`, `rangeShift`) that
+// are a binary search precomputed in 1991 and wrong in a good number
+// of shipped fonts.  This package recomputes rather than trusting
+// them, and the README says so.
+pub fn header_len() -> Int []
+    todo("font-nv.fontdir.header_len")
+
+// How many bytes the second read needs, given the table count.
+//
+// `16 * num_tables`.  Published so a caller driving its own loop can
+// size the read without knowing the layout.
+pub fn directory_len(num_tables: Int) -> Int []
+    todo("font-nv.fontdir.directory_len")
+
+// The range of the offset table: the first `header_len` bytes.
+pub fn header_range() -> fontsrc.FontRange []
+    todo("font-nv.fontdir.header_range")
+
+// The range of the table directory that follows an offset table at
+// `at`, given its table count.
+pub fn directory_range(at: Int, num_tables: Int) -> fontsrc.FontRange []
+    todo("font-nv.fontdir.directory_range")
+
+// How many tables the offset table at the head of `head` declares.
+//
+// Reads two bytes.  Answers 0 rather than failing when `head` is
+// shorter than `header_len`, so a caller can size its second read from
+// a first read that was too small and retry.
+pub fn table_count_of(head: Bytes) -> Int []
+    todo("font-nv.fontdir.table_count_of")
+
+// Whether these bytes open a font this package reads.
+//
+// ```novo
+// use fontdir
+// use bytes
+//
+// fn main() [io]
+//     println("${fontdir.is_sfnt(bytes.from_str("OTTO"))}")
+// ```
+pub fn is_sfnt(head: Bytes) -> Bool []
+    todo("font-nv.fontdir.is_sfnt")
+
+// What the sfnt version word says the face carries.
+pub fn flavour(face: FontFace) -> FontFlavour []
+    todo("font-nv.fontdir.flavour")
+
+// The flavour a version word names, before a face has been built.
+pub fn flavour_of(sfnt: Int) -> FontFlavour []
+    todo("font-nv.fontdir.flavour_of")
+
+// Parse an offset table and its directory into a face.
+//
+// `head` is the `header_len + directory_len(n)` bytes at the face's
+// own start — `fontsrc.read_face` performs the two reads, and this is
+// the arithmetic underneath it for a caller that already holds the
+// file.
+//
+// `at` is where those bytes came from in the file, and is added to
+// every table range: a face inside a collection begins part-way in,
+// and a directory parsed without its own offset produces ranges that
+// are silently wrong for exactly those fonts.
+pub fn parse_directory(head: Bytes, at: Int) -> Result<FontFace, fonterror.FontFault> []
+    todo("font-nv.fontdir.parse_directory")
+
+// ── Collections ──────────────────────────────────────────────────────
+
+// Whether the file opens with a `ttcf` header.
+pub fn is_collection(head: Bytes) -> Bool []
+    todo("font-nv.fontdir.is_collection")
+
+// How many faces a collection header declares.
+pub fn collection_faces(head: Bytes) -> Int []
+    todo("font-nv.fontdir.collection_faces")
+
+// The range of a collection header for `n` faces.
+//
+// 12 bytes plus four per face.  Two reads and the offset of any face
+// is known.
+pub fn collection_header_range(n: Int) -> fontsrc.FontRange []
+    todo("font-nv.fontdir.collection_header_range")
+
+// Where face `index` begins, from a collection header.
+//
+// `FontNoSuchFace` carrying both numbers when the index is past the
+// end, because "face 4 of 2" is a caller's own bug and the count is
+// what it needs to fix it.
+pub fn collection_face_at(head: Bytes, index: Int) -> Result<Int, fonterror.FontFault> []
+    todo("font-nv.fontdir.collection_face_at")
+
+// ── Tags ─────────────────────────────────────────────────────────────
+
+// The tag four bytes spell, as an integer.
+pub fn tag(a: Int, b: Int, c: Int, d: Int) -> Int []
+    todo("font-nv.fontdir.tag")
+
+// The tag a four-character name spells.
+//
+// A name that is not four bytes answers 0, which no table uses, so a
+// typo is a lookup that finds nothing rather than one that finds the
+// wrong table.
+//
+// ```novo
+// use fontdir
+//
+// fn main() [io]
+//     println("${fontdir.tag_of("cmap") == fontdir.tag_cmap()}")
+// ```
+pub fn tag_of(name: Str) -> Int []
+    todo("font-nv.fontdir.tag_of")
+
+// The four characters a tag spells, for a message a person reads.
+pub fn tag_name(t: Int) -> Str []
+    todo("font-nv.fontdir.tag_name")
+
+// The tags this package reads, in the order a text run needs them.
+//
+// Published as data because it is the answer to the question a caller
+// with an expensive source actually asks — "what should I fetch in one
+// go?" — and `fontsrc.read_tables` takes exactly this list.
+pub fn tags_for_text() -> [Int] []
+    todo("font-nv.fontdir.tags_for_text")
+
+// The tags a conformant font must carry for its flavour.
+//
+// `fontdir.missing_required` is the check; this is the list it checks
+// against, published separately because a tool reporting on a font
+// wants to name them.
+pub fn required_tags(f: FontFlavour) -> [Int] []
+    todo("font-nv.fontdir.required_tags")
+
+// Which required tables the face does not have.
+//
+// Empty for a font that will render.  A non-empty answer is a font
+// that some tool subset badly, which is common enough in the wild that
+// naming the missing tables is more useful than one refusal.
+pub fn missing_required(face: FontFace) -> [Int] []
+    todo("font-nv.fontdir.missing_required")
+
+// `head`, as an integer tag.
+pub fn tag_head() -> Int []
+    todo("font-nv.fontdir.tag_head")
+
+// `hhea`, as an integer tag.
+pub fn tag_hhea() -> Int []
+    todo("font-nv.fontdir.tag_hhea")
+
+// `hmtx`, as an integer tag.
+pub fn tag_hmtx() -> Int []
+    todo("font-nv.fontdir.tag_hmtx")
+
+// `maxp`, as an integer tag.
+pub fn tag_maxp() -> Int []
+    todo("font-nv.fontdir.tag_maxp")
+
+// `cmap`, as an integer tag.
+pub fn tag_cmap() -> Int []
+    todo("font-nv.fontdir.tag_cmap")
+
+// `loca`, as an integer tag.
+pub fn tag_loca() -> Int []
+    todo("font-nv.fontdir.tag_loca")
+
+// `glyf`, as an integer tag.
+pub fn tag_glyf() -> Int []
+    todo("font-nv.fontdir.tag_glyf")
+
+// `CFF `, as an integer tag.  The trailing space is part of it, which
+// is the detail a hand-written comparison gets wrong.
+pub fn tag_cff() -> Int []
+    todo("font-nv.fontdir.tag_cff")
+
+// `OS/2`, as an integer tag.  The slash is part of it.
+pub fn tag_os2() -> Int []
+    todo("font-nv.fontdir.tag_os2")
+
+// `kern`, as an integer tag.
+pub fn tag_kern() -> Int []
+    todo("font-nv.fontdir.tag_kern")
+
+// `GPOS`, as an integer tag.
+pub fn tag_gpos() -> Int []
+    todo("font-nv.fontdir.tag_gpos")
+
+// `GSUB`, as an integer tag.
+pub fn tag_gsub() -> Int []
+    todo("font-nv.fontdir.tag_gsub")
+
+// ── Looking a table up ───────────────────────────────────────────────
+
+// Where a table lives, or nothing when the face has no such table.
+//
+// ```novo
+// use fontdir
+// use fontsrc
+//
+// fn main() [io]
+//     let face = FontFace { sfnt: 65536, index: 0, face_count: 1, tables: [] }
+//     println("${fontdir.table_range(face, fontdir.tag_glyf()) == None}")
+// ```
+pub fn table_range(face: FontFace, t: Int) -> ?fontsrc.FontRange []
+    todo("font-nv.fontdir.table_range")
+
+// Whether the face has the table at all.
+pub fn has_table(face: FontFace, t: Int) -> Bool []
+    todo("font-nv.fontdir.has_table")
+
+// How many tables the face's directory holds.
+pub fn table_count(face: FontFace) -> Int []
+    todo("font-nv.fontdir.table_count")
+
+// The `i`-th directory row, in file order.
+pub fn table_at(face: FontFace, i: Int) -> ?FontTable []
+    todo("font-nv.fontdir.table_at")
+
+// Every tag the face carries, in file order.
+pub fn table_tags(face: FontFace) -> [Int] []
+    todo("font-nv.fontdir.table_tags")
+
+// Whether every table's range lies inside a file of `total` bytes.
+//
+// The one whole-file check worth making before anything is read: a
+// directory whose entries point past the end is a truncated download,
+// and finding that out once is better than finding it out per table.
+pub fn ranges_fit(face: FontFace, total: Int) -> Bool []
+    todo("font-nv.fontdir.ranges_fit")
+
+// ── Checksums ────────────────────────────────────────────────────────
+
+// The sfnt checksum of a table's bytes.
+//
+// The sum of its big-endian 32-bit words with the last one zero-padded,
+// truncated to 32 bits.  Published because it is also how a caller
+// WRITES a table, and a package that only verified would leave the
+// other half to be written twice.
+pub fn checksum(data: Bytes) -> Int []
+    todo("font-nv.fontdir.checksum")
+
+// Whether a table's bytes match the checksum the directory recorded.
+//
+// `head` is the exception the specification makes and this handles:
+// its own `checkSumAdjustment` field is excluded from its sum, so a
+// naive check fails on every font ever made.
+pub fn checksum_matches(t: FontTable, data: Bytes) -> Bool []
+    todo("font-nv.fontdir.checksum_matches")

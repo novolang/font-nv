@@ -1,0 +1,179 @@
+// fontsrc.nv — the seam.  A place in a font file, said out loud, and
+// the trait that lets a host fill it.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THIS MODULE IS THE LOAD-BEARING INTERFACE OF THE PACKAGE.
+//
+// A font is not a document, it is an INDEX: twelve bytes say how many
+// tables there are, sixteen bytes per table say where each one lives,
+// and every table after that is independent of every other.  Drawing a
+// line of English text reads four of them — `cmap` to turn characters
+// into glyph ids, `hmtx` for the advances, `loca` and `glyf` for the
+// outlines of the glyphs actually used — out of the twenty a modern
+// font carries.  Noto Sans CJK is 20 MB and a terminal draws ASCII out
+// of it; a web page's font arrives over a socket a chunk at a time.
+// Reading the whole file first is a decision the caller should be able
+// not to make.
+//
+// So this package never reads anything, and says where instead.  Every
+// answer about WHERE something is, is a `FontRange`, and it means two
+// things at once:
+//
+//   - to a caller holding the whole file, it is a SPAN into the buffer
+//     it already has, and `fontsrc.slice` cuts it out;
+//   - to a caller holding no file at all — a `File` with a `seek`, an
+//     HTTP range request, a flash page — it is a REQUEST: read these
+//     `len` bytes at `at` and hand them back.
+//
+// `docs/publishing.md` § How a `core` package takes bytes from its host
+// calls the second one "the core asks, the host performs", and elf-nv
+// is the package on the grid that answered the same shape first.
+//
+// WHY A TRAIT AND NOT JUST A RANGE.  elf-nv stops at the range and
+// leaves the loop to the caller; a font's loop is longer than an ELF
+// file's — open the directory, find `head`, read it to learn the `loca`
+// format, read `loca` to find the glyph, read the glyph, and if it is a
+// composite go round again — and written out by hand at every call site
+// it is where the bugs live.  `FontSource[e]` lets that loop be written
+// ONCE, in `fontread`, without the package acquiring an effect: the
+// bound binds the trait's effect parameter and the clause is `[e]`, so
+// `read_face` costs `[io, fs]` over a `File` and NOTHING over a buffer,
+// and the package stays `core` either way (SPEC § 5.6, and
+// `docs/publishing.md` § Design, third shape).
+//
+// WHY THE TRAIT IS THIS PACKAGE'S AND NOT `std.io`'s `Read` + `Seek`.
+// Because the compiler will not take both: a function may bind exactly
+// ONE effect parameter, and `<S: Read[e] + Seek[e]>` is `E3005` with a
+// message saying a clause mixing two supplies could not say which name
+// each filled.  That is the right refusal and not a defect — but it
+// means a random-access source cannot be spelled with the standard
+// library's two traits at all, so this package declares the one trait
+// that is random access by construction: a range in, the bytes out.
+// A host that has a `File` writes the four-line impl once.
+
+use fonterror
+
+// A place in a font file: `len` bytes starting at `at`.
+//
+// Offsets are counted from the first byte of the FILE, never from the
+// start of the table being walked.  A caller that read one table out
+// and is now parsing it holds that table's own `at` and adds it — it
+// is the only party that knows it did that, and a range that sometimes
+// meant one and sometimes the other would be a coin flip at every call
+// site.
+//
+// Not `@value`: a range is what `fontdir.table_range` answers as an
+// optional and what several functions carry inside a `Result`, and
+// SPEC § 14.5 keeps an unboxed struct out of both positions.
+pub struct FontRange
+    // Byte offset of the first byte, from the start of the file.
+    at: Int
+    // How many bytes.  Zero is a legal answer — an empty `glyf` entry
+    // is how a font spells "this glyph has no outline", which is what
+    // a space is.
+    len: Int
+
+// The range of `len` bytes at `at`.
+//
+// ```novo
+// use fontsrc
+//
+// fn main() [io]
+//     let r = fontsrc.range(12, 16)
+//     println("${r.len} bytes at ${r.at}")
+// ```
+pub fn range(at: Int, len: Int) -> FontRange []
+    todo("font-nv.fontsrc.range")
+
+// The zero-length range at `at`.
+//
+// Named rather than left to `range(at, 0)` because an empty glyph is
+// the common case — every space, every unencoded slot — and a reader
+// that meets one should see a word for it rather than a zero.
+pub fn empty(at: Int) -> FontRange []
+    todo("font-nv.fontsrc.empty")
+
+// Whether the range covers no bytes at all.
+pub fn is_empty(r: FontRange) -> Bool []
+    todo("font-nv.fontsrc.is_empty")
+
+// One past the last byte: `at + len`.
+pub fn range_end(r: FontRange) -> Int []
+    todo("font-nv.fontsrc.range_end")
+
+// Whether the whole range lies inside a file of `total` bytes.
+//
+// The check every offset field gets before it is believed.  A table
+// directory is a list of numbers some tool wrote, and nothing in the
+// format stops one naming bytes past the end of the file; a caller
+// doing its own reading asks this before it seeks.
+pub fn range_fits(r: FontRange, total: Int) -> Bool []
+    todo("font-nv.fontsrc.range_fits")
+
+// A range inside another range, with `at` relative to the outer one.
+//
+// The arithmetic that turns "the `cmap` subtable at offset 28 of the
+// `cmap` table" into a file offset, in one place rather than at every
+// call site that does it.  The result is clipped to the outer range,
+// so a nested offset that overruns answers a shorter range rather than
+// one pointing outside the table.
+pub fn sub(outer: FontRange, at: Int, len: Int) -> FontRange []
+    todo("font-nv.fontsrc.sub")
+
+// The range's bytes, cut out of a file the caller holds whole.
+//
+// The convenience half of the type, for the caller that DID read the
+// file: `slice` and the trait below are the same fact reached from the
+// two ends.  Answers a short slice rather than failing when the range
+// overruns, because the caller's next parse will refuse with a
+// `FontShort` that names the structure, which is the more useful
+// message.
+pub fn slice(file: Bytes, r: FontRange) -> Bytes []
+    todo("font-nv.fontsrc.slice")
+
+// Whether `have` bytes are enough for a structure needing `want`, and
+// the fault to answer when they are not.
+//
+// Every parser in this package opens with this pair, so the shortfall
+// is reported the same way from twelve places rather than twelve ways.
+pub fn enough(have: Int, want: Int) -> Bool []
+    todo("font-nv.fontsrc.enough")
+
+// The `FontShort` for a table that ran out.
+pub fn short(table: Int, want: Int, have: Int) -> fonterror.FontFault []
+    todo("font-nv.fontsrc.short")
+
+// ── The trait that crosses the layer ─────────────────────────────────
+
+// A source of font bytes the host performs against.
+//
+// One method, and it is random access on purpose: a font is an index,
+// and an index read sequentially is a file read whole.  An
+// implementation over a `File` seeks and reads; one over a `Bytes`
+// slices and costs nothing; one over an HTTP connection sends a
+// `Range` header.
+//
+// The effect parameter is what makes the difference invisible to this
+// package and visible to the caller: an impl declares what it performs,
+// and every function bound to `FontSource[e]` is charged that and no
+// more.
+//
+// ```novo ignore
+// impl FontSource[io] for FontFile
+//     fn font_bytes(self, r: FontRange) -> Result<Bytes, FontFault> [io]
+//         match self.handle.seek(SeekStart(r.at))
+//             Err(e) => Err(FontSourceFailed(e.message()))
+//             Ok(_)  =>
+//                 match self.handle.read(r.len)
+//                     Err(e) => Err(FontSourceFailed(e.message()))
+//                     Ok(b)  => Ok(b)
+// ```
+pub trait FontSource[e]
+    // Answer exactly the bytes the range names.
+    //
+    // Short is an error, not a truncation: a parser handed nine bytes
+    // where it asked for sixteen would read a field out of the next
+    // table, and `FontSourceFailed` at the seam is a message a caller
+    // can act on where a wrong advance width is not.
+    fn font_bytes(self, r: FontRange) -> Result<Bytes, fonterror.FontFault> [e]

@@ -1,0 +1,103 @@
+// fontcff_tests.nv — the bias, the off-by-one, and the scope said out
+// loud.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: font-nv.<module>.<fn>`.
+//
+// THE ASSERTION THIS SUITE EXISTS FOR: the subroutine bias.  It is
+// 107, 1131 or 32768 depending on how many subroutines an INDEX has,
+// it applies to the local and global INDEXes independently, and a
+// reader that hard-codes 107 draws correct glyphs in a small font and
+// nonsense in a large one — which is the worst way for a defect to
+// behave, because it passes every test written against a test font.
+//
+// THE VECTORS are the CFF specification's own thresholds and the Type
+// 2 charstring operator numbers.
+
+use std.test
+use std.list
+use std.bytes
+use fontcff
+use fonterror
+
+@test
+fn test_the_subroutine_bias_has_three_values_and_two_thresholds() [io]
+    test.case("THE CLAIM: under 1240 subroutines the bias is 107")
+    test.assert(fontcff.bias(0) == 107)
+    test.assert(fontcff.bias(1) == 107)
+    test.assert(fontcff.bias(1239) == 107)
+
+    test.case("at 1240 it becomes 1131, which is the boundary a test font never reaches")
+    test.assert(fontcff.bias(1240) == 1131)
+    test.assert(fontcff.bias(33899) == 1131)
+
+    test.case("and at 33900 it becomes 32768")
+    test.assert(fontcff.bias(33900) == 32768)
+    test.assert(fontcff.bias(65535) == 32768)
+
+@test
+fn test_the_limits_are_the_specifications_and_are_published_as_numbers() [io]
+    test.case("THE CLAIM: a charstring may nest ten calls deep")
+    test.assert(fontcff.call_depth_limit() == 10)
+
+    test.case("and may hold forty-eight arguments")
+    test.assert(fontcff.stack_limit() == 48)
+
+    test.case("so a charstring that exceeds either is a fault naming what it did")
+    test.assert(fonterror.severity(FontCharstringState("stack overflow")) == FontGlyphOnly)
+    test.assert(fonterror.substitute_glyph(FontCharstringState("stack overflow")) == 0)
+
+@test
+fn test_the_interpreted_operators_are_a_list_and_not_a_paragraph() [io]
+    test.case("THE CLAIM: the scope is data, so a caller can assert against it")
+    let ok = fontcff.operators_covered()
+    test.assert(list.len(ok) >= 15)
+
+    test.case("rmoveto is 21 and is interpreted")
+    test.assert(list.contains(ok, 21))
+
+    test.case("and the refused set is a list too, so a survey can run before anything draws")
+    let no = fontcff.operators_refused()
+    test.assert(list.len(no) >= 10)
+
+    test.case("flex is escape 35, encoded as 3072 + 35, and is the first refusal to close")
+    test.assert(list.contains(no, 3072 + 35))
+
+    test.case("an operator outside the set is named by NUMBER, so the fix has an address")
+    test.assert(fonterror.severity(FontCharstringOp(3072 + 35)) == FontGlyphOnly)
+    test.assert(fontcff.operator_name(21) == "rmoveto")
+
+@test
+fn test_cff_two_is_refused_by_name_rather_than_read_as_cff() [io]
+    let cff1 = bytes.from_byte_list([1, 0, 4, 2])
+    let cff2 = bytes.from_byte_list([2, 0, 5, 0])
+
+    test.case("THE CLAIM: the major version is the first byte, and 2 is a different table")
+    test.assert(fontcff.is_cff2(cff1) == false)
+    test.assert(fontcff.is_cff2(cff2))
+
+    test.case("because reading a CFF2 as a CFF gives plausible glyphs and wrong ones")
+    test.assert(fontcff.header_len() == 4)
+
+@test
+fn test_an_index_answers_where_an_entry_is_and_never_copies_it() [io]
+    // count 2, offSize 1, offsets 1 3 5, then four bytes of data.
+    let ix_bytes = bytes.from_byte_list([0, 2, 1, 1, 3, 5, 65, 66, 67, 68])
+
+    test.case("THE CLAIM: an INDEX is a count, an offset size and offsets")
+    match fontcff.index_at(ix_bytes, 0)
+        Err(_) => test.assert(false)
+        Ok(ix) =>
+            test.assert(ix.count == 2)
+            test.assert(ix.off_size == 1)
+
+            test.case("and an entry is a RANGE, so nothing is copied to look at it")
+            match fontcff.index_entry(ix_bytes, ix, 0)
+                Some(r) => test.assert(r.len == 2)
+                None    => test.assert(false)
+
+            test.case("an entry past the count is nothing")
+            test.assert(fontcff.index_entry(ix_bytes, ix, 5) == None)
+
+            test.case("the INDEX's end is where the next one begins")
+            test.assert(fontcff.index_end(ix_bytes, ix) == 10)

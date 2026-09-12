@@ -1,0 +1,248 @@
+// fontcff.nv — the `CFF ` table: an INDEX of INDEXes, two DICTs, and a
+// stack machine that draws.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// WHY THIS IS ITS OWN MODULE AND NOT PART OF `fontglyf`.  A font has
+// TrueType outlines or CFF outlines, never both, and the two share
+// nothing below the path they answer: `glyf` is a point list read with
+// arithmetic, and CFF is a bytecode interpreted on a stack with
+// subroutine calls, a hint model and a width convention.  A consumer
+// that only ever meets `OTTO` fonts and one that only ever meets
+// `ttf` files both pay for whichever they do not use if the two live
+// together; keeping them apart is also what makes the scope of THIS
+// one statable.
+//
+// THE SCOPE, STATED UP FRONT AND PUBLISHED AS DATA.  This module
+// interprets the Type 2 charstring operators that DRAW and the ones
+// that CALL, and it reads — without acting on — the ones that HINT.
+// `operators_covered` and `operators_refused` are functions rather
+// than a paragraph, so a caller can assert against them and a font
+// that trips one gets `FontCharstringOp` carrying the number rather
+// than a silently missing stroke.
+//
+//   drawn:    rmoveto hmoveto vmoveto rlineto hlineto vlineto
+//             rrcurveto hhcurveto hvcurveto vhcurveto vvcurveto
+//             rcurveline rlinecurve endchar
+//   called:   callsubr callgsubr return
+//   read:     hstem vstem hstemhm vstemhm hintmask cntrmask
+//   refused:  flex hflex hflex1 flex1 (escape 34-37), seac via
+//             endchar's four-argument form, random, and the whole
+//             arithmetic and storage group (add sub div and or not
+//             abs neg sqrt drop exch index roll dup put get ifelse)
+//
+// The refusals are not equal and the README says which is which:
+// `flex` is a curve smoothing pair that a font DOES use and whose
+// absence loses a shallow curve, so it is the first thing the
+// implementation adds.  The arithmetic group is Type 2 machinery no
+// shipped font uses, and the README says that rather than pretending
+// it is a roadmap.
+//
+// CFF2 IS REFUSED BY NAME.  It is a different table with a different
+// top DICT, no encoding, no charset, and a variation store that makes
+// an outline a function of the design axes rather than a shape.
+// Reading one as CFF would produce plausible garbage.
+
+use geomxform
+use svgpath
+use fonterror
+use fontsrc
+
+// A CFF INDEX: a count, an offset size, and the offsets that follow.
+//
+// The format's one container, used five times in a table — name,
+// top DICT, string, global subroutine, charstrings — so it is one
+// type read five times rather than five parsers.
+pub struct FontCffIndex
+    // How many entries.
+    count: Int
+    // Bytes per offset: 1 to 4.  A 1-byte-offset INDEX cannot hold
+    // more than 255 bytes of data, which is the check the format does
+    // not make for you.
+    off_size: Int
+    // Where the whole INDEX lives, including its header.
+    range: fontsrc.FontRange
+    // Where the data begins: the byte the offsets are relative to,
+    // minus one, which is the format's off-by-one and the single most
+    // common CFF reader bug.
+    data_at: Int
+
+// The top DICT's fields that matter to a reader.
+//
+// Absent entries come back as an empty range or a zero, and the
+// `is_cid` flag is what makes the difference readable: a CID font's
+// `charstrings` are addressed through an FDSelect rather than one
+// private DICT, and a reader that missed the flag would use the wrong
+// subroutines for every glyph.
+pub struct FontCffTop
+    // The CharStrings INDEX: one entry per glyph.
+    charstrings: fontsrc.FontRange
+    // The Private DICT, whose `Subrs` offset is relative to ITS start
+    // rather than to the table's — the format's second off-by-one.
+    private: fontsrc.FontRange
+    // The local subroutine INDEX named by the Private DICT, already
+    // resolved to a file range.
+    local_subrs: fontsrc.FontRange
+    // The global subroutine INDEX, from the table header.
+    global_subrs: fontsrc.FontRange
+    // The charset, for a caller that wants glyph names.
+    charset: fontsrc.FontRange
+    // The FontMatrix, defaulting to 0.001 per unit — which is why a
+    // CFF font is usually 1000 units to the em and why assuming 1000
+    // is wrong for the fonts that say otherwise.
+    matrix: geomxform.GeomXform
+    // `defaultWidthX`: the advance a charstring that says nothing
+    // takes.
+    default_width: Float
+    // `nominalWidthX`: the number a charstring's leading odd argument
+    // is added to.  The width convention below.
+    nominal_width: Float
+    // Whether this is a CID-keyed font.
+    is_cid: Bool
+
+// What a charstring produced besides its path.
+//
+// `@value`: two numbers returned beside a path, never inside a
+// `Result` of their own and never a field of a boxed struct.
+pub @value
+struct FontCharWidth
+    // The advance width the charstring's leading argument implied, in
+    // font units.
+    width: Float
+    // Whether the charstring actually carried one.  THE CONVENTION
+    // THAT IS ALL CONVENTION: a Type 2 charstring's first operator
+    // takes an extra leading argument when the glyph's width differs
+    // from `defaultWidthX`, and there is no marker — a reader knows
+    // only by counting arguments against what the operator expects.
+    // Getting it wrong shifts the whole rest of the stack by one and
+    // draws a different glyph.
+    explicit: Bool
+
+// How many bytes the `CFF ` header is: 4, then `hdrSize` says the
+// rest.
+pub fn header_len() -> Int []
+    todo("font-nv.fontcff.header_len")
+
+// Read an INDEX header at an offset inside the table.
+pub fn index_at(data: Bytes, at: Int) -> Result<FontCffIndex, fonterror.FontFault> []
+    todo("font-nv.fontcff.index_at")
+
+// Where entry `i` of an INDEX lives.
+//
+// Nothing when `i` is past the count.  A zero-length entry is legal
+// and means an empty glyph, the same way an empty `glyf` record does.
+pub fn index_entry(data: Bytes, ix: FontCffIndex, i: Int) -> ?fontsrc.FontRange []
+    todo("font-nv.fontcff.index_entry")
+
+// Where the whole INDEX ends, so the next one can be found.
+pub fn index_end(data: Bytes, ix: FontCffIndex) -> Int []
+    todo("font-nv.fontcff.index_end")
+
+// Parse the header and the top DICT into the fields a reader needs.
+pub fn parse_top(data: Bytes,
+                 table: fontsrc.FontRange) -> Result<FontCffTop, fonterror.FontFault> []
+    todo("font-nv.fontcff.parse_top")
+
+// How many glyphs the CharStrings INDEX holds.
+pub fn glyph_count(top: FontCffTop, data: Bytes) -> Int []
+    todo("font-nv.fontcff.glyph_count")
+
+// Where one glyph's charstring lives.
+pub fn charstring_range(data: Bytes, top: FontCffTop, glyph: Int) -> ?fontsrc.FontRange []
+    todo("font-nv.fontcff.charstring_range")
+
+// ── The subroutine bias ──────────────────────────────────────────────
+
+// The bias added to a subroutine number before it indexes the INDEX.
+//
+// 107 under 1240 subroutines, 1131 under 33900, 32768 above.  A
+// separate function because it is the CFF rule that is pure magic
+// numbers, it applies to local and global subroutines independently,
+// and a reader that hard-codes 107 draws correct glyphs in small fonts
+// and nonsense in large ones — which is the worst way for a bug to
+// behave.
+//
+// ```novo
+// use fontcff
+//
+// fn main() [io]
+//     println("${fontcff.bias(200)}")      // 107
+// ```
+pub fn bias(subr_count: Int) -> Int []
+    todo("font-nv.fontcff.bias")
+
+// ── The interpreter ──────────────────────────────────────────────────
+
+// Interpret one charstring into a path, in font units.
+//
+// `local` and `global` are the two subroutine INDEXes already located;
+// `depth` is the call depth the caller is at, which is 0 from outside
+// and is how the 10-deep limit is enforced across the recursion.
+//
+// The path is CUBIC — Type 2 curves are cubic Béziers, unlike
+// TrueType's quadratics — so an outline out of this module and one out
+// of `fontglyf` are both `SvgPath` and are not the same commands.  A
+// rasteriser takes either; a caller comparing two fonts' outlines
+// should know which it has, and `fontdir.flavour` is how.
+pub fn charstring_outline(cs: Bytes, data: Bytes, top: FontCffTop,
+                          depth: Int) -> Result<svgpath.SvgPath, fonterror.FontFault> []
+    todo("font-nv.fontcff.charstring_outline")
+
+// The advance width a charstring implied, and whether it carried one.
+//
+// Separate from the outline because a caller measuring a string does
+// not want the path, and because reading the width means interpreting
+// only the first operator rather than the whole charstring.
+pub fn charstring_width(cs: Bytes, top: FontCffTop) -> FontCharWidth []
+    todo("font-nv.fontcff.charstring_width")
+
+// How deep `callsubr` and `callgsubr` may nest: 10, which is the
+// specification's own limit.
+pub fn call_depth_limit() -> Int []
+    todo("font-nv.fontcff.call_depth_limit")
+
+// How many arguments the interpreter's stack may hold: 48.
+//
+// Published because a charstring that pushes more is not a font this
+// package refuses on a whim — it is one the specification forbids —
+// and a caller reading `FontCharstringState` deserves the number.
+pub fn stack_limit() -> Int []
+    todo("font-nv.fontcff.stack_limit")
+
+// The operator numbers this module interprets.
+//
+// Escape-prefixed (12 x) operators are encoded as `3072 + x` so that
+// one list covers both, which is what the interpreter's own dispatch
+// does.
+pub fn operators_covered() -> [Int] []
+    todo("font-nv.fontcff.operators_covered")
+
+// The operator numbers it refuses, in the same encoding.
+//
+// Published so that a caller can assert on the set and so that a
+// survey over a font library can say which fonts this module would
+// refuse, before anything is drawn.
+pub fn operators_refused() -> [Int] []
+    todo("font-nv.fontcff.operators_refused")
+
+// The name of an operator number, for a message a person reads.
+pub fn operator_name(op: Int) -> Str []
+    todo("font-nv.fontcff.operator_name")
+
+// Whether a charstring uses only operators this module interprets.
+//
+// A dry run: the stack machine walked for operator numbers without
+// building a path.  For a font validator, and for a renderer that
+// would rather fall back to a different font than draw half a glyph.
+pub fn is_interpretable(cs: Bytes) -> Bool []
+    todo("font-nv.fontcff.is_interpretable")
+
+// Whether the table is CFF2 rather than CFF.
+//
+// Refused by name: CFF2's top DICT has no charset and no encoding, its
+// charstrings may reference a variation store, and reading one as CFF
+// yields glyphs that are plausible and wrong.  A caller that meets one
+// needs a different package, and telling it so is more useful than a
+// parse error twenty bytes in.
+pub fn is_cff2(data: Bytes) -> Bool []
+    todo("font-nv.fontcff.is_cff2")

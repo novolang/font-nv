@@ -1,0 +1,173 @@
+// fonterror.nv — every way a font file can refuse to be read, and the
+// table it was being read from when it did.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// WHY A FAULT CARRIES A TABLE TAG.  A font is twenty independent
+// binary tables that happen to share a file, and "the font is
+// corrupt" is not a sentence anyone can act on.  `FontFault` names
+// the table in every variant that has one, because the caller's next
+// move genuinely differs: a broken `GPOS` means render without
+// kerning, a broken `cmap` means render nothing, and a broken `post`
+// means nothing at all.
+//
+// WHY THERE IS NO `FontUnsupported`.  Every refusal this package makes
+// is a NAMED thing it does not do — a `cmap` format it did not
+// implement, a charstring operator it did not interpret, a script it
+// will not lay out — and each of those is its own variant carrying the
+// number or the codepoint.  A single catch-all would make the one
+// question a caller asks at that point ("is there another font I could
+// try, or is this one just old?") unanswerable.
+
+// What went wrong, and where.
+//
+// `table` is the four-byte tag as an integer — `fontdir.tag_of("cmap")`
+// builds one and `fontdir.tag_name` prints it — and is 0 on the
+// variants that are not about one table.
+pub enum FontFault
+    // The bytes handed over are shorter than the structure being read.
+    // `want` is the offset one past the last byte needed, `have` the
+    // length supplied, so the two subtract to the shortfall.
+    FontShort(table: Int, want: Int, have: Int)
+    // The first four bytes are not an sfnt version this package knows:
+    // not `0x00010000`, not `OTTO`, not `true`, not `ttcf`.
+    FontNotSfnt(magic: Int)
+    // A TrueType collection was opened at a face index it does not
+    // have.  `count` is how many it does.
+    FontNoSuchFace(index: Int, count: Int)
+    // The table directory has no entry for a table the operation needs.
+    FontNoTable(table: Int)
+    // A table's entry in the directory names bytes outside the file.
+    FontTableOutside(table: Int, at: Int, len: Int)
+    // A field the format constrains holds something else: a version
+    // this package does not read, a flag combination the specification
+    // forbids, a count that contradicts another table's count.
+    FontBadField(table: Int, field: Str, value: Int)
+    // A `cmap` subtable in a format this package does not implement.
+    // Formats 4 and 12 are implemented; `format` is what was found.
+    FontCmapFormat(format: Int)
+    // A `cmap` table with no subtable this package can use — a font
+    // with only format 0 and format 6 subtables reaches this, and the
+    // answer for the caller is a different font rather than a retry.
+    FontNoUsableCmap
+    // `glyf` was asked for a glyph id at or past `numGlyphs`.
+    FontNoSuchGlyph(glyph: Int, count: Int)
+    // A composite glyph nests deeper than `fontglyf.component_limit`,
+    // or names itself.  Either way the recursion does not terminate,
+    // and a reader that followed it would hang rather than fail.
+    FontCompositeTooDeep(glyph: Int, depth: Int)
+    // A composite glyph names a component the caller did not supply a
+    // resolved path for.  The package cannot read it — that is the
+    // host's half — so this is the refusal that says which one is
+    // missing.
+    FontComponentMissing(glyph: Int, component: Int)
+    // A Type 2 charstring used an operator this package does not
+    // interpret.  `fontcff.operators_refused` lists them up front so a
+    // caller need not discover the set one font at a time.
+    FontCharstringOp(op: Int)
+    // A Type 2 charstring left the interpreter's stack in a state the
+    // specification does not allow — too many arguments before an
+    // operator, a `hintmask` before any stem, a call past the end of
+    // the subroutine index.
+    FontCharstringState(reason: Str)
+    // A `GSUB` or `GPOS` lookup of a type this package does not apply.
+    // `fontgsub.lookup_types_covered` and
+    // `fontkern.gpos_lookup_types_covered` list what it does.
+    FontLookupType(table: Int, lookup: Int)
+    // The text handed to the shaper contains a script whose correct
+    // layout needs reordering, joining or mark attachment — Arabic,
+    // Devanagari, Thai and the rest of HarfBuzz's subject.  `codepoint`
+    // is the first one found.
+    //
+    // A refusal rather than a best effort, because best-effort Arabic
+    // is unreadable rather than imperfect, and a caller that got a
+    // plausible-looking line back would ship it.
+    FontComplexScript(codepoint: Int)
+    // The source a `FontSource[e]` wraps failed to supply bytes.  The
+    // host's own error text, because this package has no idea what a
+    // file, a socket or a flash page can go wrong in.
+    FontSourceFailed(why: Str)
+
+// Which half of a read a fault came out of, for a caller deciding
+// whether to fall back to another font or to give up on text.
+//
+// Three answers rather than a boolean: a font that cannot be opened at
+// all is a different situation from one whose outlines are fine and
+// whose kerning is broken, and the middle case is the common one in
+// fonts that shipped.
+pub enum FontSeverity
+    // The file is not a font, or its directory does not parse.  No
+    // table can be read and no fallback within this file exists.
+    FontFatal
+    // One table is unreadable and the text can still be drawn without
+    // it: `kern`, `GPOS`, `GSUB`, `OS/2`.  Draw unkerned rather than
+    // not at all.
+    FontDegraded
+    // One glyph is unreadable.  Substitute `.notdef` — glyph 0, which
+    // every font has — and carry on down the line.
+    FontGlyphOnly
+
+// Which table the fault came from, or 0 when it is not about one.
+//
+// ```novo
+// use fonterror
+//
+// fn main() [io]
+//     println("${fonterror.fault_table(FontNoUsableCmap)}")    // 0
+// ```
+pub fn fault_table(f: FontFault) -> Int []
+    todo("font-nv.fonterror.fault_table")
+
+// How much of the text is lost if the caller carries on.
+//
+// Published rather than left to a `match` at every call site, because
+// the classification is a property of the FORMAT — which tables are
+// optional is written in the OpenType specification — and two callers
+// deciding it separately will disagree about `GPOS`.
+pub fn severity(f: FontFault) -> FontSeverity []
+    todo("font-nv.fonterror.severity")
+
+// Whether carrying on leaves readable text.
+//
+// True for `FontDegraded` and `FontGlyphOnly`, false for `FontFatal`.
+// The one-line form of `severity` for the caller that only wants to
+// know whether to reach for the next font in its list.
+pub fn is_recoverable(f: FontFault) -> Bool []
+    todo("font-nv.fonterror.is_recoverable")
+
+// The glyph a caller should draw instead, when the fault is about one
+// glyph.
+//
+// Always 0, which is `.notdef` and which every conformant font
+// defines, so the answer is a constant with a name rather than a magic
+// number in a `match` arm.  `-1` when the fault is not about a glyph.
+pub fn substitute_glyph(f: FontFault) -> Int []
+    todo("font-nv.fonterror.substitute_glyph")
+
+// One line a person can read, naming the table and the numbers.
+//
+// `impl Error` is required before `Result<_, FontFault>` type-checks
+// at all (SPEC § 3.4), so this block is part of the interface rather
+// than a convenience on top of it.
+//
+// ```novo
+// use fonterror
+//
+// fn main() [io]
+//     println(fonterror.describe(FontCmapFormat(6)))
+// ```
+pub fn describe(f: FontFault) -> Str []
+    todo("font-nv.fonterror.describe")
+
+// The `Error` implementation `Result<_, FontFault>` requires.
+//
+// ```novo
+// use fonterror
+//
+// fn main() [io]
+//     let e: FontFault = FontNotSfnt(0)
+//     println(e.message())
+// ```
+impl Error for FontFault
+    fn message(self) -> Str
+        todo("font-nv.fonterror.message")

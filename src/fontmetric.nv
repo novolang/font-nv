@@ -1,0 +1,406 @@
+// fontmetric.nv — `head`, `hhea`, `maxp`, `hmtx` and `OS/2`: the
+// numbers a line of text is laid out with, and the transform that
+// turns them into pixels.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE UNIT RULE, WHICH IS THE WHOLE MODULE.  Every number a font
+// stores is in FONT UNITS — `unitsPerEm` of them to an em, 1000 in a
+// CFF font and 2048 in most TrueType ones — and a font unit is not a
+// pixel, a point, or anything else with a name outside the file.
+// Nothing in this package converts for the caller, ever: outlines come
+// out in font units, advances come out in font units, and
+// `scale_for_px` hands back the one `GeomXform` that maps them.
+//
+// The reason is a cache.  A rasteriser holds an outline per glyph and
+// draws it at whatever size the caller asked for, so the outline must
+// not know the size; a shaper accumulates advances across a run and
+// rounds ONCE at the end, because rounding per glyph accumulates into
+// a visibly wrong line length by the fortieth character.  A library
+// that returned pixels would make both of those impossible and would
+// look more convenient doing it.
+//
+// THE ASCENT PROBLEM, AND WHY THERE IS NO `ascender`.  A font records
+// its vertical metrics THREE times — `hhea.ascender`, `OS/2.sTypoAscender`
+// and `OS/2.usWinAscent` — and in a great many shipped fonts the three
+// disagree by enough to change how many lines fit on a page.  Which one
+// is right depends on who is asking: a browser follows the `USE_TYPO_METRICS`
+// flag, a terminal wants the one that never clips, a print engine wants
+// the typographic one.  So `line_metrics` takes a `FontAscent` and there
+// is no default, because the default is the bug.
+
+use geomrect
+use geomxform
+use fonterror
+
+// The `head` table's fields that a reader needs.
+//
+// Not the whole table: `checkSumAdjustment`, `created` and `modified`
+// are facts about the file rather than about the type, and a reader
+// that exposed them would invite a caller to treat a font's build date
+// as a version.
+pub struct FontHead
+    // Font units to the em.  16 to 16384 by the specification, and a
+    // power of two in TrueType fonts because hinting assumed it.
+    units_per_em: Int
+    // The design bounding box, in font units: every glyph fits inside
+    // it, so an atlas can be sized from it before a glyph is read.
+    x_min: Int
+    // The design bounding box's lowest y.
+    y_min: Int
+    // The design bounding box's highest x.
+    x_max: Int
+    // The design bounding box's highest y.
+    y_max: Int
+    // Bit flags: baseline at y=0, left sidebearing at x=0, and the
+    // rest.  `fontmetric.head_flag` reads one.
+    flags: Int
+    // Bold, italic, condensed and the rest, as the font claims them.
+    // `OS/2.fsSelection` claims the same things and disagrees in a
+    // noticeable number of fonts; `fontmetric.style_disagrees` is how
+    // a caller finds out rather than picking one.
+    mac_style: Int
+    // 0 for 16-bit `loca` offsets, 1 for 32-bit.  The one field in the
+    // whole font that cannot be skipped: reading `loca` without it
+    // gives glyph offsets that are wrong by a factor of two, and the
+    // outlines that come out are noise rather than an error.
+    index_to_loc_format: Int
+    // The smallest size, in pixels per em, at which the font is
+    // readable.  A hint for a caller choosing a bitmap threshold.
+    lowest_rec_ppem: Int
+
+// The `hhea` table's horizontal line metrics.
+pub struct FontHhea
+    // Distance from the baseline to the top of the line, positive up.
+    ascender: Int
+    // Distance from the baseline to the bottom, NEGATIVE in a
+    // conformant font.  A font that stores it positive exists, and
+    // `fontmetric.descender_sign_is_wrong` is how a caller sees that
+    // rather than laying out upside down.
+    descender: Int
+    // Extra space between lines, on top of ascender minus descender.
+    line_gap: Int
+    // The widest advance in the font, in font units.
+    advance_max: Int
+    // The rise of the caret's slope; 1 with a run of 0 is upright.
+    caret_slope_rise: Int
+    // The run of the caret's slope; 0 with a rise of 1 is upright.
+    caret_slope_run: Int
+    // How many glyphs at the start of `hmtx` carry their own advance.
+    // THE FIELD THAT MAKES `hmtx` PARSABLE — see `h_metrics`.
+    num_h_metrics: Int
+
+// The `maxp` table's one field a reader needs.
+pub struct FontMaxp
+    // How many glyphs the font has.  Every glyph id is checked against
+    // this before `loca` is indexed, because `loca` has `num_glyphs + 1`
+    // entries and an id past the end reads the terminator as an offset.
+    num_glyphs: Int
+    // The deepest composite nesting the font claims to use.  Advisory:
+    // `fontglyf.component_limit` is what is actually enforced, because
+    // a font claiming 0 and nesting 3 is a font, not an error.
+    max_component_depth: Int
+
+// The `OS/2` table's fields that affect layout.
+//
+// Version 0 fonts have no `sxHeight` or `sCapHeight`; both are 0 there
+// and `fontmetric.has_x_height` says which it is, because 0 is also a
+// legal value for a font with no lowercase.
+pub struct FontOs2
+    // The typographic ascender: the designer's answer.
+    typo_ascender: Int
+    // The typographic descender, negative.
+    typo_descender: Int
+    // The typographic line gap.
+    typo_line_gap: Int
+    // The Windows ascent: the clipping bound, always positive.
+    win_ascent: Int
+    // The Windows descent: the clipping bound, stored POSITIVE even
+    // though it is below the baseline, which is the sign trap in this
+    // table.
+    win_descent: Int
+    // Height of a lowercase x, or 0 when the table is too old to say.
+    x_height: Int
+    // Height of a capital, or 0 when the table is too old to say.
+    cap_height: Int
+    // `fsSelection`.  Bit 7 is `USE_TYPO_METRICS`, which is the font
+    // telling a renderer which of the three ascents it means.
+    fs_selection: Int
+    // The table version, 0 to 5.  Which fields exist depends on it.
+    version: Int
+
+// One glyph's horizontal metrics, in font units.
+//
+// `@value`: two integers, returned whole from a hot call and never
+// placed in a `Result`, an optional or a field of a boxed struct —
+// which is what SPEC § 14.5 asks before an unboxed struct is legal.
+// `h_metrics` cannot fail, so there is no `Result` for it to be
+// trapped in; see its own note for why.
+pub @value
+struct FontHMetrics
+    // How far the pen moves after this glyph, in font units.
+    advance: Int
+    // Left side bearing: the gap from the pen to the glyph's leftmost
+    // outline point.  Can be negative, and routinely is for an italic
+    // `f`.
+    lsb: Int
+
+// The numbers a caller needs to lay out a line, gathered from `head`,
+// `hhea` and `maxp`.
+pub struct FontMetrics
+    // Font units to the em, from `head`.
+    units_per_em: Int
+    // The design bounding box's left edge.
+    x_min: Int
+    // The design bounding box's bottom edge.
+    y_min: Int
+    // The design bounding box's right edge.
+    x_max: Int
+    // The design bounding box's top edge.
+    y_max: Int
+    // How many glyphs.
+    num_glyphs: Int
+    // How many glyphs carry their own advance in `hmtx`.
+    num_h_metrics: Int
+    // The widest advance in the font.
+    advance_max: Int
+    // Whether `head.indexToLocFormat` says `loca` is 32-bit.
+    long_loca: Bool
+
+// Which of the three vertical metric sets a caller wants.
+//
+// No default and no "best": the three exist because three communities
+// wanted different things, and a library that picked would be picking
+// for a caller whose layout it cannot see.
+pub enum FontAscent
+    // `hhea.ascender` / `descender` / `lineGap`.  What a terminal and
+    // most Apple software use; present in every font.
+    FontAscentHhea
+    // `OS/2.sTypoAscender` and its neighbours.  The designer's
+    // intended line spacing, and what the `USE_TYPO_METRICS` flag asks
+    // for.  Zero in a font with a version 0 `OS/2`.
+    FontAscentTypo
+    // `OS/2.usWinAscent` / `usWinDescent`.  The clipping box: nothing
+    // in the font draws outside it, so a caller that must not clip
+    // uses this and accepts the loose leading.
+    FontAscentWin
+
+// A line's vertical extents, in font units, from whichever set was
+// asked for.
+//
+// `descent` is NEGATIVE here whichever source it came from, including
+// `usWinDescent`, which the table stores positive.  Normalising the
+// sign in one place is the point: every caller that has to remember
+// which of five fields is upside down eventually forgets.
+pub struct FontLineMetrics
+    // Above the baseline, positive.
+    ascent: Int
+    // Below the baseline, NEGATIVE.
+    descent: Int
+    // Extra leading between lines.
+    line_gap: Int
+
+// ── Parsing ──────────────────────────────────────────────────────────
+
+// Parse `head`.
+pub fn parse_head(data: Bytes) -> Result<FontHead, fonterror.FontFault> []
+    todo("font-nv.fontmetric.parse_head")
+
+// Parse `hhea`.
+pub fn parse_hhea(data: Bytes) -> Result<FontHhea, fonterror.FontFault> []
+    todo("font-nv.fontmetric.parse_hhea")
+
+// Parse `maxp`.
+pub fn parse_maxp(data: Bytes) -> Result<FontMaxp, fonterror.FontFault> []
+    todo("font-nv.fontmetric.parse_maxp")
+
+// Parse `OS/2`, whichever version it is.
+//
+// Fields the version does not carry come back 0, and
+// `fontmetric.has_x_height` and `has_cap_height` are how a caller
+// tells 0-because-absent from 0-because-zero.
+pub fn parse_os2(data: Bytes) -> Result<FontOs2, fonterror.FontFault> []
+    todo("font-nv.fontmetric.parse_os2")
+
+// Gather the three tables a layout cannot do without.
+//
+// `OS/2` is deliberately not among them: a font may genuinely lack it
+// — an Apple-only TrueType font does — and nothing here needs it to
+// draw.  What it carries goes through `line_metrics` instead, where
+// the caller has already said which ascent set it wants.
+pub fn metrics(head: FontHead, hhea: FontHhea, maxp: FontMaxp) -> FontMetrics []
+    todo("font-nv.fontmetric.metrics")
+
+// ── `hmtx`, and the rule that makes it parsable ──────────────────────
+
+// One glyph's advance and left side bearing.
+//
+// THE RULE THAT SURPRISES EVERY FIRST IMPLEMENTATION: `hmtx` does not
+// have one entry per glyph.  It has `hhea.numberOfHMetrics` pairs
+// followed by side bearings alone, and every glyph at or past that
+// index takes the advance of the LAST pair.  A monospaced font stores
+// exactly one pair, which is the whole point of the design — and a
+// reader that indexed `hmtx` directly gets a correct advance for glyph
+// 0 and garbage for every other glyph in the font.
+//
+// So this cannot fail and does not answer an optional: a glyph id past
+// `num_glyphs` answers the last pair's advance with a zero bearing,
+// which is what a renderer wants anyway, and the id check belongs to
+// the caller that looked the glyph up.
+//
+// ```novo
+// use fontmetric
+// use bytes
+//
+// fn main() [io]
+//     let m = fontmetric.h_metrics(bytes.from_str(""), 1, 100, 42)
+//     println("${m.advance}")
+// ```
+pub fn h_metrics(hmtx: Bytes, num_h_metrics: Int, num_glyphs: Int, glyph: Int) -> FontHMetrics []
+    todo("font-nv.fontmetric.h_metrics")
+
+// Just the advance, for the caller measuring a string and not drawing
+// it.
+pub fn advance_of(hmtx: Bytes, num_h_metrics: Int, num_glyphs: Int, glyph: Int) -> Int []
+    todo("font-nv.fontmetric.advance_of")
+
+// How many bytes `hmtx` should be, from the two counts.
+//
+// `4 * num_h_metrics + 2 * (num_glyphs - num_h_metrics)`.  A table
+// shorter than this was subset by a tool that did not update `hhea`,
+// which happens, and a caller can check before it trusts an advance.
+pub fn hmtx_len(num_h_metrics: Int, num_glyphs: Int) -> Int []
+    todo("font-nv.fontmetric.hmtx_len")
+
+// Whether every glyph in the font shares one advance.
+//
+// True when `num_h_metrics` is 1.  Worth its own name because it is
+// the question a terminal asks of a font before it agrees to use it,
+// and because the `post.isFixedPitch` flag that claims to answer it
+// disagrees with `hmtx` in a fair number of fonts.
+pub fn is_monospaced(m: FontMetrics) -> Bool []
+    todo("font-nv.fontmetric.is_monospaced")
+
+// ── Vertical metrics ─────────────────────────────────────────────────
+
+// The line's extents from whichever of the three sets the caller
+// named, with the descent's sign normalised to negative.
+pub fn line_metrics(hhea: FontHhea, os2: FontOs2, pick: FontAscent) -> FontLineMetrics []
+    todo("font-nv.fontmetric.line_metrics")
+
+// Which set the font itself asks for.
+//
+// `FontAscentTypo` when `OS/2.fsSelection` bit 7 (`USE_TYPO_METRICS`)
+// is set, `FontAscentHhea` otherwise.  A recommendation and not a
+// decision: the caller still passes a `FontAscent` to `line_metrics`,
+// and this is the value to pass when it has no opinion of its own.
+pub fn ascent_recommended(os2: FontOs2) -> FontAscent []
+    todo("font-nv.fontmetric.ascent_recommended")
+
+// Baseline-to-baseline distance in font units, for the chosen set.
+//
+// `ascent - descent + line_gap`, with the descent already negative, so
+// the sign trap is spent once here rather than at every call site.
+pub fn line_height(lm: FontLineMetrics) -> Int []
+    todo("font-nv.fontmetric.line_height")
+
+// Whether the three sets disagree by more than `tolerance` font units.
+//
+// The check a tool runs over a font library.  A caller that never asks
+// it and picks one set is not wrong; a caller whose layout changed
+// when it switched renderers is looking for exactly this number.
+pub fn ascent_sets_disagree(hhea: FontHhea, os2: FontOs2, tolerance: Int) -> Bool []
+    todo("font-nv.fontmetric.ascent_sets_disagree")
+
+// Whether `hhea.descender` is stored with the wrong sign.
+//
+// Positive is wrong — the specification says below the baseline is
+// negative — and enough fonts get it wrong that a renderer either
+// checks or occasionally draws its second line above its first.
+pub fn descender_sign_is_wrong(hhea: FontHhea) -> Bool []
+    todo("font-nv.fontmetric.descender_sign_is_wrong")
+
+// Whether `OS/2` is new enough to carry an x-height.
+pub fn has_x_height(os2: FontOs2) -> Bool []
+    todo("font-nv.fontmetric.has_x_height")
+
+// Whether `OS/2` is new enough to carry a cap height.
+pub fn has_cap_height(os2: FontOs2) -> Bool []
+    todo("font-nv.fontmetric.has_cap_height")
+
+// Whether `head.macStyle` and `OS/2.fsSelection` claim different
+// styles.
+//
+// They should agree; in shipped fonts they often do not, and a font
+// picker that trusts one silently ships the wrong weight.
+pub fn style_disagrees(head: FontHead, os2: FontOs2) -> Bool []
+    todo("font-nv.fontmetric.style_disagrees")
+
+// One bit of `head.flags`, by index.
+pub fn head_flag(head: FontHead, bit: Int) -> Bool []
+    todo("font-nv.fontmetric.head_flag")
+
+// ── Font units to pixels ─────────────────────────────────────────────
+
+// The transform from font units to pixels at `px` pixels per em.
+//
+// THE ONE PLACE THIS PACKAGE CONVERTS, and it hands back a matrix
+// rather than applying it: a rasteriser caches one outline per glyph
+// and multiplies by this per size, which is only possible if the
+// outline never knew the size.
+//
+// The y axis is FLIPPED.  A font's y grows upward from the baseline
+// and an image's y grows downward from the top, and the conversion
+// that forgets it draws every glyph upside down — which is obvious the
+// first time and invisible in a sign error six months later.  The
+// origin lands on the baseline at x = 0, so a caller translates by the
+// pen position and the baseline it chose.
+//
+// ```novo
+// use fontmetric
+//
+// fn main() [io]
+//     let m = FontMetrics { units_per_em: 2048, x_min: 0, y_min: 0, x_max: 0,
+//                           y_max: 0, num_glyphs: 1, num_h_metrics: 1,
+//                           advance_max: 0, long_loca: false }
+//     println("${fontmetric.units_to_px(m, 2048, 16.0)}")    // 16
+// ```
+pub fn scale_for_px(m: FontMetrics, px: Float) -> geomxform.GeomXform []
+    todo("font-nv.fontmetric.scale_for_px")
+
+// The same transform without the y flip, for a caller whose own space
+// already grows upward — an SVG document with a `transform`, a plot.
+pub fn scale_for_px_y_up(m: FontMetrics, px: Float) -> geomxform.GeomXform []
+    todo("font-nv.fontmetric.scale_for_px_y_up")
+
+// One length in font units, as pixels at `px` per em.
+//
+// For advances and line heights, where a whole matrix is more than the
+// caller needs.  Not rounded: rounding per glyph is what makes a long
+// line come out the wrong length, so the caller rounds once at the end.
+pub fn units_to_px(m: FontMetrics, units: Int, px: Float) -> Float []
+    todo("font-nv.fontmetric.units_to_px")
+
+// One length in pixels, as font units at `px` per em.
+//
+// The inverse, for a caller that has a pixel budget — a terminal cell,
+// a column width — and wants to compare it against advances without
+// converting every advance.
+pub fn px_to_units(m: FontMetrics, pixels: Float, px: Float) -> Int []
+    todo("font-nv.fontmetric.px_to_units")
+
+// The pixels-per-em at which one em is `points` points on a `dpi`
+// display.
+//
+// `points * dpi / 72`.  Published because the 72 is the number every
+// caller writes from memory and a third of them write as 72.27.
+pub fn ppem_for_points(points: Float, dpi: Float) -> Float []
+    todo("font-nv.fontmetric.ppem_for_points")
+
+// The design bounding box in pixels at `px` per em, y down.
+//
+// What an atlas allocator needs before it has read a single glyph: no
+// glyph in the font draws outside this box, so a cell this size always
+// fits.
+pub fn px_bounds(m: FontMetrics, px: Float) -> geomrect.GeomRectF []
+    todo("font-nv.fontmetric.px_bounds")

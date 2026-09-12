@@ -1,0 +1,177 @@
+// fontgsub.nv — `GSUB`, cut to two lookup types: ligatures, and single
+// substitution.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE SUBSET IS NAMED RATHER THAN IMPLIED.  `GSUB` has eight lookup
+// types and a chaining context mechanism that amounts to a small
+// pattern language; implementing it is implementing HarfBuzz, and the
+// plan's note for this row says shaping is not in scope.  What IS in
+// scope is the part Latin text needs and notices the absence of:
+//
+//   type 4, ligature substitution — `fi`, `fl`, `ffi`, and whatever
+//   else the font's `liga` feature lists, which is what makes set text
+//   look set rather than typed;
+//
+//   type 1, single substitution — one glyph for one glyph, which is
+//   how `smcp` makes small capitals, `onum` old-style figures and
+//   `zero` a slashed zero.
+//
+// Types 2, 3, 5, 6, 7 and 8 are refused by number through
+// `lookup_types_refused`, and a font whose `liga` feature reaches one
+// answers `FontLookupType` carrying it rather than quietly applying
+// the lookups it did understand — a partly-applied feature is worse
+// than an unapplied one, because the text is inconsistent with itself.
+//
+// FEATURES ARE THE CALLER'S CHOICE, AND `liga` IS NOT ON BY DEFAULT
+// HERE.  A ligature is wrong in a terminal, wrong in a password field,
+// wrong wherever a character has to correspond to a cell — and a
+// library that applied `liga` unasked would be a library a terminal
+// has to work around.  `plan` takes the feature tags to apply, and
+// `default_features` is the list a body of prose wants, published so
+// that the caller who does want the usual answer does not have to
+// invent it.
+
+use fonterror
+
+// One ligature: a sequence of glyphs, and the glyph that replaces it.
+pub struct FontLigature
+    // The glyphs that must appear in order, INCLUDING the first —
+    // `GSUB` stores the tail only, because the first is the coverage
+    // key, and a reader that forgets to put it back matches one glyph
+    // too few.
+    components: [Int]
+    // The glyph they become.
+    glyph: Int
+
+// One single substitution: a glyph and its replacement.
+//
+// `@value`: two integers, held in a list on `FontSubstPlan` and never
+// occupying a `Result`, an optional or a boxed field itself.
+pub @value
+struct FontSubst
+    // The glyph as the `cmap` produced it.
+    from_glyph: Int
+    // The glyph the feature replaces it with.
+    to_glyph: Int
+
+// The substitutions a set of features asks for, gathered once.
+//
+// A plan rather than a live table for the same reason `fontkern` has
+// one: the choice of features is the caller's and is made once, and a
+// per-glyph call that re-read the feature list would re-make it a
+// thousand times a paragraph.
+pub struct FontSubstPlan
+    // Ligatures, sorted by first component then by DESCENDING length,
+    // which is the order `apply` needs: `ffi` must be tried before
+    // `fi`, or the longer ligature can never match.
+    ligatures: [FontLigature]
+    // Single substitutions, sorted by `from_glyph`.
+    singles: [FontSubst]
+    // The feature tags the plan was built from, kept so a caller can
+    // report what it asked for and a test can assert it.
+    features: [Int]
+
+// The lookup types this module applies: `[1, 4]`.
+pub fn lookup_types_covered() -> [Int] []
+    todo("font-nv.fontgsub.lookup_types_covered")
+
+// The lookup types it refuses: `[2, 3, 5, 6, 7, 8]`.
+//
+// 2 is multiple substitution (one glyph becomes several), 3 is
+// alternate (a choice a user interface picks from), 5 and 6 are
+// contextual and chained contextual, 7 is extension positioning and 8
+// is reverse chaining.  A `liga` feature that reaches any of them is
+// a font doing something this package does not do, and the refusal
+// names which.
+pub fn lookup_types_refused() -> [Int] []
+    todo("font-nv.fontgsub.lookup_types_refused")
+
+// The feature tags a body of prose usually wants: `liga`, `kern`,
+// `calt`.
+//
+// Published rather than applied: see this module's header for why a
+// terminal must be able to get none of them, and why the default is
+// therefore the caller's to state.
+pub fn default_features() -> [Int] []
+    todo("font-nv.fontgsub.default_features")
+
+// No substitutions at all.
+//
+// The plan a terminal uses, and the one a caller passes when it wants
+// the shaping loop without any of this: `apply` on it is the identity.
+pub fn no_substitutions() -> FontSubstPlan []
+    todo("font-nv.fontgsub.no_substitutions")
+
+// The feature tags `GSUB` declares for a script and language.
+//
+// For a caller that wants to offer them — a text editor's font panel —
+// and for a report that says what a font can do.
+pub fn features_present(gsub: Bytes, script: Int, language: Int) -> [Int] []
+    todo("font-nv.fontgsub.features_present")
+
+// The scripts `GSUB` declares, as tags.
+pub fn scripts_present(gsub: Bytes) -> [Int] []
+    todo("font-nv.fontgsub.scripts_present")
+
+// Whether a feature exists for a script and language.
+pub fn has_feature(gsub: Bytes, script: Int, language: Int, feature: Int) -> Bool []
+    todo("font-nv.fontgsub.has_feature")
+
+// Build the plan for a set of features.
+//
+// `FontLookupType` when a requested feature reaches a lookup type this
+// module does not apply, carrying the number — so the caller can drop
+// that feature and rebuild, or pick another font, rather than getting
+// half of it.
+pub fn plan(gsub: Bytes, script: Int, language: Int,
+            features: [Int]) -> Result<FontSubstPlan, fonterror.FontFault> []
+    todo("font-nv.fontgsub.plan")
+
+// Every ligature the plan carries.
+pub fn ligatures(p: FontSubstPlan) -> [FontLigature] []
+    todo("font-nv.fontgsub.ligatures")
+
+// Every single substitution the plan carries.
+pub fn singles(p: FontSubstPlan) -> [FontSubst] []
+    todo("font-nv.fontgsub.singles")
+
+// Apply the plan to a glyph run.
+//
+// Longest match first, left to right, one pass: `ffi` wins over `fi`
+// because the ligature list is sorted by descending length, and the
+// sort is part of the plan rather than a rule `apply` re-derives.
+//
+// ```novo
+// use fontgsub
+//
+// fn main() [io]
+//     let p = fontgsub.no_substitutions()
+//     println("${list.len(fontgsub.apply(p, [1, 2, 3]))}")     // 3
+// ```
+pub fn apply(p: FontSubstPlan, glyphs: [Int]) -> [Int] []
+    todo("font-nv.fontgsub.apply")
+
+// Apply the plan, and say which input glyph each output glyph came
+// from.
+//
+// THE CALL A TEXT EDITOR NEEDS AND THE PLAIN ONE CANNOT GIVE IT.  A
+// ligature makes the glyph run shorter than the character run, so a
+// caret placed at output index 4 is at a character index nobody can
+// compute afterwards — the mapping has to come out of the substitution
+// itself.  Answers one index per output glyph, naming the FIRST input
+// glyph that went into it.
+pub fn apply_mapped(p: FontSubstPlan, glyphs: [Int]) -> [Int] []
+    todo("font-nv.fontgsub.apply_mapped")
+
+// How many glyphs a ligature consumes.
+pub fn ligature_len(l: FontLigature) -> Int []
+    todo("font-nv.fontgsub.ligature_len")
+
+// Whether the plan would change this run at all.
+//
+// A cheap pre-check for a caller that caches shaped runs: a run with
+// no `f` in it is untouched by every Latin ligature feature, and
+// knowing that without building the output is worth one pass.
+pub fn changes_anything(p: FontSubstPlan, glyphs: [Int]) -> Bool []
+    todo("font-nv.fontgsub.changes_anything")
