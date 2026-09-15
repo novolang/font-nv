@@ -1,6 +1,6 @@
 [package]
 name        = "font-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "TrueType and OpenType read as an INDEX rather than a file: the table directory answers byte RANGES, `FontSource[e]` is the trait the host implements, and shaping a line of Latin text touches four tables out of twenty.  Glyph outlines come back as svg-nv paths in FONT UNITS with the pixel transform named separately; `cmap` answers glyph 0 for a character the font lacks rather than an optional; kerning has ONE source and never two.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 

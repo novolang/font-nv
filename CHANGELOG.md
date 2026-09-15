@@ -5,6 +5,10 @@ All notable changes to font-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.0.2 — 2026-09-15
+
+- README rewritten to the package README style guide (docs/writing-a-readme.md); no change to the interface.
+
 ## 0.0.1 — 2026-09-11
 
 The **interface**: every signature and every effect row, and no bodies.
@@ -60,3 +64,35 @@ The **interface**: every signature and every effect row, and no bodies.
 - **No device claim.** A firmware with a display ships a bitmap font;
   a claim with no consumer is a claim nobody maintains.
 - The scaffold's `src/font.nv` was dropped for eleven prefixed modules.
+
+### Design notes
+
+Three findings recorded here rather than in the README, which states what the
+package does rather than how it was decided. The manifest's comment on the
+`svg-nv` dependency points at a README section that the 0.0.2 rewrite removed;
+the first note below is that section.
+
+- **The path type is in the wrong package, for the right reason.** A glyph
+  outline is a move, some lines, some quadratic curves and a close, and the
+  only typed path on the registry is svg-nv's. geometry-nv has no path type at
+  all: it stops at `GeomPoly`, a closed list of points, which cannot hold a
+  curve. So a font reader and a rasteriser both depend on an XML writer in
+  order to agree on four curve commands. `SvgPath`, `SvgPathCmd` and
+  `SvgSubpath` describe geometry rather than SVG, and moving them into
+  geometry-nv with svg-nv re-exporting them is a one-package change this row
+  would take the day it lands; nothing here would change but a `use` line.
+  Declaring a `FontPath` instead is worse, because a rasteriser would then
+  have to accept two path types that mean the same thing.
+- **WOFF2 is a real row and its parts are named.** A web font on the wire is
+  WOFF2: the same sfnt tables in a Brotli-compressed container. The parts it
+  needs are this package's table directory, a Brotli decoder, and the format's
+  own glyph-record transform, which is the only genuinely new work. It is not
+  in this package because a font reader that also decompressed would make every
+  consumer download a decompressor to read a `.ttf` off disk.
+- **This package plus a rasteriser replaces a FreeType binding.** A terminal
+  building a glyph atlas today goes through a foreign-function trampoline over
+  FreeType, with a fallback that draws stripes when the C library is missing.
+  Reading the 95 printable ASCII outlines here and filling them with raster-nv
+  is the same path natively. What it buys is not speed — FreeType is faster —
+  it is that drawing a character needs no C library and that the whole path
+  builds for WebAssembly.
