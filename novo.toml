@@ -1,6 +1,6 @@
 [package]
 name        = "font-nv"
-version     = "0.0.2"
+version     = "0.0.3"
 description = "TrueType and OpenType read as an INDEX rather than a file: the table directory answers byte RANGES, `FontSource[e]` is the trait the host implements, and shaping a line of Latin text touches four tables out of twenty.  Glyph outlines come back as svg-nv paths in FONT UNITS with the pixel transform named separately; `cmap` answers glyph 0 for a character the font lacks rather than an optional; kerning has ONE source and never two.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
@@ -50,7 +50,7 @@ novo        = ">= 0.8.9"
 # put two incompatible matrices in one program — which
 # `docs/publishing.md` § Public type names are globally unique says is
 # not a style question but an `E2004` in the consumer.
-geometry-nv = "^0.0.1"
+geometry-nv = "^0.1.0"
 
 # svg-nv, for `SvgPath` and `SvgPathCmd` — and the reason is the same
 # one, with a finding attached.
@@ -69,4 +69,4 @@ geometry-nv = "^0.0.1"
 # downloading an XML writer to agree on four curve commands.  Moving
 # `SvgPath` into geometry-nv and leaving svg-nv to re-export it is a
 # one-package change that this row would take the day it lands.
-svg-nv = "^0.0.1"
+svg-nv = "^0.1.0"
