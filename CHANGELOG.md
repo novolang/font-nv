@@ -5,6 +5,60 @@ All notable changes to font-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.1.0 — 2026-10-29
+
+The first implementation of the interface published as 0.0.3: every function
+has a body.  The package is read, tested and measured against HarfBuzz and
+FreeType on installed fonts, and the line coverage over `src/` is 100%.
+
+### Breaking
+
+These break code written against 0.0.x.
+
+- `FontKernPlan` has two new fields, `later_matrices` and `matrix_lookups`, and
+  the new type `FontKernMatrix` holds one class matrix.  A font splits its
+  class kerning across several sub-tables, so one set of class fields cannot
+  hold it.  Code that builds a `FontKernPlan` by hand adds both fields.
+- `FontKernPair` has a new field, `lookup`, the number of the `kern` lookup
+  that listed the pair.  The adjustments of different lookups add.
+- `fontgsub.lookup_types_refused` is `[2, 3, 5, 6, 8]` and
+  `fontkern.gpos_lookup_types_refused` is `[1, 3, 4, 5, 6, 7, 8]`.  Extension
+  lookups (`GSUB` 7, `GPOS` 9) are read as the lookup they wrap, so they are no
+  longer refused.
+- The ligatures of a `FontSubstPlan` are ordered by first glyph and then by the
+  order the font lists them, not by length.  A font that lists `fi` before `ffi`
+  gets `fi`, as HarfBuzz gives.
+- `FontSubstPlan.features` holds the requested features the font declares for
+  the script, not every feature requested.
+- A script the font does not declare falls back to `DFLT` and `dflt`, as
+  OpenType specifies, in `fontgsub` and `fontkern`.
+- The class arrays of a `FontKernPlan` hold -1 for a left glyph its coverage does
+  not name and for a right glyph its class definition leaves unnamed.
+- The table offsets of a face in a collection count from the start of the file,
+  as the collection format defines them.  `fontdir.parse_directory` adds its `at`
+  argument to each offset, and `fontread.read_face` passes 0.
+- `fontread.read_cmap` reads the whole `cmap` table once instead of the header
+  and one subtable.
+- `fontglyf.components` reads the 2 by 2 transformation of a composite as
+  FreeType does: the second number scales x into y, the third y into x.
+
+### Added
+
+- Bodies for `fontsrc`, `fontdir`, `fonterror`, `fontmetric`, `fontcmap`,
+  `fontglyf`, `fontcff`, `fontgsub`, `fontkern`, `fontshape` and `fontread`.
+- The `FontBuffer` source, which costs no effects.
+- A work limit on a charstring's subroutine calls, on a plan's substitutions and
+  pairs, and on the records one composite outline reads, so a font built to
+  fan out is refused rather than followed.
+- `tests/coverage.sh`, and `tests/oracle/`, which compares this package with
+  HarfBuzz and FreeType on installed fonts.
+
+### Not read
+
+- CID-keyed CFF fonts keep their subroutines per font dictionary, selected by an
+  FDSelect.  Neither is read, so a charstring of such a font that calls a local
+  subroutine is refused with `FontCharstringState`.
+
 ## 0.0.3 — 2026-09-28
 
 The dependency ranges move to the dependencies' current releases.  A

@@ -9,11 +9,6 @@ glyph outline comes back as [svg-nv](https://novo-lang.org/packages/svg-nv)'s
 path type, and the transforms and rectangles are
 [geometry-nv](https://novo-lang.org/packages/geometry-nv)'s.
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is declared with
-its full signature, but every body is a `todo()` that panics when called. The
-package is published so its design can be reviewed and depended on before it
-is implemented. Version 0.1.0 will be the first working release.
-
 ## What it is
 
 A font file is an **index**, not a document. Twelve bytes say how many tables
@@ -58,8 +53,8 @@ adjusts the space between particular pairs.
 | `glyf` | quadratic outlines and composites | yes |
 | `CFF ` | cubic outlines as charstrings | yes |
 | `kern` | the legacy pair kerning table | horizontal format 0 |
-| `GPOS` | positioning, including the modern kerning feature | the pair types |
-| `GSUB` | substitution | ligatures and single substitution |
+| `GPOS` | positioning, including the modern kerning feature | pair adjustment, directly or behind an extension lookup |
+| `GSUB` | substitution | ligatures and single substitution, directly or behind an extension lookup |
 
 | Quantity | Value |
 | --- | --- |
@@ -109,10 +104,7 @@ fn main() [io]
                         Err(f) => println(f.message())
 ```
 
-Build and test with `novo pkg build` and `novo test`. Today `novo test` fails
-on purpose: every test reaches a `not implemented: font-nv.<module>.<fn>`
-panic. The tests are the specification the implementation will have to
-satisfy.
+Build and test with `novo pkg build` and `novo test`.
 
 ## What the package contains
 
@@ -124,7 +116,7 @@ satisfy.
 | `fontcmap` | The subtable list, the published preference order, formats 4 and 12 parsed, and the lookup from a character to a glyph number. |
 | `fontglyf` | `loca` with its entry width carried on the value, quadratic outlines with the implied on-curve points restored, and composite glyphs answered as component records. |
 | `fontcff` | The CFF INDEX and top dictionary, the subroutine bias, and a Type 2 charstring interpreter whose covered and refused operators are both published lists. |
-| `fontkern` | One kerning source chosen once, from `GPOS` or from `kern`, with the pairs and the class tables gathered into a plan. |
+| `fontkern` | One kerning source chosen once, from `GPOS` or from `kern`, with the pairs and the class matrices gathered into a plan. |
 | `fontgsub` | Ligatures and single substitution, with the feature tags the caller's to name. |
 | `fontshape` | A run of text into placed glyphs: the plan, the shaping, the measurement, the cluster map, and the refusal for scripts this package will not lay out. |
 | `fontread` | Twelve loops over a `FontSource`, each written once, and `FontBuffer`, the source over a buffer that costs nothing. |
@@ -223,15 +215,27 @@ in sight.
 15. **Nothing here reorders bidirectional text.** The Unicode bidirectional
     algorithm runs on characters before a font is chosen.
     `fontshape.is_right_to_left` names the property so a caller can route.
-16. **A subtable is picked, not merged.** A `cmap` holds several subtables for
+16. **A script the font does not declare falls back to `DFLT`.** A font that
+    lists its features under `DFLT` alone still kerns and ligates a Latin run,
+    as OpenType specifies. An unlisted script and no `DFLT` finds no feature.
+17. **A ligature is chosen by the font's order, not by its length.** Two
+    ligatures that start with the same glyph are tried in the order the font
+    lists them, and the first that matches wins. A font lists `ffi` before
+    `fi` when it wants `ffi`.
+18. **Kerning adds across lookups and stops within one.** The `kern` feature
+    names lookups, and every lookup adjusts a pair on its own. Within one
+    lookup the first sub-table that gives the pair a non-zero value decides,
+    which is how HarfBuzz reads a class matrix whose first sub-table covers
+    the glyph with a zero.
+19. **A subtable is picked, not merged.** A `cmap` holds several subtables for
     several platform encodings and they do not agree: a symbol font's subtable
     maps `U+F041` rather than `A`. `fontcmap.best_subtable` picks one by the
     order `preference_order` publishes, and the pick is visible in the value.
-17. **What this package refuses is published as data, not as prose.**
+20. **What this package refuses is published as data, not as prose.**
     `fontcmap.formats_refused`, `fontcff.operators_refused`,
     `fontkern.gpos_lookup_types_refused` and `fontgsub.lookup_types_refused`
     are lists a caller can read, so they cannot drift from the code.
-18. **`fonterror.severity` says how much text a fault costs.** A caller
+21. **`fonterror.severity` says how much text a fault costs.** A caller
     deciding between falling back to another font and giving up on text reads
     it, and `is_recoverable` and `substitute_glyph` are the two follow-up
     questions.
@@ -246,6 +250,10 @@ in sight.
 - **Hinting.** The TrueType instruction set is a virtual machine whose job is
   moving points at small sizes, and CFF's hint operators are read and not
   acted on. What that costs is bitmap quality below about 11 pixels per em.
+- **GPOS lookups other than pair adjustment.** Mark attachment, cursive
+  attachment and contextual positioning are not applied, and a lookup of
+  those types in the `kern` feature adds nothing.
+  `fontkern.gpos_lookup_types_refused` lists them.
 - **Rasterising.** This package answers outlines.
   [raster-nv](https://novo-lang.org/packages/raster-nv) fills them.
 - **`cmap` formats 0, 2, 6, 8, 10, 13 and 14.** `fontcmap.formats_refused`
@@ -255,6 +263,11 @@ in sight.
   `fontcff.operators_refused` lists them. They are not equal: `flex` is a
   curve-smoothing pair that shipped fonts use, and its absence loses a shallow
   curve.
+- **CID-keyed CFF fonts.** A CID-keyed font keeps its subroutines in one
+  private dictionary per font dictionary and picks the dictionary for a glyph
+  with an FDSelect. Neither is read, so `parse_top` reports `is_cid` and a
+  charstring that calls a local subroutine is refused with
+  `FontCharstringState`. Most CJK fonts in OpenType form are of this kind.
 - **CFF2 and sfnt-wrapped Type 1.** Both are refused by name. A CFF2 outline
   is a function of design axes rather than a shape, and reading one as CFF
   produces plausible garbage.
@@ -290,19 +303,19 @@ in sight.
 ## Tests
 
 ```bash
-novo test tests/fontdir_tests.nv      # magics, tags, ranges and the two checksums
-novo test tests/fontcmap_tests.nv     # the lookup, and glyph 0
-novo test tests/fontglyf_tests.nv     # loca's entry width, and composites
-novo test tests/fontcff_tests.nv      # the subroutine bias and the interpreter's scope
-novo test tests/fontshape_tests.nv    # metrics, kerning, ligatures and the refusal
-novo test tests/fontsurface_tests.nv  # every entry point, with the types it declares
+novo test                          # every suite
+bash tests/coverage.sh             # the line coverage over src/, merged across the suites
+bash tests/oracle/compare.sh       # this package against HarfBuzz and FreeType, on installed fonts
 ```
 
-The reference implementation for the surface is
-[ttf-parser](https://github.com/RazrFalcon/ttf-parser), which reads a font
-without allocating. `fontTools` is the reference for the parts a reader
-argues about. FreeType is the behavioural reference: where this package and
-FreeType disagree about a glyph, FreeType is right.
+The suites fall in three groups. `fontdir_tests.nv`, `fontcmap_tests.nv`,
+`fontglyf_tests.nv`, `fontcff_tests.nv`, `fontshape_tests.nv` and
+`fontsurface_tests.nv` assert what each table means. `font_edge_tests.nv` and
+the `*_edge_tests.nv` files read every table field by field from fonts
+assembled byte by byte in the test, so each fixture differs from a good table
+in the one field the case names. `hostile_tests.nv`, `font_gap_tests.nv` and
+`font_layout_gap_tests.nv` hold the inputs that are cut short, claim more than
+they contain or repeat themselves, and the branches only those reach.
 
 The expected values are the OpenType specification's own worked examples: the
 format 4 `cmap` with its segments and its terminator, the `hmtx` last-advance
@@ -311,72 +324,22 @@ and the CFF subroutine bias thresholds. A test font is assembled byte by byte,
 a directory in front of the tables it names, which is the same fixture shape
 ttf-parser's own suite uses.
 
+`tests/oracle/compare.sh` shapes five lines of text in thirteen installed
+fonts, with and without the `liga` feature, once through this package and once
+through HarfBuzz, and compares the glyph numbers, each glyph's pen position and
+the run's width. FreeType loads each glyph unscaled and the control box of its
+outline is compared with this package's. The fonts include TrueType and CFF
+outlines, `kern` tables and `GPOS` kerning in class and listed form, extension
+lookups, and one face of a collection. Where this package and FreeType or
+HarfBuzz disagree about a glyph, they are right.
+
 `fontsurface_tests.nv` reaches every entry point with the types the package
-itself produces. An interface package's claim is that its signatures compose,
-and a missing accessor or a type that cannot be constructed from outside is a
-compile error in that file rather than a discovery in the first consumer.
+itself produces. A missing accessor or a type that cannot be constructed from
+outside is a compile error in that file rather than a discovery in the first
+consumer.
 
-The tests compile today and fail at run, each on the
-`not implemented: font-nv.<module>.<fn>` panic that is its body. That is the
-expected state of an interface release. They turn green one at a time as
-bodies land. `novo test --isolate tests/<file>` prints one verdict per test.
-
-## Implementation status
-
-| Item | Implemented |
-| --- | --- |
-| `fontsrc.FontRange`, `.FontSource` | the type and the trait are declared; nothing constructs one |
-| `fontsrc.range`, `.empty`, `.is_empty`, `.range_end`, `.range_fits`, `.sub`, `.slice` | no |
-| `fontsrc.enough`, `.short` | no |
-| `fontdir.FontFlavour`, `.FontTable`, `.FontFace` | the types are declared; nothing constructs one |
-| `fontdir.header_len`, `.directory_len`, `.header_range`, `.directory_range` | no |
-| `fontdir.table_count_of`, `.is_sfnt`, `.flavour`, `.flavour_of`, `.parse_directory` | no |
-| `fontdir.is_collection`, `.collection_faces`, `.collection_header_range`, `.collection_face_at` | no |
-| `fontdir.tag`, `.tag_of`, `.tag_name`, `.tags_for_text`, `.required_tags`, `.missing_required` | no |
-| `fontdir.tag_head`, `.tag_hhea`, `.tag_hmtx`, `.tag_maxp`, `.tag_cmap`, `.tag_loca`, `.tag_glyf` | no |
-| `fontdir.tag_cff`, `.tag_os2`, `.tag_kern`, `.tag_gpos`, `.tag_gsub` | no |
-| `fontdir.table_range`, `.has_table`, `.table_count`, `.table_at`, `.table_tags`, `.ranges_fit`, `.checksum` | no |
-| `fontmetric.FontHead`, `.FontHhea`, `.FontMaxp`, `.FontOs2`, `.FontHMetrics` | the types are declared; nothing constructs one |
-| `fontmetric.FontMetrics`, `.FontAscent`, `.FontLineMetrics` | the types are declared |
-| `fontmetric.parse_head`, `.parse_hhea`, `.parse_maxp`, `.parse_os2`, `.metrics` | no |
-| `fontmetric.h_metrics`, `.advance_of`, `.hmtx_len`, `.is_monospaced` | no |
-| `fontmetric.line_metrics`, `.ascent_recommended`, `.line_height`, `.ascent_sets_disagree` | no |
-| `fontmetric.descender_sign_is_wrong`, `.has_x_height`, `.has_cap_height`, `.style_disagrees`, `.head_flag` | no |
-| `fontmetric.scale_for_px`, `.scale_for_px_y_up`, `.units_to_px`, `.px_to_units`, `.ppem_for_points`, `.px_bounds` | no |
-| `fontcmap.FontCmapSub`, `.FontCmap` | the types are declared; nothing constructs one |
-| `fontcmap.header_len`, `.subtable_count`, `.list_range`, `.subtables`, `.best_subtable`, `.preference_order` | no |
-| `fontcmap.is_readable`, `.formats_covered`, `.formats_refused`, `.parse_subtable` | no |
-| `fontcmap.glyph_for`, `.has_codepoint`, `.glyphs_for` | no |
-| `fontcmap.mapped_count`, `.covered_ranges`, `.max_codepoint`, `.covers_astral` | no |
-| `fontglyf.FontLoca`, `.FontGlyphKind`, `.FontComponent` | the types are declared; nothing constructs one |
-| `fontglyf.component_limit`, `.loca_len`, `.parse_loca`, `.loca_glyph_count` | no |
-| `fontglyf.glyph_range`, `.glyph_file_range`, `.glyph_kind`, `.contour_count`, `.point_count` | no |
-| `fontglyf.outline`, `.glyph_bounds`, `.bounds_from_points` | no |
-| `fontglyf.components`, `.compose`, `.metrics_component`, `.component_glyphs`, `.names_itself` | no |
-| `fontcff.FontCffIndex`, `.FontCffTop`, `.FontCharWidth` | the types are declared; nothing constructs one |
-| `fontcff.header_len`, `.index_at`, `.index_entry`, `.index_end`, `.parse_top` | no |
-| `fontcff.glyph_count`, `.charstring_range`, `.bias`, `.charstring_outline`, `.charstring_width` | no |
-| `fontcff.call_depth_limit`, `.stack_limit`, `.operators_covered`, `.operators_refused` | no |
-| `fontcff.operator_name`, `.is_interpretable`, `.is_cff2` | no |
-| `fontkern.FontKernSource`, `.FontKernPair`, `.FontKernTable`, `.FontKernPlan` | the types are declared; nothing constructs one |
-| `fontkern.kern_source`, `.has_both_sources`, `.plan`, `.no_kerning` | no |
-| `fontkern.kern_subtable_count`, `.kern_is_apple`, `.kern_pairs` | no |
-| `fontkern.gpos_lookup_types_covered`, `.gpos_lookup_types_refused`, `.gpos_has_kern`, `.gpos_scripts` | no |
-| `fontkern.pair_value`, `.run_values`, `.pair_count`, `.kerns_nothing` | no |
-| `fontgsub.FontLigature`, `.FontSubst`, `.FontSubstPlan` | the types are declared; nothing constructs one |
-| `fontgsub.lookup_types_covered`, `.lookup_types_refused`, `.default_features`, `.no_substitutions` | no |
-| `fontgsub.features_present`, `.scripts_present`, `.has_feature`, `.plan` | no |
-| `fontgsub.ligatures`, `.singles`, `.apply`, `.apply_mapped`, `.ligature_len`, `.changes_anything` | no |
-| `fontshape.FontPlaced`, `.FontShaped`, `.FontPlan` | the types are declared; nothing constructs one |
-| `fontshape.plan`, `.shape`, `.shape_codepoints`, `.measure`, `.measure_px`, `.fit_prefix` | no |
-| `fontshape.is_simple_script`, `.first_complex`, `.script_of`, `.is_right_to_left` | no |
-| `fontshape.glyph_count`, `.placed_at`, `.glyph_at_x`, `.cluster_at`, `.has_ligature` | no |
-| `fontread.read_face`, `.read_face_count`, `.read_table`, `.read_tables` | no |
-| `fontread.read_metrics`, `.read_cmap`, `.read_loca`, `.read_outline`, `.read_outlines` | no |
-| `fontread.read_plan`, `.read_subst`, `.read_kerning` | no |
-| `fontread.FontBuffer`, `.buffer` | the type is declared; `buffer` is not implemented |
-| `fonterror.FontFault`, `.FontSeverity`, and the `Error` implementation | the types are declared; `message` is not implemented |
-| `fonterror.fault_table`, `.severity`, `.is_recoverable`, `.substitute_glyph`, `.describe` | no |
+`tests/coverage.sh` merges the line coverage of the suites over `src/` and
+exits non-zero below 100%.
 
 ## Licence
 
