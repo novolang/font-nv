@@ -1,8 +1,6 @@
 // fontread.nv — the loops, written once, over whatever the host can
 // read with.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // EVERY FUNCTION HERE IS EFFECT-POLYMORPHIC, and that is the whole
 // module.  `S: FontSource[e]` binds the effect parameter of this
 // package's own trait (`fontsrc`), and every clause is `[e]`, so the
@@ -69,14 +67,39 @@ use svgpath
 // ```
 pub fn read_face<S: FontSource[e]>(src: S,
                                    index: Int) -> Result<fontdir.FontFace, fonterror.FontFault> [e]
-    todo("font-nv.fontread.read_face")
+    let head = src.font_bytes(fontsrc.range(0, 12))!
+    if fontdir.is_collection(head)
+        let count = fontdir.collection_faces(head)
+        let header = src.font_bytes(fontdir.collection_header_range(count))!
+        let at = fontdir.collection_face_at(header, index)!
+        let face = read_directory(src, at)!
+        return Ok(FontFace { sfnt: face.sfnt, index: index, face_count: count, tables: face.tables })
+    if index != 0
+        return Err(FontNoSuchFace(index, 1))
+    read_directory(src, 0)
+// Read the offset table at `at` and the directory it declares.  Table
+// offsets count from the start of the file, in a font and in the faces of
+// a collection alike.
+fn read_directory<S: FontSource[e]>(src: S,
+                                    at: Int) -> Result<fontdir.FontFace, fonterror.FontFault> [e]
+    let head = src.font_bytes(fontsrc.range(at, fontdir.header_len()))!
+    if not fontdir.is_sfnt(head)
+        return Err(FontNotSfnt(bytes.u32_be_at(head, 0) ?? 0))
+    let n = fontdir.table_count_of(head)
+    let whole = src.font_bytes(fontsrc.range(at, fontdir.header_len() + fontdir.directory_len(n)))!
+    fontdir.parse_directory(whole, 0)
 
 // How many faces the file holds.
 //
 // One read.  For a font manager listing a `.ttc` before it opens any
 // of them.
 pub fn read_face_count<S: FontSource[e]>(src: S) -> Result<Int, fonterror.FontFault> [e]
-    todo("font-nv.fontread.read_face_count")
+    let head = src.font_bytes(fontsrc.range(0, 12))!
+    if fontdir.is_collection(head)
+        return Ok(fontdir.collection_faces(head))
+    if not fontdir.is_sfnt(head)
+        return Err(FontNotSfnt(bytes.u32_be_at(head, 0) ?? 0))
+    Ok(1)
 
 // Read one whole table by tag.
 //
@@ -87,7 +110,9 @@ pub fn read_face_count<S: FontSource[e]>(src: S) -> Result<Int, fonterror.FontFa
 // reporting on a font needs both.
 pub fn read_table<S: FontSource[e]>(src: S, face: fontdir.FontFace,
                                     tag: Int) -> Result<Bytes, fonterror.FontFault> [e]
-    todo("font-nv.fontread.read_table")
+    match fontdir.table_range(face, tag)
+        Some(r) => src.font_bytes(r)
+        None    => Err(FontNoTable(tag))
 
 // Read several tables, in the order the tags are given.
 //
@@ -98,7 +123,12 @@ pub fn read_table<S: FontSource[e]>(src: S, face: fontdir.FontFace,
 // `fontdir.has_table` is how a caller asks the other question.
 pub fn read_tables<S: FontSource[e]>(src: S, face: fontdir.FontFace,
                                      tags: [Int]) -> Result<[Bytes], fonterror.FontFault> [e]
-    todo("font-nv.fontread.read_tables")
+    var out: [Bytes] = []
+    for tag in tags
+        match fontdir.table_range(face, tag)
+            Some(r) => list.push(out, src.font_bytes(r)!)
+            None    => list.push(out, bytes.zeros(0))
+    Ok(out)
 
 // Read `head`, `hhea` and `maxp` and gather the metrics.
 //
@@ -107,19 +137,31 @@ pub fn read_tables<S: FontSource[e]>(src: S, face: fontdir.FontFace,
 // font and a caller deserves to be told which one it was.
 pub fn read_metrics<S: FontSource[e]>(src: S,
                                       face: fontdir.FontFace) -> Result<fontmetric.FontMetrics, fonterror.FontFault> [e]
-    todo("font-nv.fontread.read_metrics")
+    let head = fontmetric.parse_head(read_table(src, face, fontdir.tag_head())!)!
+    let hhea = fontmetric.parse_hhea(read_table(src, face, fontdir.tag_hhea())!)!
+    let maxp = fontmetric.parse_maxp(read_table(src, face, fontdir.tag_maxp())!)!
+    Ok(fontmetric.metrics(head, hhea, maxp))
 
 // Read `cmap` and parse the subtable `fontcmap.best_subtable` picks.
 //
-// Two reads: the header and subtable list, then the one subtable.  The
-// rest of the table — the Mac Roman subtable, the symbol subtable a
-// Unicode font also carries — is never fetched, which on a large font
-// is most of the table.
+// One read of the whole `cmap` table, which holds every subtable the font
+// carries; the one that is picked is parsed and the rest are dropped.
 //
 // `FontNoUsableCmap` when nothing in the list is format 4 or 12.
 pub fn read_cmap<S: FontSource[e]>(src: S,
                                    face: fontdir.FontFace) -> Result<fontcmap.FontCmap, fonterror.FontFault> [e]
-    todo("font-nv.fontread.read_cmap")
+    let range = match fontdir.table_range(face, fontdir.tag_cmap())
+        Some(r) => r
+        None    =>
+            return Err(FontNoTable(fontdir.tag_cmap()))
+    let table = src.font_bytes(range)!
+    let subs = fontcmap.subtables(table, range)!
+    let best = match fontcmap.best_subtable(subs)
+        Some(s) => s
+        None    =>
+            return Err(FontNoUsableCmap)
+    let from = best.range.at - range.at
+    fontcmap.parse_subtable(bytes.slice(table, from, bytes.len(table)), best)
 
 // Read `loca`, having first read `head` for its format.
 //
@@ -129,7 +171,8 @@ pub fn read_cmap<S: FontSource[e]>(src: S,
 // failing.
 pub fn read_loca<S: FontSource[e]>(src: S, face: fontdir.FontFace,
                                    m: fontmetric.FontMetrics) -> Result<fontglyf.FontLoca, fonterror.FontFault> [e]
-    todo("font-nv.fontread.read_loca")
+    let data = read_table(src, face, fontdir.tag_loca())!
+    fontglyf.parse_loca(data, m.num_glyphs, m.long_loca)
 
 // Read one glyph's outline, following composites to their components.
 //
@@ -148,7 +191,48 @@ pub fn read_loca<S: FontSource[e]>(src: S, face: fontdir.FontFace,
 // without reading twenty megabytes.
 pub fn read_outline<S: FontSource[e]>(src: S, face: fontdir.FontFace, loca: fontglyf.FontLoca,
                                       glyph: Int) -> Result<svgpath.SvgPath, fonterror.FontFault> [e]
-    todo("font-nv.fontread.read_outline")
+    let glyf = match fontdir.table_range(face, fontdir.tag_glyf())
+        Some(r) => r
+        None    =>
+            return Err(FontNoTable(fontdir.tag_glyf()))
+    var reads = Reads { left: component_budget() }
+    outline_at(src, glyf, loca, glyph, 0, var reads)
+// How many glyph records one outline may read.  Components may name
+// components many times over, and the depth limit alone still allows a
+// tree of reads no glyph is worth.
+fn component_budget() -> Int
+    4096
+
+// The records still allowed to be read for one outline.
+struct Reads
+    var left: Int
+
+// One glyph's outline, reading its record and, for a composite, its
+// components one level deeper.
+fn outline_at<S: FontSource[e]>(src: S, glyf: fontsrc.FontRange, loca: fontglyf.FontLoca,
+                                glyph: Int, depth: Int,
+                                var reads: Reads) -> Result<svgpath.SvgPath, fonterror.FontFault> [e]
+    if depth > fontglyf.component_limit()
+        return Err(FontCompositeTooDeep(glyph, depth))
+    let range = match fontglyf.glyph_file_range(loca, glyf, glyph)
+        Some(r) => r
+        None    =>
+            return Err(FontNoSuchGlyph(glyph, fontglyf.loca_glyph_count(loca)))
+    if fontsrc.is_empty(range)
+        return Ok(svgpath.empty())
+    reads.left -= 1
+    if reads.left < 0
+        return Err(FontBadField(fontdir.tag_glyf(), "components", component_budget()))
+    let record = src.font_bytes(range)!
+    if fontglyf.glyph_kind(record) != FontGlyphComposite
+        return fontglyf.outline(record)
+    let comps = fontglyf.components(record)!
+    if fontglyf.names_itself(glyph, comps)
+        return Err(FontCompositeTooDeep(glyph, depth + 1))
+    var parts: [svgpath.SvgPath] = []
+    for c in comps
+        list.push(parts, outline_at(src, glyf, loca, c.glyph, depth + 1, var reads)!)
+    fontglyf.compose(record, parts)
 
 // Read several glyphs' outlines in one pass.
 //
@@ -158,7 +242,27 @@ pub fn read_outline<S: FontSource[e]>(src: S, face: fontdir.FontFace, loca: font
 // pays for one forward pass rather than a random walk.
 pub fn read_outlines<S: FontSource[e]>(src: S, face: fontdir.FontFace, loca: fontglyf.FontLoca,
                                        glyphs: [Int]) -> Result<[svgpath.SvgPath], fonterror.FontFault> [e]
-    todo("font-nv.fontread.read_outlines")
+    let glyf = match fontdir.table_range(face, fontdir.tag_glyf())
+        Some(r) => r
+        None    =>
+            return Err(FontNoTable(fontdir.tag_glyf()))
+    var order: [Int] = []
+    for i in 0..list.len(glyphs)
+        var at = 1 << 40
+        match fontglyf.glyph_range(loca, glyphs[i])
+            Some(r) =>
+                at = r.at
+            None    => ()
+        list.push(order, (at << 20) | i)
+    list.sort(order)
+    var out: [svgpath.SvgPath] = []
+    for _ in glyphs
+        list.push(out, svgpath.empty())
+    var reads = Reads { left: component_budget() }
+    for key in order
+        let i = key & 0xFFFFF
+        out[i] = outline_at(src, glyf, loca, glyphs[i], 0, var reads)!
+    Ok(out)
 
 // Read the four tables a Latin run needs and build the shaping plan.
 //
@@ -174,7 +278,14 @@ pub fn read_outlines<S: FontSource[e]>(src: S, face: fontdir.FontFace, loca: fon
 // reports.
 pub fn read_plan<S: FontSource[e]>(src: S, face: fontdir.FontFace, script: Int,
                                    features: [Int]) -> Result<fontshape.FontPlan, fonterror.FontFault> [e]
-    todo("font-nv.fontread.read_plan")
+    let metrics = read_metrics(src, face)!
+    let cmap = read_cmap(src, face)!
+    let hmtx = read_table(src, face, fontdir.tag_hmtx())!
+    var subst = fontgsub.no_substitutions()
+    if list.len(features) > 0
+        subst = read_subst(src, face, script, 0, features)!
+    let kern = read_kerning(src, face, script, 0)!
+    Ok(fontshape.plan(cmap, subst, kern, hmtx, metrics))
 
 // Read the `GSUB` plan alone.
 //
@@ -182,7 +293,10 @@ pub fn read_plan<S: FontSource[e]>(src: S, face: fontdir.FontFace, script: Int,
 // features are on — a text editor toggling small capitals.
 pub fn read_subst<S: FontSource[e]>(src: S, face: fontdir.FontFace, script: Int, language: Int,
                                     features: [Int]) -> Result<fontgsub.FontSubstPlan, fonterror.FontFault> [e]
-    todo("font-nv.fontread.read_subst")
+    if not fontdir.has_table(face, fontdir.tag_gsub())
+        return Ok(fontgsub.no_substitutions())
+    let gsub = read_table(src, face, fontdir.tag_gsub())!
+    fontgsub.plan(gsub, script, language, features)
 
 // Read the kerning plan alone, choosing its one source.
 //
@@ -191,7 +305,13 @@ pub fn read_subst<S: FontSource[e]>(src: S, face: fontdir.FontFace, script: Int,
 // well as a mistake.
 pub fn read_kerning<S: FontSource[e]>(src: S, face: fontdir.FontFace, script: Int,
                                       language: Int) -> Result<fontkern.FontKernPlan, fonterror.FontFault> [e]
-    todo("font-nv.fontread.read_kerning")
+    var gpos = bytes.zeros(0)
+    if fontdir.has_table(face, fontdir.tag_gpos())
+        gpos = read_table(src, face, fontdir.tag_gpos())!
+    var kern = bytes.zeros(0)
+    if fontdir.has_table(face, fontdir.tag_kern()) and not fontkern.gpos_has_kern(gpos, script, language)
+        kern = read_table(src, face, fontdir.tag_kern())!
+    fontkern.plan(gpos, kern, script, language)
 
 // ── For a caller that holds the whole file ───────────────────────────
 
@@ -216,7 +336,7 @@ pub struct FontBuffer
 // let face = fontread.read_face(src, 0)!
 // ```
 pub fn buffer(bytes: Bytes) -> FontBuffer []
-    todo("font-nv.fontread.buffer")
+    FontBuffer { bytes: bytes }
 
 // Reading a buffer costs nothing, which is what the empty row says.
 //
@@ -230,4 +350,7 @@ pub fn buffer(bytes: Bytes) -> FontBuffer []
 // ```
 impl FontSource[] for FontBuffer
     fn font_bytes(self, r: fontsrc.FontRange) -> Result<Bytes, fonterror.FontFault> []
-        todo("font-nv.fontread.buffer_bytes")
+        let end = fontsrc.range_end(r)
+        if r.at < 0 or r.len < 0 or end > bytes.len(self.bytes)
+            return Err(fontsrc.short(0, end, bytes.len(self.bytes)))
+        Ok(fontsrc.slice(self.bytes, r))
