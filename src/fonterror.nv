@@ -1,8 +1,6 @@
 // fonterror.nv — every way a font file can refuse to be read, and the
 // table it was being read from when it did.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // WHY A FAULT CARRIES A TABLE TAG.  A font is twenty independent
 // binary tables that happen to share a file, and "the font is
 // corrupt" is not a sentence anyone can act on.  `FontFault` names
@@ -116,7 +114,13 @@ pub enum FontSeverity
 //     println("${fonterror.fault_table(FontNoUsableCmap)}")    // 0
 // ```
 pub fn fault_table(f: FontFault) -> Int []
-    todo("font-nv.fonterror.fault_table")
+    match f
+        FontShort(t, _, _)        => t
+        FontNoTable(t)            => t
+        FontTableOutside(t, _, _) => t
+        FontBadField(t, _, _)     => t
+        FontLookupType(t, _)      => t
+        _                         => 0
 
 // How much of the text is lost if the caller carries on.
 //
@@ -125,7 +129,37 @@ pub fn fault_table(f: FontFault) -> Int []
 // optional is written in the OpenType specification — and two callers
 // deciding it separately will disagree about `GPOS`.
 pub fn severity(f: FontFault) -> FontSeverity []
-    todo("font-nv.fonterror.severity")
+    match f
+        FontShort(t, _, _)         => table_severity(t)
+        FontNoTable(t)             => table_severity(t)
+        FontTableOutside(t, _, _)  => table_severity(t)
+        FontBadField(t, _, _)      => table_severity(t)
+        FontLookupType(_, _)       => FontDegraded
+        FontNoSuchGlyph(_, _)      => FontGlyphOnly
+        FontCompositeTooDeep(_, _) => FontGlyphOnly
+        FontComponentMissing(_, _) => FontGlyphOnly
+        FontCharstringOp(_)        => FontGlyphOnly
+        FontCharstringState(_)     => FontGlyphOnly
+        _                          => FontFatal
+// The severity of a fault in the table with this tag: the optional
+// tables cost a feature, the outline tables cost a glyph, and any
+// other table, or none, costs the font.
+fn table_severity(t: Int) -> FontSeverity
+    if t == tag_word("kern") or t == tag_word("GPOS") or t == tag_word("GSUB") or t == tag_word("OS/2")
+        return FontDegraded
+    if t == tag_word("glyf") or t == tag_word("loca") or t == tag_word("CFF ")
+        return FontGlyphOnly
+    FontFatal
+
+// The four characters of a tag, big-endian, or `<none>` for 0.
+fn tag_text(t: Int) -> Str
+    if t == 0
+        return "<none>"
+    bytes.byte_list_to_str([(t >> 24) & 255, (t >> 16) & 255, (t >> 8) & 255, t & 255])
+
+// The tag four characters spell.
+fn tag_word(name: Str) -> Int
+    (str.byte_at_or(name, 0, 0) << 24) | (str.byte_at_or(name, 1, 0) << 16) | (str.byte_at_or(name, 2, 0) << 8) | str.byte_at_or(name, 3, 0)
 
 // Whether carrying on leaves readable text.
 //
@@ -133,7 +167,7 @@ pub fn severity(f: FontFault) -> FontSeverity []
 // The one-line form of `severity` for the caller that only wants to
 // know whether to reach for the next font in its list.
 pub fn is_recoverable(f: FontFault) -> Bool []
-    todo("font-nv.fonterror.is_recoverable")
+    severity(f) != FontFatal
 
 // The glyph a caller should draw instead, when the fault is about one
 // glyph.
@@ -142,7 +176,9 @@ pub fn is_recoverable(f: FontFault) -> Bool []
 // defines, so the answer is a constant with a name rather than a magic
 // number in a `match` arm.  `-1` when the fault is not about a glyph.
 pub fn substitute_glyph(f: FontFault) -> Int []
-    todo("font-nv.fonterror.substitute_glyph")
+    if severity(f) == FontGlyphOnly
+        return 0
+    0 - 1
 
 // One line a person can read, naming the table and the numbers.
 //
@@ -157,7 +193,30 @@ pub fn substitute_glyph(f: FontFault) -> Int []
 //     println(fonterror.describe(FontCmapFormat(6)))
 // ```
 pub fn describe(f: FontFault) -> Str []
-    todo("font-nv.fonterror.describe")
+    match f
+        FontShort(t, want, have)               =>
+            "the ${tag_text(t)} table is short: ${want} bytes wanted, ${have} read"
+        FontNotSfnt(magic)                     => "not an sfnt font: the first four bytes are ${magic}"
+        FontNoSuchFace(index, count)           => "no face ${index} in a collection of ${count}"
+        FontNoTable(t)                         => "the font has no ${tag_text(t)} table"
+        FontTableOutside(t, at, len)           =>
+            "the ${tag_text(t)} table names ${len} bytes at ${at}, outside the file"
+        FontBadField(t, field, value)          =>
+            "the ${tag_text(t)} table holds ${value} in ${field}, which the format does not allow"
+        FontCmapFormat(format)                 => "cmap subtable format ${format} is not read"
+        FontNoUsableCmap                       => "the cmap table has no subtable of a format that is read"
+        FontNoSuchGlyph(glyph, count)          => "glyph ${glyph} is past the ${count} glyphs of the font"
+        FontCompositeTooDeep(glyph, depth)     =>
+            "glyph ${glyph} nests components ${depth} deep or names itself"
+        FontComponentMissing(glyph, component) =>
+            "glyph ${glyph} names component ${component}, which was not supplied"
+        FontCharstringOp(op)                   => "charstring operator ${op} is not interpreted"
+        FontCharstringState(reason)            => "charstring is malformed: ${reason}"
+        FontLookupType(t, lookup)              =>
+            "the ${tag_text(t)} table has a lookup of type ${lookup}, which is not applied"
+        FontComplexScript(codepoint)           =>
+            "codepoint ${codepoint} is in a script that needs complex layout"
+        FontSourceFailed(why)                  => "the font source failed: ${why}"
 
 // The `Error` implementation `Result<_, FontFault>` requires.
 //
@@ -170,4 +229,4 @@ pub fn describe(f: FontFault) -> Str []
 // ```
 impl Error for FontFault
     fn message(self) -> Str
-        todo("font-nv.fonterror.message")
+        describe(self)

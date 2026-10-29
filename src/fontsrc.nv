@@ -1,8 +1,6 @@
 // fontsrc.nv — the seam.  A place in a font file, said out loud, and
 // the trait that lets a host fill it.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // THIS MODULE IS THE LOAD-BEARING INTERFACE OF THE PACKAGE.
 //
 // A font is not a document, it is an INDEX: twelve bytes say how many
@@ -84,7 +82,7 @@ pub struct FontRange
 //     println("${r.len} bytes at ${r.at}")
 // ```
 pub fn range(at: Int, len: Int) -> FontRange []
-    todo("font-nv.fontsrc.range")
+    FontRange { at: at, len: len }
 
 // The zero-length range at `at`.
 //
@@ -92,15 +90,15 @@ pub fn range(at: Int, len: Int) -> FontRange []
 // the common case — every space, every unencoded slot — and a reader
 // that meets one should see a word for it rather than a zero.
 pub fn empty(at: Int) -> FontRange []
-    todo("font-nv.fontsrc.empty")
+    FontRange { at: at, len: 0 }
 
 // Whether the range covers no bytes at all.
 pub fn is_empty(r: FontRange) -> Bool []
-    todo("font-nv.fontsrc.is_empty")
+    r.len <= 0
 
 // One past the last byte: `at + len`.
 pub fn range_end(r: FontRange) -> Int []
-    todo("font-nv.fontsrc.range_end")
+    r.at + r.len
 
 // Whether the whole range lies inside a file of `total` bytes.
 //
@@ -109,7 +107,7 @@ pub fn range_end(r: FontRange) -> Int []
 // format stops one naming bytes past the end of the file; a caller
 // doing its own reading asks this before it seeks.
 pub fn range_fits(r: FontRange, total: Int) -> Bool []
-    todo("font-nv.fontsrc.range_fits")
+    r.at >= 0 and r.len >= 0 and r.at + r.len <= total
 
 // A range inside another range, with `at` relative to the outer one.
 //
@@ -119,7 +117,18 @@ pub fn range_fits(r: FontRange, total: Int) -> Bool []
 // so a nested offset that overruns answers a shorter range rather than
 // one pointing outside the table.
 pub fn sub(outer: FontRange, at: Int, len: Int) -> FontRange []
-    todo("font-nv.fontsrc.sub")
+    let outer_end = outer.at + outer.len
+    var start = outer.at + at
+    if start < outer.at
+        start = outer.at
+    if start > outer_end
+        start = outer_end
+    var n = len
+    if n < 0
+        n = 0
+    if n > outer_end - start
+        n = outer_end - start
+    FontRange { at: start, len: n }
 
 // The range's bytes, cut out of a file the caller holds whole.
 //
@@ -130,7 +139,13 @@ pub fn sub(outer: FontRange, at: Int, len: Int) -> FontRange []
 // `FontShort` that names the structure, which is the more useful
 // message.
 pub fn slice(file: Bytes, r: FontRange) -> Bytes []
-    todo("font-nv.fontsrc.slice")
+    let total = bytes.len(file)
+    if r.at < 0 or r.at >= total or r.len <= 0
+        return bytes.zeros(0)
+    var hi = r.at + r.len
+    if hi > total
+        hi = total
+    bytes.slice(file, r.at, hi)
 
 // Whether `have` bytes are enough for a structure needing `want`, and
 // the fault to answer when they are not.
@@ -138,11 +153,11 @@ pub fn slice(file: Bytes, r: FontRange) -> Bytes []
 // Every parser in this package opens with this pair, so the shortfall
 // is reported the same way from twelve places rather than twelve ways.
 pub fn enough(have: Int, want: Int) -> Bool []
-    todo("font-nv.fontsrc.enough")
+    have >= want
 
 // The `FontShort` for a table that ran out.
 pub fn short(table: Int, want: Int, have: Int) -> fonterror.FontFault []
-    todo("font-nv.fontsrc.short")
+    FontShort(table, want, have)
 
 // ── The trait that crosses the layer ─────────────────────────────────
 
