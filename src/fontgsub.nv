@@ -1,13 +1,11 @@
 // fontgsub.nv — `GSUB`, cut to two lookup types: ligatures, and single
 // substitution.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // THE SUBSET IS NAMED RATHER THAN IMPLIED.  `GSUB` has eight lookup
 // types and a chaining context mechanism that amounts to a small
-// pattern language; implementing it is implementing HarfBuzz, and the
-// plan's note for this row says shaping is not in scope.  What IS in
-// scope is the part Latin text needs and notices the absence of:
+// pattern language; implementing it is implementing HarfBuzz, and full
+// shaping is not in scope.  What IS in scope is the part Latin text
+// needs and notices the absence of:
 //
 //   type 4, ligature substitution — `fi`, `fl`, `ffi`, and whatever
 //   else the font's `liga` feature lists, which is what makes set text
@@ -17,7 +15,7 @@
 //   how `smcp` makes small capitals, `onum` old-style figures and
 //   `zero` a slashed zero.
 //
-// Types 2, 3, 5, 6, 7 and 8 are refused by number through
+// Types 2, 3, 5, 6 and 8 are refused by number through
 // `lookup_types_refused`, and a font whose `liga` feature reaches one
 // answers `FontLookupType` carrying it rather than quietly applying
 // the lookups it did understand — a partly-applied feature is worse
@@ -33,6 +31,8 @@
 // invent it.
 
 use fonterror
+use fontsrc
+use fontdir
 
 // One ligature: a sequence of glyphs, and the glyph that replaces it.
 pub struct FontLigature
@@ -62,9 +62,10 @@ struct FontSubst
 // per-glyph call that re-read the feature list would re-make it a
 // thousand times a paragraph.
 pub struct FontSubstPlan
-    // Ligatures, sorted by first component then by DESCENDING length,
-    // which is the order `apply` needs: `ffi` must be tried before
-    // `fi`, or the longer ligature can never match.
+    // Ligatures, sorted by first component and, among those that share
+    // one, in the order the font lists them.  `apply` takes the first
+    // that matches, which is how a font chooses between `ffi` and
+    // `fi`: it lists the one it prefers first.
     ligatures: [FontLigature]
     // Single substitutions, sorted by `from_glyph`.
     singles: [FontSubst]
@@ -74,18 +75,19 @@ pub struct FontSubstPlan
 
 // The lookup types this module applies: `[1, 4]`.
 pub fn lookup_types_covered() -> [Int] []
-    todo("font-nv.fontgsub.lookup_types_covered")
+    [1, 4]
 
-// The lookup types it refuses: `[2, 3, 5, 6, 7, 8]`.
+// The lookup types it refuses: `[2, 3, 5, 6, 8]`.
 //
 // 2 is multiple substitution (one glyph becomes several), 3 is
 // alternate (a choice a user interface picks from), 5 and 6 are
-// contextual and chained contextual, 7 is extension positioning and 8
-// is reverse chaining.  A `liga` feature that reaches any of them is
+// contextual and chained contextual, and 8 is reverse chaining.  Type 7,
+// extension substitution, only wraps the other types at 32-bit offsets
+// and is read as the type it wraps.  A `liga` feature that reaches any of them is
 // a font doing something this package does not do, and the refusal
 // names which.
 pub fn lookup_types_refused() -> [Int] []
-    todo("font-nv.fontgsub.lookup_types_refused")
+    [2, 3, 5, 6, 8]
 
 // The feature tags a body of prose usually wants: `liga`, `kern`,
 // `calt`.
@@ -94,29 +96,121 @@ pub fn lookup_types_refused() -> [Int] []
 // terminal must be able to get none of them, and why the default is
 // therefore the caller's to state.
 pub fn default_features() -> [Int] []
-    todo("font-nv.fontgsub.default_features")
+    [fontdir.tag_of("liga"), fontdir.tag_of("kern"), fontdir.tag_of("calt")]
 
 // No substitutions at all.
 //
 // The plan a terminal uses, and the one a caller passes when it wants
 // the shaping loop without any of this: `apply` on it is the identity.
 pub fn no_substitutions() -> FontSubstPlan []
-    todo("font-nv.fontgsub.no_substitutions")
+    FontSubstPlan { ligatures: [], singles: [], features: [] }
 
 // The feature tags `GSUB` declares for a script and language.
 //
 // For a caller that wants to offer them — a text editor's font panel —
 // and for a report that says what a font can do.
 pub fn features_present(gsub: Bytes, script: Int, language: Int) -> [Int] []
-    todo("font-nv.fontgsub.features_present")
+    var out: [Int] = []
+    for index in feature_indices(gsub, script, language)
+        let tag = feature_tag(gsub, index)
+        if tag != 0
+            list.push(out, tag)
+    out
+// The unsigned 16-bit number at `off`, or -1 when it is not all inside the table.
+fn rd16(data: Bytes, off: Int) -> Int
+    bytes.u16_be_at(data, off) ?? 0 - 1
+
+// The unsigned 32-bit number at `off`, or -1 when it is not all inside the table.
+fn rd32(data: Bytes, off: Int) -> Int
+    bytes.u32_be_at(data, off) ?? 0 - 1
+
+// The signed 16-bit number at `off`, which the caller has checked is inside the table.
+fn rds16(data: Bytes, off: Int) -> Int
+    let v = rd16(data, off)
+    if v >= 32768
+        return v - 65536
+    v
+
+// The offset of a sub-table named by the 16-bit offset at `at`, counted
+// from `base`, or -1 when the offset is 0 or the field is missing.
+fn follow(data: Bytes, base: Int, at: Int) -> Int
+    let rel = rd16(data, at)
+    if rel <= 0
+        return 0 - 1
+    base + rel
+
+// The Script table for a tag, or the one for `DFLT` or `dflt` when the font
+// has none for it, or -1.
+fn script_table(gsub: Bytes, scripts: Int, script: Int) -> Int
+    for wanted in [script, 0x44464C54, 0x64666C74]
+        for i in 0..rd16(gsub, scripts)
+            let rec = scripts + 2 + 6 * i
+            if rd32(gsub, rec) == wanted
+                return follow(gsub, scripts, rec + 4)
+    0 - 1
+
+// The absolute position of the LangSys table for a script and language,
+// or -1.  Language 0 asks for the script's default; another asks for its
+// own record and falls back to the default when the script has none.
+fn langsys_at(gsub: Bytes, script: Int, language: Int) -> Int
+    let scripts = follow(gsub, 0, 4)
+    if scripts < 0
+        return 0 - 1
+    let table = script_table(gsub, scripts, script)
+    if table < 0 or rd16(gsub, table) < 0
+        return 0 - 1
+    if language != 0
+        let n = rd16(gsub, table + 2)
+        for i in 0..n
+            let rec = table + 4 + 6 * i
+            if rd32(gsub, rec) == language
+                return follow(gsub, table, rec + 4)
+    follow(gsub, table, table)
+
+// The feature indices a script and language name, as many as the table holds.
+fn feature_indices(gsub: Bytes, script: Int, language: Int) -> [Int]
+    var out: [Int] = []
+    let lang = langsys_at(gsub, script, language)
+    if lang < 0 or rd16(gsub, lang + 4) < 0
+        return out
+    let required = rd16(gsub, lang + 2)
+    if required >= 0 and required != 0xFFFF
+        list.push(out, required)
+    let n = rd16(gsub, lang + 4)
+    for i in 0..n
+        let index = rd16(gsub, lang + 6 + 2 * i)
+        if index < 0
+            break
+        list.push(out, index)
+    out
+
+// The tag of the feature record at `index`, or 0 when there is none.
+fn feature_tag(gsub: Bytes, index: Int) -> Int
+    let features = follow(gsub, 0, 6)
+    if features < 0 or index >= rd16(gsub, features)
+        return 0
+    let tag = rd32(gsub, features + 2 + 6 * index)
+    if tag < 0
+        0
+    else
+        tag
 
 // The scripts `GSUB` declares, as tags.
 pub fn scripts_present(gsub: Bytes) -> [Int] []
-    todo("font-nv.fontgsub.scripts_present")
+    var out: [Int] = []
+    let scripts = follow(gsub, 0, 4)
+    if scripts < 0
+        return out
+    for i in 0..rd16(gsub, scripts)
+        let tag = rd32(gsub, scripts + 2 + 6 * i)
+        if tag < 0 or rd16(gsub, scripts + 6 + 6 * i) < 0
+            break
+        list.push(out, tag)
+    out
 
 // Whether a feature exists for a script and language.
 pub fn has_feature(gsub: Bytes, script: Int, language: Int, feature: Int) -> Bool []
-    todo("font-nv.fontgsub.has_feature")
+    list.contains(features_present(gsub, script, language), feature)
 
 // Build the plan for a set of features.
 //
@@ -126,21 +220,225 @@ pub fn has_feature(gsub: Bytes, script: Int, language: Int, feature: Int) -> Boo
 // half of it.
 pub fn plan(gsub: Bytes, script: Int, language: Int,
             features: [Int]) -> Result<FontSubstPlan, fonterror.FontFault> []
-    todo("font-nv.fontgsub.plan")
+    let have = bytes.len(gsub)
+    if have < 10
+        return Err(fontsrc.short(fontdir.tag_gsub(), 10, have))
+    let major = rd16(gsub, 0)
+    if major != 1
+        return Err(FontBadField(fontdir.tag_gsub(), "version", major))
+    var lookups: [Int] = []
+    var chosen: [Int] = []
+    for index in feature_indices(gsub, script, language)
+        let tag = feature_tag(gsub, index)
+        if tag != 0 and list.contains(features, tag)
+            if not list.contains(chosen, tag)
+                list.push(chosen, tag)
+            for lookup in feature_lookups(gsub, index)
+                if not list.contains(lookups, lookup)
+                    list.push(lookups, lookup)
+    list.sort(lookups)
+    var found = Found { singles: [], ligatures: [], total: 0 }
+    for lookup in lookups
+        add_lookup(var found, gsub, lookup)!
+    Ok(FontSubstPlan { ligatures: sorted_ligatures(found.ligatures), singles: sorted_singles(found.singles),
+                       features: chosen })
+// What the lookups of a plan have yielded so far.  `singles` holds one
+// number per substitution that packs the glyph pair beside its order.
+struct Found
+    var singles: [Int]
+    var ligatures: [FontLigature]
+    var total: Int
+
+// The most substitutions and ligatures one plan may gather.  A font
+// may point any number of sub-tables at one coverage, and the sum is
+// what a plan holds in memory.
+fn plan_limit() -> Int
+    262144
+
+// The lookup indices a feature names, as many as its table holds.
+fn feature_lookups(gsub: Bytes, index: Int) -> [Int]
+    var out: [Int] = []
+    let features = follow(gsub, 0, 6)
+    let table = follow(gsub, features, features + 2 + 6 * index + 4)
+    if table < 0 or rd16(gsub, table + 2) < 0
+        return out
+    for i in 0..rd16(gsub, table + 2)
+        let lookup = rd16(gsub, table + 4 + 2 * i)
+        if lookup < 0
+            break
+        list.push(out, lookup)
+    out
+
+// Gather the substitutions of one lookup into the plan under way.  A
+// lookup index past the lookup list, and a lookup table too short for its
+// header, contribute nothing; a type this module does not apply is a fault.
+// An extension lookup (type 7) holds sub-tables of one other type at 32-bit
+// offsets, and is read as that type.
+fn add_lookup(var found: Found, gsub: Bytes, lookup: Int) -> Result<Unit, fonterror.FontFault>
+    let lookups = follow(gsub, 0, 8)
+    if lookups < 0 or lookup >= rd16(gsub, lookups)
+        return Ok()
+    let table = follow(gsub, lookups, lookups + 2 + 2 * lookup)
+    if table < 0 or rd16(gsub, table + 4) < 0
+        return Ok()
+    let kind = rd16(gsub, table)
+    if kind != 1 and kind != 4 and kind != 7
+        return Err(FontLookupType(fontdir.tag_gsub(), kind))
+    for i in 0..rd16(gsub, table + 4)
+        var sub = follow(gsub, table, table + 6 + 2 * i)
+        var inner = kind
+        if kind == 7
+            if rd16(gsub, sub) != 1 or rd32(gsub, sub + 4) < 0
+                continue
+            inner = rd16(gsub, sub + 2)
+            if inner != 1 and inner != 4
+                return Err(FontLookupType(fontdir.tag_gsub(), inner))
+            sub = sub + rd32(gsub, sub + 4)
+        if inner == 1
+            add_single(var found, gsub, sub)!
+        else
+            add_ligatures(var found, gsub, sub)!
+    Ok()
+
+// The glyphs a coverage table covers, in coverage order, and how many a
+// walk of it would produce; a range list is counted before it is expanded.
+fn coverage_size(gsub: Bytes, at: Int) -> Int
+    let format = rd16(gsub, at)
+    let n = rd16(gsub, at + 2)
+    var total = 0
+    if format == 1
+        for i in 0..n
+            if rd16(gsub, at + 4 + 2 * i) >= 0
+                total += 1
+    else if format == 2
+        for i in 0..n
+            let first = rd16(gsub, at + 4 + 6 * i)
+            let last = rd16(gsub, at + 6 + 6 * i)
+            if rd16(gsub, at + 8 + 6 * i) >= 0 and last >= first
+                total += last - first + 1
+    total
+
+// Expand a coverage table into its glyphs.
+fn coverage_glyphs(gsub: Bytes, at: Int) -> [Int]
+    var out: [Int] = []
+    let format = rd16(gsub, at)
+    let n = rd16(gsub, at + 2)
+    if format == 1
+        for i in 0..n
+            let g = rd16(gsub, at + 4 + 2 * i)
+            if g < 0
+                break
+            list.push(out, g)
+    else if format == 2
+        for i in 0..n
+            let first = rd16(gsub, at + 4 + 6 * i)
+            let last = rd16(gsub, at + 6 + 6 * i)
+            if rd16(gsub, at + 8 + 6 * i) < 0
+                break
+            for g in first..last + 1
+                list.push(out, g)
+    out
+
+// Charge a count against the plan's limit.
+fn charge(var found: Found, n: Int) -> Result<Unit, fonterror.FontFault>
+    found.total += n
+    if found.total > plan_limit()
+        return Err(FontBadField(fontdir.tag_gsub(), "substitutions", found.total))
+    Ok()
+
+// Add the substitutions of a single-substitution sub-table.
+fn add_single(var found: Found, gsub: Bytes, sub: Int) -> Result<Unit, fonterror.FontFault>
+    let format = rd16(gsub, sub)
+    if rd16(gsub, sub + 4) < 0 or format != 1 and format != 2
+        return Ok()
+    let cov = follow(gsub, sub, sub + 2)
+    charge(var found, coverage_size(gsub, cov))!
+    let covered = coverage_glyphs(gsub, cov)
+    if format == 1
+        let delta = rds16(gsub, sub + 4)
+        for g in covered
+            push_single(var found, g, (g + delta) & 0xFFFF)
+    else
+        let count = rd16(gsub, sub + 4)
+        var k = 0
+        while k < list.len(covered) and k < count and rd16(gsub, sub + 6 + 2 * k) >= 0
+            push_single(var found, covered[k], rd16(gsub, sub + 6 + 2 * k))
+            k += 1
+    Ok()
+
+// Record one substitution, ordered after those before it.
+fn push_single(var found: Found, from: Int, to: Int)
+    list.push(found.singles, (from << 40) | (list.len(found.singles) << 20) | to)
+
+// Add the ligatures of a ligature-substitution sub-table.
+fn add_ligatures(var found: Found, gsub: Bytes, sub: Int) -> Result<Unit, fonterror.FontFault>
+    if rd16(gsub, sub) != 1 or rd16(gsub, sub + 4) < 0
+        return Ok()
+    let cov = follow(gsub, sub, sub + 2)
+    let covered = coverage_glyphs(gsub, cov)
+    for k in 0..rd16(gsub, sub + 4)
+        let set = follow(gsub, sub, sub + 6 + 2 * k)
+        if set < 0 or k >= list.len(covered) or rd16(gsub, set) < 0
+            continue
+        charge(var found, rd16(gsub, set))!
+        for j in 0..rd16(gsub, set)
+            let rec = follow(gsub, set, set + 2 + 2 * j)
+            if rec < 0 or rd16(gsub, rec + 2) < 0
+                continue
+            let n = rd16(gsub, rec + 2)
+            if n == 0
+                continue
+            var parts: [Int] = [covered[k]]
+            var whole = true
+            for t in 1..n
+                let g = rd16(gsub, rec + 4 + 2 * (t - 1))
+                if g < 0
+                    whole = false
+                    break
+                list.push(parts, g)
+            if whole
+                list.push(found.ligatures, FontLigature { components: parts, glyph: rd16(gsub, rec) })
+    Ok()
+
+// The ligatures ordered by first component, and by the order the font
+// lists them within one.
+fn sorted_ligatures(ligs: [FontLigature]) -> [FontLigature]
+    var keys: [Int] = []
+    for i in 0..list.len(ligs)
+        list.push(keys, (ligs[i].components[0] << 40) | i)
+    list.sort(keys)
+    var out: [FontLigature] = []
+    for key in keys
+        list.push(out, ligs[key & 0xFFFFFFFFFF])
+    out
+
+// The substitutions ordered by glyph, the earliest lookup first, with a
+// glyph that more than one lookup replaces kept once.
+fn sorted_singles(packed: [Int]) -> [FontSubst]
+    var keys = list.clone(packed)
+    list.sort(keys)
+    var out: [FontSubst] = []
+    var last = 0 - 1
+    for key in keys
+        let from = key >> 40
+        if from != last
+            list.push(out, FontSubst { from_glyph: from, to_glyph: key & 0xFFFFF })
+            last = from
+    out
 
 // Every ligature the plan carries.
 pub fn ligatures(p: FontSubstPlan) -> [FontLigature] []
-    todo("font-nv.fontgsub.ligatures")
+    p.ligatures[:]
 
 // Every single substitution the plan carries.
 pub fn singles(p: FontSubstPlan) -> [FontSubst] []
-    todo("font-nv.fontgsub.singles")
+    p.singles[:]
 
 // Apply the plan to a glyph run.
 //
-// Longest match first, left to right, one pass: `ffi` wins over `fi`
-// because the ligature list is sorted by descending length, and the
-// sort is part of the plan rather than a rule `apply` re-derives.
+// Left to right, one pass, the first ligature of the plan that matches:
+// `ffi` wins over `fi` when the font lists it first, and the order is
+// part of the plan rather than a rule `apply` re-derives.
 //
 // ```novo
 // use fontgsub
@@ -150,7 +448,65 @@ pub fn singles(p: FontSubstPlan) -> [FontSubst] []
 //     println("${list.len(fontgsub.apply(p, [1, 2, 3]))}")     // 3
 // ```
 pub fn apply(p: FontSubstPlan, glyphs: [Int]) -> [Int] []
-    todo("font-nv.fontgsub.apply")
+    var out: [Int] = []
+    var skip = 0
+    for i in 0..list.len(glyphs)
+        if i < skip
+            continue
+        let (n, g) = step(p, glyphs, i)
+        list.push(out, g)
+        skip = i + n
+    out
+// What happens at position `i`: how many glyphs are consumed and which
+// glyph replaces them.  The first ligature that matches wins, then a
+// single substitution, then the glyph as it is.
+fn step(p: FontSubstPlan, glyphs: [Int], i: Int) -> (Int, Int)
+    let g = glyphs[i]
+    var k = first_ligature(p, g)
+    while k < list.len(p.ligatures) and p.ligatures[k].components[0] == g
+        let lig = p.ligatures[k]
+        if matches_at(lig, glyphs, i)
+            return (list.len(lig.components), lig.glyph)
+        k += 1
+    match single_for(p, g)
+        Some(to) => (1, to)
+        None     => (1, g)
+
+// The index of the first ligature that starts with `g`, or the list length.
+fn first_ligature(p: FontSubstPlan, g: Int) -> Int
+    var lo = 0
+    var hi = list.len(p.ligatures)
+    while lo < hi
+        let mid = (lo + hi) / 2
+        if p.ligatures[mid].components[0] < g
+            lo = mid + 1
+        else
+            hi = mid
+    lo
+
+// Whether the ligature's glyphs are the run's glyphs from position `i`.
+fn matches_at(lig: FontLigature, glyphs: [Int], i: Int) -> Bool
+    if i + list.len(lig.components) > list.len(glyphs)
+        return false
+    for k in 0..list.len(lig.components)
+        if glyphs[i + k] != lig.components[k]
+            return false
+    true
+
+// The glyph a single substitution gives `g`, by binary search.
+fn single_for(p: FontSubstPlan, g: Int) -> ?Int
+    var lo = 0
+    var hi = list.len(p.singles) - 1
+    while lo <= hi
+        let mid = (lo + hi) / 2
+        let from = p.singles[mid].from_glyph
+        if from == g
+            return Some(p.singles[mid].to_glyph)
+        if from < g
+            lo = mid + 1
+        else
+            hi = mid - 1
+    None
 
 // Apply the plan, and say which input glyph each output glyph came
 // from.
@@ -162,11 +518,19 @@ pub fn apply(p: FontSubstPlan, glyphs: [Int]) -> [Int] []
 // itself.  Answers one index per output glyph, naming the FIRST input
 // glyph that went into it.
 pub fn apply_mapped(p: FontSubstPlan, glyphs: [Int]) -> [Int] []
-    todo("font-nv.fontgsub.apply_mapped")
+    var out: [Int] = []
+    var skip = 0
+    for i in 0..list.len(glyphs)
+        if i < skip
+            continue
+        let (n, _) = step(p, glyphs, i)
+        list.push(out, i)
+        skip = i + n
+    out
 
 // How many glyphs a ligature consumes.
 pub fn ligature_len(l: FontLigature) -> Int []
-    todo("font-nv.fontgsub.ligature_len")
+    list.len(l.components)
 
 // Whether the plan would change this run at all.
 //
@@ -174,4 +538,10 @@ pub fn ligature_len(l: FontLigature) -> Int []
 // no `f` in it is untouched by every Latin ligature feature, and
 // knowing that without building the output is worth one pass.
 pub fn changes_anything(p: FontSubstPlan, glyphs: [Int]) -> Bool []
-    todo("font-nv.fontgsub.changes_anything")
+    var i = 0
+    while i < list.len(glyphs)
+        let (n, g) = step(p, glyphs, i)
+        if n > 1 or g != glyphs[i]
+            return true
+        i += n
+    false

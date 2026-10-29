@@ -1,8 +1,6 @@
 // fontkern.nv — pair kerning, from `GPOS` or from `kern`, and NEVER
 // from both.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // THE RULE THIS MODULE EXISTS TO ENFORCE.  A font may carry a legacy
 // `kern` table AND a `GPOS` table with a `kern` feature, and a great
 // many do — the `kern` table for old software, `GPOS` for everything
@@ -28,11 +26,14 @@
 // WHAT IS NOT, AND IS NAMED.  Mark-to-base, mark-to-mark, cursive
 // attachment, contextual positioning, and the device tables that adjust
 // a value per pixel size.  `gpos_lookup_types_covered` lists what is
-// applied and `FontLookupType` carries the number of anything else, so
-// a font that needs more says so instead of coming out unkerned and
-// unexplained.
+// applied; a lookup of any other type in the `kern` feature adds
+// nothing to the plan, and `gpos_lookup_types_refused` lists those
+// types so a caller can tell a font that needs more from one that does
+// not kern.
 
 use fonterror
+use fontsrc
+use fontdir
 
 // Where a font's kerning comes from.
 pub enum FontKernSource
@@ -63,6 +64,12 @@ struct FontKernPair
     // pairs that matter — `AV`, `To`, `Yo` all pull together — so a
     // reader that treated it as a gap would push them apart.
     value: Int
+    // Which lookup of the `kern` feature listed the pair, counted from 0 in
+    // the order the plan gathered them; 0 for every pair of the legacy
+    // table.  The adjustments of different lookups add, and a lookup that
+    // lists a pair with an adjustment does not also consult its class
+    // matrices for it.
+    lookup: Int
 
 // The legacy `kern` table, read.
 //
@@ -104,16 +111,39 @@ pub struct FontKernPlan
     // is a binary search.
     pairs: [FontKernPair]
     // Class assignments for the left glyph, when the source is a
-    // class-based `GPOS` lookup: one class per glyph id, 0 for "not in
-    // any class".
+    // class-based `GPOS` lookup: one class per glyph id, -1 for a
+    // glyph the sub-table's coverage does not name.
     left_classes: [Int]
-    // Class assignments for the right glyph.
+    // Class assignments for the right glyph: -1 for a glyph the class
+    // definition leaves unnamed, which is class 0.
     right_classes: [Int]
     // The class matrix, `left_class_count * right_class_count` values
     // in row-major order.  Empty when the plan is pair-by-pair.
     class_values: [Int]
     // How many right-hand classes there are, which is the matrix's row
     // stride.
+    right_class_count: Int
+    // The class matrices of the later class-based sub-tables, in the
+    // order the font lists them.  A font splits its class kerning
+    // across several sub-tables, and a lookup adjusts a pair by the
+    // first of its matrices that gives the pair a non-zero value; the
+    // first matrix of all is held in the four fields above.
+    later_matrices: [FontKernMatrix]
+    // The lookup that each matrix belongs to, the first matrix first:
+    // the numbers `FontKernPair.lookup` counts in.
+    matrix_lookups: [Int]
+
+// One class matrix, in the form `FontKernPlan` holds the first one.
+pub struct FontKernMatrix
+    // The class of each left glyph id: -1 for a glyph the sub-table's
+    // coverage does not name.
+    left_classes: [Int]
+    // The class of each right glyph id: -1 for a glyph the class
+    // definition leaves unnamed, which is class 0.
+    right_classes: [Int]
+    // The entries in row-major order.
+    class_values: [Int]
+    // The row stride.
     right_class_count: Int
 
 // ── Choosing a source ────────────────────────────────────────────────
@@ -124,7 +154,11 @@ pub struct FontKernPlan
 // table when it does not, nothing when neither.  The whole of the
 // double-kerning rule, in one call.
 pub fn kern_source(has_gpos_kern: Bool, has_kern_table: Bool) -> FontKernSource []
-    todo("font-nv.fontkern.kern_source")
+    if has_gpos_kern
+        return FontKernGpos
+    if has_kern_table
+        return FontKernLegacy
+    FontKernNone
 
 // Whether the face would kern twice if both tables were applied.
 //
@@ -132,7 +166,7 @@ pub fn kern_source(has_gpos_kern: Bool, has_kern_table: Bool) -> FontKernSource 
 // it and a renderer can log it — the situation is common, legal, and
 // the reason this module has a plan rather than two readers.
 pub fn has_both_sources(has_gpos_kern: Bool, has_kern_table: Bool) -> Bool []
-    todo("font-nv.fontkern.has_both_sources")
+    has_gpos_kern and has_kern_table
 
 // ── The legacy `kern` table ──────────────────────────────────────────
 
@@ -143,12 +177,16 @@ pub fn has_both_sources(has_gpos_kern: Bool, has_kern_table: Bool) -> Bool []
 // reads the other's subtable count out of the middle of a length
 // field.
 pub fn kern_subtable_count(data: Bytes) -> Int []
-    todo("font-nv.fontkern.kern_subtable_count")
+    if bytes.len(data) < 4
+        return 0
+    if kern_is_apple(data)
+        return bytes.u32_be_at(data, 4) ?? 0
+    bytes.u16_be_at(data, 2) ?? 0
 
 // Whether the `kern` table uses Apple's header rather than
 // Microsoft's.
 pub fn kern_is_apple(data: Bytes) -> Bool []
-    todo("font-nv.fontkern.kern_is_apple")
+    bytes.len(data) >= 8 and (bytes.u16_be_at(data, 0) ?? 0) == 1
 
 // Every pair in the `kern` table's horizontal format 0 subtables.
 //
@@ -156,7 +194,94 @@ pub fn kern_is_apple(data: Bytes) -> Bool []
 // refused: a font that carries them is not broken, and a horizontal
 // renderer has no use for them.
 pub fn kern_pairs(data: Bytes) -> Result<FontKernTable, fonterror.FontFault> []
-    todo("font-nv.fontkern.kern_pairs")
+    let have = bytes.len(data)
+    if have < 4
+        return Err(fontsrc.short(fontdir.tag_kern(), 4, have))
+    let apple = kern_is_apple(data)
+    let header = if apple
+        8
+    else
+        4
+    let n = kern_subtable_count(data)
+    let sub_header = if apple
+        8
+    else
+        6
+    var found = KernFound { keys: [], values: [], skipped: 0, cost: 0, lookups: [] }
+    var pos = header
+    for _ in 0..n
+        if pos + sub_header > have
+            return Err(fontsrc.short(fontdir.tag_kern(), pos + sub_header, have))
+        var length = 0
+        var coverage = 0
+        if apple
+            length = bytes.u32_be_at(data, pos) ?? 0
+            coverage = bytes.u16_be_at(data, pos + 4) ?? 0
+        else
+            length = bytes.u16_be_at(data, pos + 2) ?? 0
+            coverage = bytes.u16_be_at(data, pos + 4) ?? 0
+        let horizontal = if apple
+            (coverage & 0xC000) == 0
+        else
+            (coverage & 5) == 1
+        let format = if apple
+            coverage & 255
+        else
+            coverage >> 8
+        var step = if length < sub_header
+            sub_header
+        else
+            length
+        if horizontal and format == 0
+            let body = pos + sub_header
+            if body + 8 > have
+                return Err(fontsrc.short(fontdir.tag_kern(), body + 8, have))
+            let pairs = bytes.u16_be_at(data, body) ?? 0
+            let end = body + 8 + 6 * pairs
+            if end > have
+                return Err(fontsrc.short(fontdir.tag_kern(), end, have))
+            for k in 0..pairs
+                let rec = body + 8 + 6 * k
+                push_pair(var found, bytes.u16_be_at(data, rec) ?? 0, bytes.u16_be_at(data, rec + 2) ?? 0,
+                          signed16(bytes.u16_be_at(data, rec + 4) ?? 0), 0)
+            if end - pos > step
+                step = end - pos
+        else
+            found.skipped += 1
+        pos += step
+    var out: [FontKernPair] = []
+    for key in sorted_keys(found.keys)
+        list.push(out, FontKernPair { left: key >> 40, right: (key >> 20) & 0xFFFFF,
+                                      value: found.values[key & 0xFFFFF], lookup: 0 })
+    Ok(FontKernTable { pairs: out, is_apple: apple, subtable_count: n, skipped: found.skipped })
+
+// What the pairs of a `kern` table or a `GPOS` lookup have yielded so far:
+// a packed key that sorts by pair beside the order the pair was met, and
+// the value in that order.
+struct KernFound
+    var keys: [Int]
+    var values: [Int]
+    var skipped: Int
+    var cost: Int
+    var lookups: [Int]
+
+// Record one pair.
+fn push_pair(var found: KernFound, left: Int, right: Int, value: Int, lookup: Int)
+    list.push(found.keys, (left << 40) | (right << 20) | list.len(found.values))
+    list.push(found.values, value)
+    list.push(found.lookups, lookup)
+
+// The packed keys in order.
+fn sorted_keys(keys: [Int]) -> [Int]
+    var copy = list.clone(keys)
+    list.sort(copy)
+    copy
+
+// A 16-bit pattern as the signed number it stands for.
+fn signed16(v: Int) -> Int
+    if v >= 32768
+        return v - 65536
+    v
 
 // ── `GPOS` ───────────────────────────────────────────────────────────
 
@@ -166,24 +291,102 @@ pub fn kern_pairs(data: Bytes) -> Result<FontKernTable, fonterror.FontFault> []
 // constant so it reads the same way as `fontgsub`'s and so an
 // assertion can compare the two.
 pub fn gpos_lookup_types_covered() -> [Int] []
-    todo("font-nv.fontkern.gpos_lookup_types_covered")
+    [2]
 
 // The `GPOS` lookup types it does not, and what each one is for.
 //
 // 1 single adjustment, 3 cursive attachment, 4 mark-to-base, 5
 // mark-to-ligature, 6 mark-to-mark, 7 contextual, 8 chained
-// contextual, 9 extension.  Every one of them is needed by a script
-// this package already refuses to shape, which is why the two
-// refusals are stated together rather than separately.
+// contextual.  Every one of them is needed by a script this package
+// already refuses to shape, which is why the two refusals are stated
+// together rather than separately.  Type 9, extension positioning, only
+// wraps the other types at 32-bit offsets, and a pair-adjustment lookup
+// inside one is read as the lookup it wraps.
 pub fn gpos_lookup_types_refused() -> [Int] []
-    todo("font-nv.fontkern.gpos_lookup_types_refused")
+    [1, 3, 4, 5, 6, 7, 8]
 
 // Whether `GPOS` has a `kern` feature for a script and language.
 //
 // `script` and `language` are four-byte tags — `fontdir.tag_of("latn")`
 // builds one — and a language of 0 means the script's default.
 pub fn gpos_has_kern(gpos: Bytes, script: Int, language: Int) -> Bool []
-    todo("font-nv.fontkern.gpos_has_kern")
+    for index in feature_indices(gpos, script, language)
+        if feature_tag(gpos, index) == fontdir.tag_kern()
+            return true
+    false
+// The unsigned 16-bit number at `off`, or -1 when it is not all inside the table.
+fn rd16(data: Bytes, off: Int) -> Int
+    bytes.u16_be_at(data, off) ?? 0 - 1
+
+// The unsigned 32-bit number at `off`, or -1 when it is not all inside the table.
+fn rd32(data: Bytes, off: Int) -> Int
+    bytes.u32_be_at(data, off) ?? 0 - 1
+
+// The signed 16-bit number at `off`, which the caller has checked is inside the table.
+fn rds16(data: Bytes, off: Int) -> Int
+    signed16(rd16(data, off))
+
+// The offset of a sub-table named by the 16-bit offset at `at`, counted
+// from `base`, or -1 when the offset is 0 or the field is missing.
+fn follow(data: Bytes, base: Int, at: Int) -> Int
+    let rel = rd16(data, at)
+    if rel <= 0
+        return 0 - 1
+    base + rel
+
+// The Script table for a tag, or the one for `DFLT` or `dflt` when the font
+// has none for it, or -1.
+fn script_table(gpos: Bytes, scripts: Int, script: Int) -> Int
+    for wanted in [script, 0x44464C54, 0x64666C74]
+        for i in 0..rd16(gpos, scripts)
+            let rec = scripts + 2 + 6 * i
+            if rd32(gpos, rec) == wanted
+                return follow(gpos, scripts, rec + 4)
+    0 - 1
+
+// The position of the LangSys table for a script and language, or -1.
+// Language 0 asks for the script's default; another asks for its own
+// record and falls back to the default when the script has none.
+fn langsys_at(gpos: Bytes, script: Int, language: Int) -> Int
+    let scripts = follow(gpos, 0, 4)
+    if scripts < 0
+        return 0 - 1
+    let table = script_table(gpos, scripts, script)
+    if table < 0 or rd16(gpos, table) < 0
+        return 0 - 1
+    if language != 0
+        for i in 0..rd16(gpos, table + 2)
+            let rec = table + 4 + 6 * i
+            if rd32(gpos, rec) == language
+                return follow(gpos, table, rec + 4)
+    follow(gpos, table, table)
+
+// The feature indices a script and language name, as many as the table holds.
+fn feature_indices(gpos: Bytes, script: Int, language: Int) -> [Int]
+    var out: [Int] = []
+    let lang = langsys_at(gpos, script, language)
+    if lang < 0 or rd16(gpos, lang + 4) < 0
+        return out
+    let required = rd16(gpos, lang + 2)
+    if required >= 0 and required != 0xFFFF
+        list.push(out, required)
+    for i in 0..rd16(gpos, lang + 4)
+        let index = rd16(gpos, lang + 6 + 2 * i)
+        if index < 0
+            break
+        list.push(out, index)
+    out
+
+// The tag of the feature record at `index`, or 0 when there is none.
+fn feature_tag(gpos: Bytes, index: Int) -> Int
+    let features = follow(gpos, 0, 6)
+    if features < 0 or index >= rd16(gpos, features)
+        return 0
+    let tag = rd32(gpos, features + 2 + 6 * index)
+    if tag < 0
+        0
+    else
+        tag
 
 // The scripts `GPOS` declares, as tags.
 //
@@ -191,7 +394,16 @@ pub fn gpos_has_kern(gpos: Bytes, script: Int, language: Int) -> Bool []
 // wants to say what a font supports rather than guessing from its
 // name.
 pub fn gpos_scripts(gpos: Bytes) -> [Int] []
-    todo("font-nv.fontkern.gpos_scripts")
+    var out: [Int] = []
+    let scripts = follow(gpos, 0, 4)
+    if scripts < 0
+        return out
+    for i in 0..rd16(gpos, scripts)
+        let tag = rd32(gpos, scripts + 2 + 6 * i)
+        if tag < 0 or rd16(gpos, scripts + 6 + 6 * i) < 0
+            break
+        list.push(out, tag)
+    out
 
 // ── The plan ─────────────────────────────────────────────────────────
 
@@ -202,7 +414,18 @@ pub fn gpos_scripts(gpos: Bytes) -> [Int] []
 // inside, once, and is then a field a caller can read and assert on.
 pub fn plan(gpos: Bytes, kern: Bytes, script: Int,
             language: Int) -> Result<FontKernPlan, fonterror.FontFault> []
-    todo("font-nv.fontkern.plan")
+    var has_gpos = false
+    if bytes.len(gpos) > 0
+        has_gpos = gpos_has_kern(gpos, script, language)
+    let has_kern = kern_subtable_count(kern) > 0
+    let source = kern_source(has_gpos, has_kern)
+    if source == FontKernLegacy
+        let table = kern_pairs(kern)!
+        return Ok(FontKernPlan { source: FontKernLegacy, pairs: table.pairs, later_matrices: [], matrix_lookups: [], left_classes: [],
+                                 right_classes: [], class_values: [], right_class_count: 0 })
+    if source == FontKernNone
+        return Ok(no_kerning())
+    gpos_plan(gpos, script, language)
 
 // A plan that kerns nothing.
 //
@@ -210,7 +433,8 @@ pub fn plan(gpos: Bytes, kern: Bytes, script: Int,
 // without a second code path: `pair_value` on this answers 0 for every
 // pair, so the shaping loop stays one loop.
 pub fn no_kerning() -> FontKernPlan []
-    todo("font-nv.fontkern.no_kerning")
+    FontKernPlan { source: FontKernNone, pairs: [], later_matrices: [], matrix_lookups: [], left_classes: [], right_classes: [],
+                   class_values: [], right_class_count: 0 }
 
 // The adjustment between two glyphs, in font units.
 //
@@ -228,7 +452,62 @@ pub fn no_kerning() -> FontKernPlan []
 //     println("${fontkern.pair_value(p, 36, 57)}")      // 0
 // ```
 pub fn pair_value(p: FontKernPlan, left: Int, right: Int) -> Int []
-    todo("font-nv.fontkern.pair_value")
+    var total = 0
+    var done = 0
+    var k = first_pair(p, left, right)
+    while k < list.len(p.pairs) and p.pairs[k].left == left and p.pairs[k].right == right
+        total += p.pairs[k].value
+        if p.pairs[k].value != 0
+            done = done | (1 << (if p.pairs[k].lookup > 62 then 62 else p.pairs[k].lookup))
+        k += 1
+    for i in 0..list.len(p.matrix_lookups)
+        let bit = 1 << (if p.matrix_lookups[i] > 62 then 62 else p.matrix_lookups[i])
+        if (done & bit) == 0
+            let m = matrix_at(p, i)
+            let v = if is_covered(m.left_classes, left)
+                class_value(m, left, right)
+            else
+                0
+            if v != 0
+                total += v
+                done = done | bit
+    total
+
+// The `i`-th class matrix of the plan, the first being the one the plan's
+// own fields hold.
+fn matrix_at(p: FontKernPlan, i: Int) -> FontKernMatrix
+    if i == 0
+        return FontKernMatrix { left_classes: p.left_classes, right_classes: p.right_classes,
+                                class_values: p.class_values, right_class_count: p.right_class_count }
+    p.later_matrices[i - 1]
+// The index of the first pair that is not before (left, right).
+fn first_pair(p: FontKernPlan, left: Int, right: Int) -> Int
+    var lo = 0
+    var hi = list.len(p.pairs)
+    while lo < hi
+        let mid = (lo + hi) / 2
+        let m = p.pairs[mid]
+        if m.left < left or m.left == left and m.right < right
+            lo = mid + 1
+        else
+            hi = mid
+    lo
+
+// Whether the class assignments name the left glyph.
+fn is_covered(left_classes: [Int], left: Int) -> Bool
+    left >= 0 and left < list.len(left_classes) and left_classes[left] >= 0
+
+// The adjustment a class matrix gives a pair whose left glyph it covers.
+// A right glyph the class definition leaves unnamed is in class 0; a
+// class past the matrix adjusts nothing.
+fn class_value(m: FontKernMatrix, left: Int, right: Int) -> Int
+    var rc = 0
+    if right >= 0 and right < list.len(m.right_classes) and m.right_classes[right] >= 0
+        rc = m.right_classes[right]
+    let at = m.left_classes[left] * m.right_class_count + rc
+    if rc >= m.right_class_count or at >= list.len(m.class_values)
+        return 0
+    m.class_values[at]
 
 // Every adjustment along a run, one per gap.
 //
@@ -237,15 +516,290 @@ pub fn pair_value(p: FontKernPlan, left: Int, right: Int) -> Int []
 // advance.  One pass with the search position carried, which is what
 // makes a line cheaper than its pairs looked up separately.
 pub fn run_values(p: FontKernPlan, glyphs: [Int]) -> [Int] []
-    todo("font-nv.fontkern.run_values")
+    var out: [Int] = []
+    for i in 1..list.len(glyphs)
+        list.push(out, pair_value(p, glyphs[i - 1], glyphs[i]))
+    out
 
 // How many pairs the plan can adjust.
 //
 // For a report, and for the test that says a font's kerning was
 // actually read rather than silently emptied.
 pub fn pair_count(p: FontKernPlan) -> Int []
-    todo("font-nv.fontkern.pair_count")
+    var n = list.len(p.pairs)
+    for v in p.class_values
+        if v != 0
+            n += 1
+    for m in p.later_matrices
+        for v in m.class_values
+            if v != 0
+                n += 1
+    n
 
 // Whether the plan adjusts anything at all.
 pub fn kerns_nothing(p: FontKernPlan) -> Bool []
-    todo("font-nv.fontkern.kerns_nothing")
+    pair_count(p) == 0
+
+// ── Reading the `kern` feature's lookups ─────────────────────────────
+
+// The most pairs and covered glyphs one plan may gather.  A font may
+// point any number of sub-tables at one coverage, and the sum is what a
+// plan holds in memory.
+fn plan_limit() -> Int
+    262144
+
+// Build the plan from the `kern` feature's pair-adjustment lookups.  A
+// lookup of another type, an index past the lookup list and a sub-table
+// that cannot be reached each contribute nothing.
+fn gpos_plan(gpos: Bytes, script: Int, language: Int) -> Result<FontKernPlan, fonterror.FontFault>
+    var lookups: [Int] = []
+    for index in feature_indices(gpos, script, language)
+        if feature_tag(gpos, index) == fontdir.tag_kern()
+            for lookup in feature_lookups(gpos, index)
+                if not list.contains(lookups, lookup)
+                    list.push(lookups, lookup)
+    list.sort(lookups)
+    var found = KernFound { keys: [], values: [], skipped: 0, cost: 0, lookups: [] }
+    var matrices: [FontKernMatrix] = []
+    var owners: [Int] = []
+    var ordinal = 0
+    for lookup in lookups
+        add_lookup(var found, var matrices, var owners, gpos, lookup, ordinal)!
+        ordinal += 1
+    var pairs: [FontKernPair] = []
+    for key in sorted_keys(found.keys)
+        list.push(pairs, FontKernPair { left: key >> 40, right: (key >> 20) & 0xFFFFF,
+                                        value: found.values[key & 0xFFFFF],
+                                        lookup: found.lookups[key & 0xFFFFF] })
+    if list.len(matrices) == 0
+        return Ok(FontKernPlan { source: FontKernGpos, pairs: pairs, left_classes: [],
+                                 right_classes: [], class_values: [], right_class_count: 0,
+                                 later_matrices: [], matrix_lookups: [] })
+    let first = matrices[0]
+    Ok(FontKernPlan { source: FontKernGpos, pairs: pairs, left_classes: first.left_classes,
+                      right_classes: first.right_classes, class_values: first.class_values,
+                      right_class_count: first.right_class_count,
+                      later_matrices: list.slice(matrices, 1, list.len(matrices)),
+                      matrix_lookups: owners })
+
+// The lookup indices a feature names, as many as its table holds.
+fn feature_lookups(gpos: Bytes, index: Int) -> [Int]
+    var out: [Int] = []
+    let features = follow(gpos, 0, 6)
+    let table = follow(gpos, features, features + 2 + 6 * index + 4)
+    if table < 0 or rd16(gpos, table + 2) < 0
+        return out
+    for i in 0..rd16(gpos, table + 2)
+        let lookup = rd16(gpos, table + 4 + 2 * i)
+        if lookup >= 0
+            list.push(out, lookup)
+    out
+
+// Charge a count against the plan's limit.
+fn charge(var found: KernFound, n: Int) -> Result<Unit, fonterror.FontFault>
+    found.cost += n
+    if found.cost > plan_limit()
+        return Err(FontBadField(fontdir.tag_gpos(), "pairs", found.cost))
+    Ok()
+
+// Gather the pairs of one lookup.
+fn add_lookup(var found: KernFound, var matrices: [FontKernMatrix], var owners: [Int], gpos: Bytes,
+              lookup: Int, ordinal: Int) -> Result<Unit, fonterror.FontFault>
+    let lookups = follow(gpos, 0, 8)
+    if lookups < 0 or lookup >= rd16(gpos, lookups)
+        return Ok()
+    let table = follow(gpos, lookups, lookups + 2 + 2 * lookup)
+    let kind = rd16(gpos, table)
+    if table < 0 or rd16(gpos, table + 4) < 0 or kind != 2 and kind != 9
+        return Ok()
+    for i in 0..rd16(gpos, table + 4)
+        var sub = follow(gpos, table, table + 6 + 2 * i)
+        if kind == 9
+            if rd16(gpos, sub) != 1 or rd16(gpos, sub + 2) != 2 or rd32(gpos, sub + 4) < 0
+                continue
+            sub = sub + rd32(gpos, sub + 4)
+        let format = rd16(gpos, sub)
+        if format == 1
+            add_listed(var found, gpos, sub, ordinal)!
+        else if format == 2
+            add_classes(var found, var matrices, var owners, gpos, sub, ordinal)!
+    Ok()
+
+// The glyphs a coverage table covers, in coverage order, and how many a
+// walk of it would produce; a range list is counted before it is expanded.
+fn coverage_size(gpos: Bytes, at: Int) -> Int
+    let format = rd16(gpos, at)
+    let n = rd16(gpos, at + 2)
+    var total = 0
+    if format == 1
+        for i in 0..n
+            if rd16(gpos, at + 4 + 2 * i) < 0
+                break
+            total += 1
+    else if format == 2
+        for i in 0..n
+            let first = rd16(gpos, at + 4 + 6 * i)
+            let last = rd16(gpos, at + 6 + 6 * i)
+            if rd16(gpos, at + 8 + 6 * i) < 0
+                break
+            if last >= first
+                total += last - first + 1
+    total
+
+// Expand a coverage table into its glyphs.
+fn coverage_glyphs(gpos: Bytes, at: Int) -> [Int]
+    var out: [Int] = []
+    let format = rd16(gpos, at)
+    let n = rd16(gpos, at + 2)
+    if format == 1
+        for i in 0..n
+            let g = rd16(gpos, at + 4 + 2 * i)
+            if g < 0
+                break
+            list.push(out, g)
+    else if format == 2
+        for i in 0..n
+            let first = rd16(gpos, at + 4 + 6 * i)
+            let last = rd16(gpos, at + 6 + 6 * i)
+            if rd16(gpos, at + 8 + 6 * i) < 0
+                break
+            for g in first..last + 1
+                list.push(out, g)
+    out
+
+// How many bytes a value record of this format takes: two per field.
+fn value_size(format: Int) -> Int
+    var n = 0
+    for bit in 0..8
+        if ((format >> bit) & 1) == 1
+            n += 2
+    n
+
+// Where the advance sits inside a value record of this format, or -1
+// when the format has no advance.  The fields before it are the two
+// placements, in order.
+fn x_advance_at(format: Int) -> Int
+    if (format & 4) == 0
+        return 0 - 1
+    var before = 0
+    if (format & 1) == 1
+        before += 2
+    if (format & 2) == 2
+        before += 2
+    before
+
+// Add the pairs of a pair-adjustment sub-table that lists them.
+fn add_listed(var found: KernFound, gpos: Bytes, sub: Int,
+              ordinal: Int) -> Result<Unit, fonterror.FontFault>
+    let size1 = value_size(rd16(gpos, sub + 4))
+    let size2 = value_size(rd16(gpos, sub + 6))
+    let advance = x_advance_at(rd16(gpos, sub + 4))
+    let sets = rd16(gpos, sub + 8)
+    if sets < 0
+        return Ok()
+    let cov = follow(gpos, sub, sub + 2)
+    charge(var found, coverage_size(gpos, cov))!
+    let covered = coverage_glyphs(gpos, cov)
+    let record = 2 + size1 + size2
+    var k = 0
+    while k < sets and k < list.len(covered)
+        let set = follow(gpos, sub, sub + 10 + 2 * k)
+        k += 1
+        if set < 0 or rd16(gpos, set) < 0
+            continue
+        for j in 0..rd16(gpos, set)
+            let rec = set + 2 + record * j
+            if rec + record > bytes.len(gpos)
+                break
+            charge(var found, 1)!
+            var value = 0
+            if advance >= 0
+                value = rds16(gpos, rec + 2 + advance)
+            push_pair(var found, covered[k - 1], rd16(gpos, rec), value, ordinal)
+    Ok()
+
+// Add the class matrix of a class-based pair-adjustment sub-table, when
+// the table holds the matrix it declares.
+fn add_classes(var found: KernFound, var matrices: [FontKernMatrix], var owners: [Int], gpos: Bytes,
+               sub: Int, ordinal: Int) -> Result<Unit, fonterror.FontFault>
+    let cov = follow(gpos, sub, sub + 2)
+    charge(var found, coverage_size(gpos, cov))!
+    let advance = x_advance_at(rd16(gpos, sub + 4))
+    let record = value_size(rd16(gpos, sub + 4)) + value_size(rd16(gpos, sub + 6))
+    let rows = rd16(gpos, sub + 12)
+    let columns = rd16(gpos, sub + 14)
+    if advance < 0 or rows <= 0 or columns <= 0
+        return Ok()
+    if sub + 16 + rows * columns * record > bytes.len(gpos)
+        return Ok()
+    var values: [Int] = []
+    for r in 0..rows * columns
+        list.push(values, rds16(gpos, sub + 16 + r * record + advance))
+    let covered = coverage_glyphs(gpos, cov)
+    var size = 0
+    for g in covered
+        if g + 1 > size
+            size = g + 1
+    var left: [Int] = []
+    for _ in 0..size
+        list.push(left, 0 - 1)
+    for g in covered
+        left[g] = 0
+    let named = class_array(gpos, follow(gpos, sub, sub + 8), size)
+    for g in 0..size
+        if left[g] >= 0 and named[g] >= 0
+            left[g] = named[g]
+    let extent = class_extent(gpos, follow(gpos, sub, sub + 10))
+    list.push(matrices, FontKernMatrix { left_classes: left,
+                                         right_classes: class_array(gpos, follow(gpos, sub, sub + 10), extent),
+                                         class_values: values, right_class_count: columns })
+    list.push(owners, ordinal)
+    Ok()
+
+// How many glyph ids a class definition names, from 0 to its highest.
+fn class_extent(gpos: Bytes, at: Int) -> Int
+    var top = 0
+    let format = rd16(gpos, at)
+    if format == 1 and rd16(gpos, at + 4) >= 0
+        top = rd16(gpos, at + 2) + rd16(gpos, at + 4)
+    else if format == 2
+        for i in 0..rd16(gpos, at + 2)
+            let last = rd16(gpos, at + 6 + 6 * i)
+            if rd16(gpos, at + 8 + 6 * i) < 0
+                break
+            if last + 1 > top
+                top = last + 1
+    if top > 65536
+        return 65536
+    top
+
+// The class of each glyph id below `size`, -1 where the definition names
+// none, reading only the records the table holds and stopping after a
+// bounded number of assignments.
+fn class_array(gpos: Bytes, at: Int, size: Int) -> [Int]
+    var out: [Int] = []
+    for _ in 0..size
+        list.push(out, 0 - 1)
+    let format = rd16(gpos, at)
+    var work = 0
+    if format == 1 and rd16(gpos, at + 4) >= 0
+        let start = rd16(gpos, at + 2)
+        for i in 0..rd16(gpos, at + 4)
+            let class = rd16(gpos, at + 6 + 2 * i)
+            if class < 0
+                break
+            if start + i < size
+                out[start + i] = class
+    else if format == 2
+        for i in 0..rd16(gpos, at + 2)
+            let first = rd16(gpos, at + 4 + 6 * i)
+            let last = rd16(gpos, at + 6 + 6 * i)
+            let class = rd16(gpos, at + 8 + 6 * i)
+            if class < 0 or work > plan_limit()
+                break
+            var g = first
+            while g <= last and g < size
+                out[g] = class
+                g += 1
+            work += last - first + 1
+    out
