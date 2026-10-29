@@ -2,8 +2,6 @@
 // numbers a line of text is laid out with, and the transform that
 // turns them into pixels.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // THE UNIT RULE, WHICH IS THE WHOLE MODULE.  Every number a font
 // stores is in FONT UNITS — `unitsPerEm` of them to an em, 1000 in a
 // CFF font and 2048 in most TrueType ones — and a font unit is not a
@@ -32,6 +30,7 @@
 use geomrect
 use geomxform
 use fonterror
+use fontdir
 
 // The `head` table's fields that a reader needs.
 //
@@ -204,15 +203,62 @@ pub struct FontLineMetrics
 
 // Parse `head`.
 pub fn parse_head(data: Bytes) -> Result<FontHead, fonterror.FontFault> []
-    todo("font-nv.fontmetric.parse_head")
+    let have = bytes.len(data)
+    if have < 54
+        return Err(FontShort(fontdir.tag_head(), 54, have))
+    let magic = bytes.u32_be_at(data, 12) ?? 0
+    if magic != 0x5F0F3CF5
+        return Err(FontBadField(fontdir.tag_head(), "magicNumber", magic))
+    let upem = u16_at(data, 18)
+    if upem < 16 or upem > 16384
+        return Err(FontBadField(fontdir.tag_head(), "unitsPerEm", upem))
+    let loc = i16_at(data, 50)
+    if loc != 0 and loc != 1
+        return Err(FontBadField(fontdir.tag_head(), "indexToLocFormat", loc))
+    Ok(FontHead { units_per_em: upem, x_min: i16_at(data, 36), y_min: i16_at(data, 38),
+                  x_max: i16_at(data, 40), y_max: i16_at(data, 42), flags: u16_at(data, 16),
+                  mac_style: u16_at(data, 44), index_to_loc_format: loc,
+                  lowest_rec_ppem: u16_at(data, 46) })
+
+// The unsigned 16-bit number at `off`, or 0 past the end.
+fn u16_at(data: Bytes, off: Int) -> Int
+    bytes.u16_be_at(data, off) ?? 0
+
+// The signed 16-bit number at `off`, or 0 past the end.
+fn i16_at(data: Bytes, off: Int) -> Int
+    let v = u16_at(data, off)
+    if v >= 32768
+        return v - 65536
+    v
 
 // Parse `hhea`.
 pub fn parse_hhea(data: Bytes) -> Result<FontHhea, fonterror.FontFault> []
-    todo("font-nv.fontmetric.parse_hhea")
+    let have = bytes.len(data)
+    if have < 36
+        return Err(FontShort(fontdir.tag_hhea(), 36, have))
+    let version = bytes.u32_be_at(data, 0) ?? 0
+    if version != 0x00010000
+        return Err(FontBadField(fontdir.tag_hhea(), "version", version))
+    let count = u16_at(data, 34)
+    if count == 0
+        return Err(FontBadField(fontdir.tag_hhea(), "numberOfHMetrics", count))
+    Ok(FontHhea { ascender: i16_at(data, 4), descender: i16_at(data, 6), line_gap: i16_at(data, 8),
+                  advance_max: u16_at(data, 10), caret_slope_rise: i16_at(data, 18),
+                  caret_slope_run: i16_at(data, 20), num_h_metrics: count })
 
 // Parse `maxp`.
 pub fn parse_maxp(data: Bytes) -> Result<FontMaxp, fonterror.FontFault> []
-    todo("font-nv.fontmetric.parse_maxp")
+    let have = bytes.len(data)
+    if have < 6
+        return Err(FontShort(fontdir.tag_maxp(), 6, have))
+    let version = bytes.u32_be_at(data, 0) ?? 0
+    if version == 0x00005000
+        return Ok(FontMaxp { num_glyphs: u16_at(data, 4), max_component_depth: 0 })
+    if version != 0x00010000
+        return Err(FontBadField(fontdir.tag_maxp(), "version", version))
+    if have < 32
+        return Err(FontShort(fontdir.tag_maxp(), 32, have))
+    Ok(FontMaxp { num_glyphs: u16_at(data, 4), max_component_depth: u16_at(data, 30) })
 
 // Parse `OS/2`, whichever version it is.
 //
@@ -220,7 +266,33 @@ pub fn parse_maxp(data: Bytes) -> Result<FontMaxp, fonterror.FontFault> []
 // `fontmetric.has_x_height` and `has_cap_height` are how a caller
 // tells 0-because-absent from 0-because-zero.
 pub fn parse_os2(data: Bytes) -> Result<FontOs2, fonterror.FontFault> []
-    todo("font-nv.fontmetric.parse_os2")
+    let have = bytes.len(data)
+    if have < 2
+        return Err(FontShort(fontdir.tag_os2(), 2, have))
+    let version = u16_at(data, 0)
+    if version > 5
+        return Err(FontBadField(fontdir.tag_os2(), "version", version))
+    let want = os2_length(version)
+    if have < want
+        return Err(FontShort(fontdir.tag_os2(), want, have))
+    var x_height = 0
+    var cap_height = 0
+    if version >= 2
+        x_height = i16_at(data, 86)
+        cap_height = i16_at(data, 88)
+    Ok(FontOs2 { typo_ascender: i16_at(data, 68), typo_descender: i16_at(data, 70),
+                 typo_line_gap: i16_at(data, 72), win_ascent: u16_at(data, 74),
+                 win_descent: u16_at(data, 76), x_height: x_height, cap_height: cap_height,
+                 fs_selection: u16_at(data, 62), version: version })
+// How many bytes an `OS/2` of this version holds.
+fn os2_length(version: Int) -> Int
+    if version == 0
+        return 78
+    if version == 1
+        return 86
+    if version <= 4
+        return 96
+    100
 
 // Gather the three tables a layout cannot do without.
 //
@@ -229,7 +301,10 @@ pub fn parse_os2(data: Bytes) -> Result<FontOs2, fonterror.FontFault> []
 // draw.  What it carries goes through `line_metrics` instead, where
 // the caller has already said which ascent set it wants.
 pub fn metrics(head: FontHead, hhea: FontHhea, maxp: FontMaxp) -> FontMetrics []
-    todo("font-nv.fontmetric.metrics")
+    FontMetrics { units_per_em: head.units_per_em, x_min: head.x_min, y_min: head.y_min,
+                  x_max: head.x_max, y_max: head.y_max, num_glyphs: maxp.num_glyphs,
+                  num_h_metrics: hhea.num_h_metrics, advance_max: hhea.advance_max,
+                  long_loca: head.index_to_loc_format == 1 }
 
 // ── `hmtx`, and the rule that makes it parsable ──────────────────────
 
@@ -257,12 +332,20 @@ pub fn metrics(head: FontHead, hhea: FontHhea, maxp: FontMaxp) -> FontMetrics []
 //     println("${m.advance}")
 // ```
 pub fn h_metrics(hmtx: Bytes, num_h_metrics: Int, num_glyphs: Int, glyph: Int) -> FontHMetrics []
-    todo("font-nv.fontmetric.h_metrics")
+    if glyph < 0 or num_h_metrics <= 0
+        return FontHMetrics { advance: 0, lsb: 0 }
+    if glyph < num_h_metrics
+        return FontHMetrics { advance: u16_at(hmtx, 4 * glyph), lsb: i16_at(hmtx, 4 * glyph + 2) }
+    let advance = u16_at(hmtx, 4 * (num_h_metrics - 1))
+    if glyph >= num_glyphs
+        return FontHMetrics { advance: advance, lsb: 0 }
+    FontHMetrics { advance: advance,
+        lsb: i16_at(hmtx, 4 * num_h_metrics + 2 * (glyph - num_h_metrics)) }
 
 // Just the advance, for the caller measuring a string and not drawing
 // it.
 pub fn advance_of(hmtx: Bytes, num_h_metrics: Int, num_glyphs: Int, glyph: Int) -> Int []
-    todo("font-nv.fontmetric.advance_of")
+    h_metrics(hmtx, num_h_metrics, num_glyphs, glyph).advance
 
 // How many bytes `hmtx` should be, from the two counts.
 //
@@ -270,7 +353,10 @@ pub fn advance_of(hmtx: Bytes, num_h_metrics: Int, num_glyphs: Int, glyph: Int) 
 // shorter than this was subset by a tool that did not update `hhea`,
 // which happens, and a caller can check before it trusts an advance.
 pub fn hmtx_len(num_h_metrics: Int, num_glyphs: Int) -> Int []
-    todo("font-nv.fontmetric.hmtx_len")
+    var bearings_only = num_glyphs - num_h_metrics
+    if bearings_only < 0
+        bearings_only = 0
+    4 * num_h_metrics + 2 * bearings_only
 
 // Whether every glyph in the font shares one advance.
 //
@@ -279,14 +365,26 @@ pub fn hmtx_len(num_h_metrics: Int, num_glyphs: Int) -> Int []
 // and because the `post.isFixedPitch` flag that claims to answer it
 // disagrees with `hmtx` in a fair number of fonts.
 pub fn is_monospaced(m: FontMetrics) -> Bool []
-    todo("font-nv.fontmetric.is_monospaced")
+    m.num_h_metrics == 1
 
 // ── Vertical metrics ─────────────────────────────────────────────────
 
 // The line's extents from whichever of the three sets the caller
 // named, with the descent's sign normalised to negative.
 pub fn line_metrics(hhea: FontHhea, os2: FontOs2, pick: FontAscent) -> FontLineMetrics []
-    todo("font-nv.fontmetric.line_metrics")
+    match pick
+        FontAscentHhea => FontLineMetrics { ascent: hhea.ascender, descent: below(hhea.descender),
+                                            line_gap: hhea.line_gap }
+        FontAscentTypo => FontLineMetrics { ascent: os2.typo_ascender,
+                                            descent: below(os2.typo_descender),
+                                            line_gap: os2.typo_line_gap }
+        FontAscentWin  => FontLineMetrics { ascent: os2.win_ascent, descent: below(os2.win_descent),
+                                            line_gap: 0 }
+// A distance below the baseline as a negative number, whichever sign the table stored.
+fn below(d: Int) -> Int
+    if d > 0
+        return 0 - d
+    d
 
 // Which set the font itself asks for.
 //
@@ -295,14 +393,16 @@ pub fn line_metrics(hhea: FontHhea, os2: FontOs2, pick: FontAscent) -> FontLineM
 // decision: the caller still passes a `FontAscent` to `line_metrics`,
 // and this is the value to pass when it has no opinion of its own.
 pub fn ascent_recommended(os2: FontOs2) -> FontAscent []
-    todo("font-nv.fontmetric.ascent_recommended")
+    if (os2.fs_selection & 128) != 0
+        return FontAscentTypo
+    FontAscentHhea
 
 // Baseline-to-baseline distance in font units, for the chosen set.
 //
 // `ascent - descent + line_gap`, with the descent already negative, so
 // the sign trap is spent once here rather than at every call site.
 pub fn line_height(lm: FontLineMetrics) -> Int []
-    todo("font-nv.fontmetric.line_height")
+    lm.ascent - lm.descent + lm.line_gap
 
 // Whether the three sets disagree by more than `tolerance` font units.
 //
@@ -310,7 +410,22 @@ pub fn line_height(lm: FontLineMetrics) -> Int []
 // it and picks one set is not wrong; a caller whose layout changed
 // when it switched renderers is looking for exactly this number.
 pub fn ascent_sets_disagree(hhea: FontHhea, os2: FontOs2, tolerance: Int) -> Bool []
-    todo("font-nv.fontmetric.ascent_sets_disagree")
+    let h = line_metrics(hhea, os2, FontAscentHhea)
+    let w = line_metrics(hhea, os2, FontAscentWin)
+    if differ(h, w, tolerance)
+        return true
+    if os2.typo_ascender == 0 and os2.typo_descender == 0
+        return false
+    differ(h, line_metrics(hhea, os2, FontAscentTypo), tolerance)
+// Whether two sets differ in ascent or descent by more than `tolerance`.
+fn differ(a: FontLineMetrics, b: FontLineMetrics, tolerance: Int) -> Bool
+    abs_int(a.ascent - b.ascent) > tolerance or abs_int(a.descent - b.descent) > tolerance
+
+// The absolute value of an integer.
+fn abs_int(n: Int) -> Int
+    if n < 0
+        return 0 - n
+    n
 
 // Whether `hhea.descender` is stored with the wrong sign.
 //
@@ -318,15 +433,15 @@ pub fn ascent_sets_disagree(hhea: FontHhea, os2: FontOs2, tolerance: Int) -> Boo
 // negative — and enough fonts get it wrong that a renderer either
 // checks or occasionally draws its second line above its first.
 pub fn descender_sign_is_wrong(hhea: FontHhea) -> Bool []
-    todo("font-nv.fontmetric.descender_sign_is_wrong")
+    hhea.descender > 0
 
 // Whether `OS/2` is new enough to carry an x-height.
 pub fn has_x_height(os2: FontOs2) -> Bool []
-    todo("font-nv.fontmetric.has_x_height")
+    os2.version >= 2
 
 // Whether `OS/2` is new enough to carry a cap height.
 pub fn has_cap_height(os2: FontOs2) -> Bool []
-    todo("font-nv.fontmetric.has_cap_height")
+    os2.version >= 2
 
 // Whether `head.macStyle` and `OS/2.fsSelection` claim different
 // styles.
@@ -334,11 +449,15 @@ pub fn has_cap_height(os2: FontOs2) -> Bool []
 // They should agree; in shipped fonts they often do not, and a font
 // picker that trusts one silently ships the wrong weight.
 pub fn style_disagrees(head: FontHead, os2: FontOs2) -> Bool []
-    todo("font-nv.fontmetric.style_disagrees")
+    let head_bold = (head.mac_style & 1) != 0
+    let head_italic = (head.mac_style & 2) != 0
+    let os2_bold = (os2.fs_selection & 32) != 0
+    let os2_italic = (os2.fs_selection & 1) != 0
+    head_bold != os2_bold or head_italic != os2_italic
 
 // One bit of `head.flags`, by index.
 pub fn head_flag(head: FontHead, bit: Int) -> Bool []
-    todo("font-nv.fontmetric.head_flag")
+    bit >= 0 and bit < 16 and ((head.flags >> bit) & 1) == 1
 
 // ── Font units to pixels ─────────────────────────────────────────────
 
@@ -366,12 +485,18 @@ pub fn head_flag(head: FontHead, bit: Int) -> Bool []
 //     println("${fontmetric.units_to_px(m, 2048, 16.0)}")    // 16
 // ```
 pub fn scale_for_px(m: FontMetrics, px: Float) -> geomxform.GeomXform []
-    todo("font-nv.fontmetric.scale_for_px")
+    if m.units_per_em <= 0
+        return geomxform.identity()
+    let s = px / m.units_per_em as Float
+    geomxform.scaling(s, 0.0 - s)
 
 // The same transform without the y flip, for a caller whose own space
 // already grows upward — an SVG document with a `transform`, a plot.
 pub fn scale_for_px_y_up(m: FontMetrics, px: Float) -> geomxform.GeomXform []
-    todo("font-nv.fontmetric.scale_for_px_y_up")
+    if m.units_per_em <= 0
+        return geomxform.identity()
+    let s = px / m.units_per_em as Float
+    geomxform.scaling(s, s)
 
 // One length in font units, as pixels at `px` per em.
 //
@@ -379,7 +504,9 @@ pub fn scale_for_px_y_up(m: FontMetrics, px: Float) -> geomxform.GeomXform []
 // caller needs.  Not rounded: rounding per glyph is what makes a long
 // line come out the wrong length, so the caller rounds once at the end.
 pub fn units_to_px(m: FontMetrics, units: Int, px: Float) -> Float []
-    todo("font-nv.fontmetric.units_to_px")
+    if m.units_per_em <= 0
+        return 0.0
+    units as Float * px / m.units_per_em as Float
 
 // One length in pixels, as font units at `px` per em.
 //
@@ -387,7 +514,9 @@ pub fn units_to_px(m: FontMetrics, units: Int, px: Float) -> Float []
 // a column width — and wants to compare it against advances without
 // converting every advance.
 pub fn px_to_units(m: FontMetrics, pixels: Float, px: Float) -> Int []
-    todo("font-nv.fontmetric.px_to_units")
+    if m.units_per_em <= 0 or px == 0.0
+        return 0
+    math.round(pixels * m.units_per_em as Float / px) as Int
 
 // The pixels-per-em at which one em is `points` points on a `dpi`
 // display.
@@ -395,7 +524,7 @@ pub fn px_to_units(m: FontMetrics, pixels: Float, px: Float) -> Int []
 // `points * dpi / 72`.  Published because the 72 is the number every
 // caller writes from memory and a third of them write as 72.27.
 pub fn ppem_for_points(points: Float, dpi: Float) -> Float []
-    todo("font-nv.fontmetric.ppem_for_points")
+    points * dpi / 72.0
 
 // The design bounding box in pixels at `px` per em, y down.
 //
@@ -403,4 +532,8 @@ pub fn ppem_for_points(points: Float, dpi: Float) -> Float []
 // glyph in the font draws outside this box, so a cell this size always
 // fits.
 pub fn px_bounds(m: FontMetrics, px: Float) -> geomrect.GeomRectF []
-    todo("font-nv.fontmetric.px_bounds")
+    if m.units_per_em <= 0
+        return geomrect.empty()
+    let s = px / m.units_per_em as Float
+    geomrect.of_xywh(m.x_min as Float * s, 0.0 - m.y_max as Float * s,
+                     (m.x_max - m.x_min) as Float * s, (m.y_max - m.y_min) as Float * s)

@@ -1,8 +1,6 @@
 // fontcmap.nv — `cmap`: characters in, glyph ids out.  Formats 4 and
 // 12, and a named refusal for the rest.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // THE DECISION THIS MODULE IS BUILT ON: `glyph_for` ANSWERS AN `Int`,
 // NEVER AN OPTIONAL, AND 0 MEANS `.notdef`.
 //
@@ -34,6 +32,7 @@
 
 use fonterror
 use fontsrc
+use fontdir
 
 // One row of the `cmap` header: a platform, an encoding, and where
 // that subtable lives.
@@ -84,15 +83,15 @@ pub struct FontCmap
 // How many bytes the `cmap` header needs before the subtable list can
 // be walked: 4.
 pub fn header_len() -> Int []
-    todo("font-nv.fontcmap.header_len")
+    4
 
 // How many subtables the `cmap` header declares.
 pub fn subtable_count(head: Bytes) -> Int []
-    todo("font-nv.fontcmap.subtable_count")
+    bytes.u16_be_at(head, 2) ?? 0
 
 // The range of the whole subtable list, given the count.
 pub fn list_range(cmap: fontsrc.FontRange, n: Int) -> fontsrc.FontRange []
-    todo("font-nv.fontcmap.list_range")
+    fontsrc.range(cmap.at + 4, 8 * n)
 
 // Every subtable the `cmap` declares, in the order the file wrote
 // them.
@@ -102,7 +101,34 @@ pub fn list_range(cmap: fontsrc.FontRange, n: Int) -> fontsrc.FontRange []
 // conversion that every `cmap` reader gets wrong once.
 pub fn subtables(data: Bytes,
                  cmap: fontsrc.FontRange) -> Result<[FontCmapSub], fonterror.FontFault> []
-    todo("font-nv.fontcmap.subtables")
+    let have = bytes.len(data)
+    if have < 4
+        return Err(fontsrc.short(fontdir.tag_cmap(), 4, have))
+    let n = subtable_count(data)
+    let want = 4 + 8 * n
+    if have < want
+        return Err(fontsrc.short(fontdir.tag_cmap(), want, have))
+    var out: [FontCmapSub] = []
+    for i in 0..n
+        let row = 4 + 8 * i
+        let off = bytes.u32_be_at(data, row + 4) ?? 0
+        let format = bytes.u16_be_at(data, off) ?? 0
+        if off + 2 > have
+            return Err(fontsrc.short(fontdir.tag_cmap(), off + 2, have))
+        list.push(out, FontCmapSub { platform: bytes.u16_be_at(data, row) ?? 0,
+                                     encoding: bytes.u16_be_at(data, row + 2) ?? 0,
+                                     format: format,
+                                     range: fontsrc.range(cmap.at + off, declared_length(data, off, format)) })
+    Ok(out)
+// The length a subtable declares, which sits in a 16-bit field after the
+// format in the older formats and in a 32-bit field after a reserved
+// word in the newer ones.
+fn declared_length(data: Bytes, off: Int, format: Int) -> Int
+    if format == 8 or format == 10 or format == 12 or format == 13
+        return bytes.u32_be_at(data, off + 4) ?? 0
+    if format == 14
+        return bytes.u32_be_at(data, off + 2) ?? 0
+    bytes.u16_be_at(data, off + 2) ?? 0
 
 // The subtable to use, by the published preference order.
 //
@@ -115,23 +141,33 @@ pub fn subtables(data: Bytes,
 // applied, because a caller that disagrees — a tool that wants the Mac
 // Roman subtable specifically — needs to see what it is overriding.
 pub fn best_subtable(subs: [FontCmapSub]) -> ?FontCmapSub []
-    todo("font-nv.fontcmap.best_subtable")
+    let order = preference_order()
+    var k = 0
+    while k < list.len(order)
+        var pick: ?FontCmapSub = None
+        for s in subs
+            if s.platform == order[k] and s.encoding == order[k + 1] and is_readable(s)
+                pick = Some(s)
+        if pick != None
+            return pick
+        k += 2
+    None
 
 // The preference order, as (platform, encoding) pairs flattened into
 // one list of even length, best first.
 pub fn preference_order() -> [Int] []
-    todo("font-nv.fontcmap.preference_order")
+    [3, 10, 0, 4, 0, 6, 3, 1, 0, 3, 0, 1, 3, 0]
 
 // Whether this package can read the subtable's format.
 //
 // True for 4 and 12.  Asked before `parse_subtable` by a caller that
 // would rather try the next subtable than handle a refusal.
 pub fn is_readable(sub: FontCmapSub) -> Bool []
-    todo("font-nv.fontcmap.is_readable")
+    sub.format == 4 or sub.format == 12
 
 // The subtable formats this package reads.
 pub fn formats_covered() -> [Int] []
-    todo("font-nv.fontcmap.formats_covered")
+    [4, 12]
 
 // The subtable formats it refuses, and which are worth adding.
 //
@@ -142,7 +178,7 @@ pub fn formats_covered() -> [Int] []
 // eventually want, and the README says so rather than leaving it as an
 // omission.
 pub fn formats_refused() -> [Int] []
-    todo("font-nv.fontcmap.formats_refused")
+    [0, 2, 6, 8, 10, 13, 14]
 
 // Parse one subtable into a lookup.
 //
@@ -150,7 +186,81 @@ pub fn formats_refused() -> [Int] []
 // are.  `FontCmapFormat` when the format is not 4 or 12, carrying the
 // number, so a caller can try the next subtable by name.
 pub fn parse_subtable(data: Bytes, sub: FontCmapSub) -> Result<FontCmap, fonterror.FontFault> []
-    todo("font-nv.fontcmap.parse_subtable")
+    if sub.format == 4
+        return parse_format4(data, sub.platform == 3 and sub.encoding == 0)
+    if sub.format == 12
+        return parse_format12(data)
+    Err(FontCmapFormat(sub.format))
+// Format 4: segments of codepoints, each mapped by a delta or through an array.
+fn parse_format4(data: Bytes, symbol: Bool) -> Result<FontCmap, fonterror.FontFault>
+    let have = bytes.len(data)
+    if have < 14
+        return Err(fontsrc.short(fontdir.tag_cmap(), 14, have))
+    let seg_count = (bytes.u16_be_at(data, 6) ?? 0) / 2
+    let want = 16 + 8 * seg_count
+    if have < want
+        return Err(fontsrc.short(fontdir.tag_cmap(), want, have))
+    let ends_at = 14
+    let starts_at = ends_at + 2 * seg_count + 2
+    let deltas_at = starts_at + 2 * seg_count
+    let offsets_at = deltas_at + 2 * seg_count
+    let array_at = offsets_at + 2 * seg_count
+    var starts: [Int] = []
+    var ends: [Int] = []
+    var deltas: [Int] = []
+    var offsets: [Int] = []
+    for i in 0..seg_count
+        list.push(starts, bytes.u16_be_at(data, starts_at + 2 * i) ?? 0)
+        list.push(ends, bytes.u16_be_at(data, ends_at + 2 * i) ?? 0)
+        let delta = bytes.u16_be_at(data, deltas_at + 2 * i) ?? 0
+        list.push(deltas, signed16(delta))
+        let range_offset = bytes.u16_be_at(data, offsets_at + 2 * i) ?? 0
+        if range_offset == 0
+            list.push(offsets, 0 - 1)
+        else
+            list.push(offsets, array_index(range_offset, i, seg_count))
+    var glyph_ids: [Int] = []
+    var at = array_at
+    while at + 2 <= have
+        list.push(glyph_ids, bytes.u16_be_at(data, at) ?? 0)
+        at += 2
+    Ok(FontCmap { format: 4, starts: starts, ends: ends, deltas: deltas, offsets: offsets,
+                  glyph_ids: glyph_ids, symbol: symbol })
+
+// Where in the glyph id array a segment with a range offset begins, or
+// -2 when its offset points before the array.  The offset counts bytes
+// from its own slot in the `idRangeOffset` array.
+fn array_index(range_offset: Int, segment: Int, seg_count: Int) -> Int
+    let base = range_offset / 2 + segment - seg_count
+    if base < 0
+        return 0 - 2
+    base
+
+// A 16-bit pattern as the signed number it stands for.
+fn signed16(v: Int) -> Int
+    if v >= 32768
+        return v - 65536
+    v
+
+// Format 12: groups of consecutive codepoints on consecutive glyphs.
+fn parse_format12(data: Bytes) -> Result<FontCmap, fonterror.FontFault>
+    let have = bytes.len(data)
+    if have < 16
+        return Err(fontsrc.short(fontdir.tag_cmap(), 16, have))
+    let n = bytes.u32_be_at(data, 12) ?? 0
+    let want = 16 + 12 * n
+    if have < want
+        return Err(fontsrc.short(fontdir.tag_cmap(), want, have))
+    var starts: [Int] = []
+    var ends: [Int] = []
+    var firsts: [Int] = []
+    for i in 0..n
+        let g = 16 + 12 * i
+        list.push(starts, bytes.u32_be_at(data, g) ?? 0)
+        list.push(ends, bytes.u32_be_at(data, g + 4) ?? 0)
+        list.push(firsts, bytes.u32_be_at(data, g + 8) ?? 0)
+    Ok(FontCmap { format: 12, starts: starts, ends: ends, deltas: firsts, offsets: [],
+                  glyph_ids: [], symbol: false })
 
 // ── Lookup ───────────────────────────────────────────────────────────
 
@@ -176,7 +286,48 @@ pub fn parse_subtable(data: Bytes, sub: FontCmapSub) -> Result<FontCmap, fonterr
 //     println("${fontcmap.glyph_for(c, 65)}")
 // ```
 pub fn glyph_for(c: FontCmap, codepoint: Int) -> Int []
-    todo("font-nv.fontcmap.glyph_for")
+    let direct = lookup(c, codepoint)
+    if direct == 0 and c.symbol
+        return lookup(c, 0xF000 + (codepoint & 0xFF))
+    direct
+// The glyph for a codepoint in one pass over the segments, 0 when no
+// segment holds it.
+fn lookup(c: FontCmap, codepoint: Int) -> Int
+    if codepoint < 0
+        return 0
+    let i = segment_of(c, codepoint)
+    if i < 0
+        return 0
+    if c.format == 12
+        return c.deltas[i] + (codepoint - c.starts[i])
+    if c.offsets[i] == 0 - 1
+        return (codepoint + c.deltas[i]) & 0xFFFF
+    if c.offsets[i] < 0
+        return 0
+    let at = c.offsets[i] + (codepoint - c.starts[i])
+    if at >= list.len(c.glyph_ids)
+        return 0
+    let g = c.glyph_ids[at]
+    if g == 0
+        return 0
+    (g + c.deltas[i]) & 0xFFFF
+
+// The index of the last segment that starts at or before the codepoint
+// when it also ends at or after it, or -1.
+fn segment_of(c: FontCmap, codepoint: Int) -> Int
+    var lo = 0
+    var hi = list.len(c.starts) - 1
+    var found = 0 - 1
+    while lo <= hi
+        let mid = (lo + hi) / 2
+        if c.starts[mid] <= codepoint
+            found = mid
+            lo = mid + 1
+        else
+            hi = mid - 1
+    if found >= 0 and codepoint <= c.ends[found]
+        return found
+    0 - 1
 
 // Whether the font has a glyph for the codepoint at all.
 //
@@ -184,7 +335,7 @@ pub fn glyph_for(c: FontCmap, codepoint: Int) -> Int []
 // draw" and has its own call so neither is answered with the other.  A
 // font picker walking four fallbacks asks this; a renderer does not.
 pub fn has_codepoint(c: FontCmap, codepoint: Int) -> Bool []
-    todo("font-nv.fontcmap.has_codepoint")
+    glyph_for(c, codepoint) != 0
 
 // Glyph ids for a whole run, one per codepoint, zeroes included.
 //
@@ -193,11 +344,18 @@ pub fn has_codepoint(c: FontCmap, codepoint: Int) -> Bool []
 // run cheaper than the same number of separate lookups on the text
 // people actually set.
 pub fn glyphs_for(c: FontCmap, codepoints: [Int]) -> [Int] []
-    todo("font-nv.fontcmap.glyphs_for")
+    var out: [Int] = []
+    for cp in codepoints
+        list.push(out, glyph_for(c, cp))
+    out
 
 // How many codepoints the subtable maps.
 pub fn mapped_count(c: FontCmap) -> Int []
-    todo("font-nv.fontcmap.mapped_count")
+    var total = 0
+    for i in 0..list.len(c.starts)
+        if c.ends[i] >= c.starts[i]
+            total += c.ends[i] - c.starts[i] + 1
+    total
 
 // The codepoint ranges the subtable covers, as start/end pairs
 // flattened into one list of even length.
@@ -205,14 +363,22 @@ pub fn mapped_count(c: FontCmap) -> Int []
 // For a font picker or a subsetter that wants to report coverage
 // without asking about a million codepoints one at a time.
 pub fn covered_ranges(c: FontCmap) -> [Int] []
-    todo("font-nv.fontcmap.covered_ranges")
+    var out: [Int] = []
+    for i in 0..list.len(c.starts)
+        list.push(out, c.starts[i])
+        list.push(out, c.ends[i])
+    out
 
 // The highest codepoint the subtable maps.
 //
 // 0xFFFF at most for a format 4 table, which is how a caller sees that
 // a font has no astral coverage without walking the ranges.
 pub fn max_codepoint(c: FontCmap) -> Int []
-    todo("font-nv.fontcmap.max_codepoint")
+    var best = 0
+    for e in c.ends
+        if e > best
+            best = e
+    best
 
 // Whether the subtable can map anything outside the Basic Multilingual
 // Plane.
@@ -221,4 +387,4 @@ pub fn max_codepoint(c: FontCmap) -> Int []
 // deciding that an emoji rendered as `.notdef` is the font's fault
 // rather than the subtable's.
 pub fn covers_astral(c: FontCmap) -> Bool []
-    todo("font-nv.fontcmap.covers_astral")
+    max_codepoint(c) > 0xFFFF
