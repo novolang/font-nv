@@ -1,0 +1,282 @@
+// fontshape_edge_tests.nv — the shaping loop, the measuring calls and
+// the script table, over a plan built by hand.
+//
+// WHY THIS SUITE EXISTS.  `fontshape_tests.nv` is the oracle for the
+// DECISIONS: one advance per monospaced font, one kerning source, a
+// complex script refused rather than approximated.  It never shapes a
+// run — `shape`, `measure`, `measure_px` and `fit_prefix` are not
+// called in it, and neither is the UTF-8 decoding — so the loop that
+// every consumer actually runs is pinned here instead.
+//
+// THE TWO NUMBERS THIS SUITE EXISTS FOR, and both are hand-computed:
+//
+//   THE ADVANCE SUM IS THE WIDTH, AND THE INK IS NOT.  A kerning pair
+//   may pull two glyphs closer than one advance, and then their INK
+//   OVERLAPS: below, `AV` kerns by -450 against a 400-unit advance, so
+//   the `V` is placed at x = -50, LEFT of the `A`'s own origin, and the
+//   run is 350 units wide.  A measure that unioned the ink would answer
+//   a different number, and the assertion below says which one is the
+//   layout's.
+//
+//   ONE PIXEL NUMBER, CONVERTED ONCE.  A run of 750 units is three
+//   quarters of a 1000-unit em, and `measure_px` converts the SUM: 750
+//   of 1000 at 16 pixels per em is 12 pixels.  Converting each part and
+//   adding the three rounded pieces would answer 6 + 6 - 1 = 11, and
+//   the test below says which number a layout gets.
+//
+// The plan's parts are literals rather than a parsed font: this module
+// consumes `FontCmap`, `FontSubstPlan`, `FontKernPlan`, `hmtx` and
+// `FontMetrics` and knows nothing about a file, so the fixtures here
+// are exactly the inputs it sees.
+
+use std.test
+use std.bytes
+use fontmetric
+use fontcmap
+use fontgsub
+use fontkern
+use fontshape
+use fontdir
+use fonterror
+
+// A buffer from the numbers a fixture is written as.
+fn bytes_of(xs: [Int]) -> Bytes
+    bytes.from_byte_list(xs)
+
+// 1000 units to the em, so one unit is 0.016 pixels at 16 px per em.
+fn metrics() -> fontmetric.FontMetrics
+    FontMetrics { units_per_em: 1000, x_min: 0, y_min: 0, x_max: 1000,
+                  y_max: 1000, num_glyphs: 300, num_h_metrics: 2,
+                  advance_max: 600, long_loca: false }
+
+// Two pairs, so every glyph at or past index 1 takes the SECOND pair's
+// advance of 400 — which is the `hmtx` rule this package is built on.
+fn hmtx() -> Bytes
+    bytes.concat([bytes.u16_be(500), bytes.u16_be(10),
+                  bytes.u16_be(400), bytes.u16_be(20)])
+
+// `A`..`z` at glyph 100 and up, one segment through a delta of
+// 100 - 0x41 = 35 — so the letters the ligature below needs are mapped
+// too, and the lowercase ones land where the arithmetic says: `A` is
+// glyph 100, `V` is 121, `a` is 132, `f` is 137 and `i` is 140.
+fn cmap() -> fontcmap.FontCmap
+    FontCmap { format: 4, starts: [0x41], ends: [0x7A],
+               deltas: [100 - 0x41], offsets: [0 - 1], glyph_ids: [],
+               symbol: false }
+
+// `ffi` becomes glyph 500, which no hmtx pair names, so it advances by
+// the last pair's 400 units.
+fn ffi_ligature() -> fontgsub.FontSubstPlan
+    FontSubstPlan { ligatures: [FontLigature { components: [137, 137, 140],
+                                               glyph: 500 }],
+                    singles: [], features: [] }
+
+// One pair, `AV`, with the adjustment the caller names.
+fn av_kern(value: Int) -> fontkern.FontKernPlan
+    FontKernPlan { source: FontKernLegacy,
+                   pairs: [FontKernPair { left: 100, right: 121, value: value, lookup: 0 }],
+                   left_classes: [], right_classes: [], class_values: [],
+                   right_class_count: 0, later_matrices: [], matrix_lookups: [] }
+
+// The plan the fixtures above describe.
+fn plan_with(subst: fontgsub.FontSubstPlan, kern: fontkern.FontKernPlan) -> fontshape.FontPlan
+    fontshape.plan(cmap(), subst, kern, hmtx(), metrics())
+
+// ── The metrics: advances, not ink ───────────────────────────────────
+
+@test
+fn test_the_width_is_the_advances_summed_and_never_the_ink_extent() [io]
+    // `A` and `V` each advance 400 units, and the pair between them
+    // pulls 450 units tighter — more than one advance, so the two
+    // glyphs OVERLAP and the second one starts left of the first.
+    let p = plan_with(fontgsub.no_substitutions(), av_kern(0 - 450))
+
+    test.case("THE CLAIM: the width is the advance sum plus the kerning, 400 + 400 - 450")
+    match fontshape.measure(p, "AV")
+        Err(_) => test.assert(false)
+        Ok(w)  => test.assert(w == 350)
+
+    test.case("and the placements say the same thing: the V starts at x = -50")
+    match fontshape.shape(p, "AV")
+        Err(_)  => test.assert(false)
+        Ok(run) =>
+            test.assert(fontshape.glyph_count(run) == 2)
+            test.assert(fontshape.placed_at(run, 0).glyph == 100)
+            test.assert(fontshape.placed_at(run, 0).x == 0)
+            test.assert(fontshape.placed_at(run, 1).glyph == 121)
+            // 400 (the advance of `A`) plus the pair's -450.
+            test.assert(fontshape.placed_at(run, 1).x == 0 - 50)
+            // and the run's own width is the LEFT edge of that glyph
+            // plus its advance, which is where the caret after it goes.
+            test.assert(run.width == 0 - 50 + 400)
+
+    test.case("an ink extent would be a different number, and this is not it")
+    // The two glyphs' boxes, each 400 wide and starting 450 units
+    // closer than their advances, would union to 400 alone.
+    match fontshape.measure(p, "AV")
+        Err(_) => test.assert(false)
+        Ok(w)  => test.assert(w != 400)
+
+@test
+fn test_a_pixel_width_is_rounded_once_at_the_end() [io]
+    let p = plan_with(fontgsub.no_substitutions(), av_kern(0 - 50))
+
+    test.case("THE CLAIM: 750 units of a 1000-unit em is three quarters of an em")
+    match fontshape.measure_px(p, "AV", 16.0)
+        Err(_) => test.assert(false)
+        Ok(px) => test.assert_approx(px, 12.0, 0.0)
+
+    test.case("and the same run at 12 pixels per em is nine pixels, exactly")
+    match fontshape.measure_px(p, "AV", 12.0)
+        Err(_) => test.assert(false)
+        Ok(px) => test.assert_approx(px, 9.0, 0.0)
+
+    test.case("a glyph no advance and no kerning reaches is still a glyph")
+    match fontshape.measure(p, "A")
+        Err(_) => test.assert(false)
+        Ok(w)  => test.assert(w == 400)
+
+@test
+fn test_fit_prefix_walks_every_prefix_from_the_plan() [io]
+    let p = plan_with(fontgsub.no_substitutions(), av_kern(0 - 50))
+    // `A` is 400, `AV` is 750, and `AVA` is 1150: the table holds the
+    // `AV` pair and not `VA`, so the run loses its 50 units ONCE —
+    // kerning is directional, and 400 + 400 + 400 - 50 + 0 is 1150.
+
+    test.case("THE CLAIM: the answer is a CHARACTER count, and the widest prefix that fits")
+    match fontshape.fit_prefix(p, "AVA", 1150)
+        Err(_) => test.assert(false)
+        Ok(n)  => test.assert(n == 3)
+
+    test.case("one unit short of the whole run is two characters, not three")
+    match fontshape.fit_prefix(p, "AVA", 1149)
+        Err(_) => test.assert(false)
+        Ok(n)  => test.assert(n == 2)
+
+    test.case("a limit the first character already exceeds is no characters at all")
+    match fontshape.fit_prefix(p, "AVA", 399)
+        Err(_) => test.assert(false)
+        Ok(n)  => test.assert(n == 0)
+
+    test.case("and the empty string has no prefix to report")
+    match fontshape.fit_prefix(p, "", 1000)
+        Err(_) => test.assert(false)
+        Ok(n)  => test.assert(n == 0)
+
+// ── Ligatures and the clusters ───────────────────────────────────────
+
+@test
+fn test_a_ligature_fires_and_the_cluster_map_carries_the_text_back() [io]
+    let p = plan_with(ffi_ligature(), fontkern.no_kerning())
+
+    test.case("THE CLAIM: `ffi` is ONE glyph, so the run is shorter than the text")
+    match fontshape.shape(p, "ffi")
+        Err(_)  => test.assert(false)
+        Ok(run) =>
+            test.assert(fontshape.glyph_count(run) == 1)
+            test.assert(fontshape.has_ligature(run))
+            test.assert(run.char_count == 3)
+            test.assert(fontshape.placed_at(run, 0).glyph == 500)
+            test.assert(fontshape.placed_at(run, 0).x == 0)
+            test.assert(run.width == 400)
+
+            test.case("the glyph's cluster names the character it came from")
+            test.assert(fontshape.cluster_at(run, 0) == 0)
+
+            test.case("a caret's glyph is the one at or before its x")
+            test.assert(fontshape.glyph_at_x(run, 0) == 0)
+            test.assert(fontshape.glyph_at_x(run, 400) == 0)
+            test.assert(fontshape.glyph_at_x(run, 0 - 1) == 0 - 1)
+
+            test.case("and an index past the run answers a sentinel, not a panic")
+            test.assert(fontshape.placed_at(run, 5).glyph == 0 - 1)
+            test.assert(fontshape.placed_at(run, 5).x == 0)
+            test.assert(fontshape.cluster_at(run, 5) == 0 - 1)
+            test.assert(fontshape.placed_at(run, 0 - 1).glyph == 0 - 1)
+
+    test.case("text the ligature does not match stays three glyphs and no ligature")
+    match fontshape.shape(p, "ffa")
+        Err(_)  => test.assert(false)
+        Ok(run) =>
+            test.assert(fontshape.glyph_count(run) == 3)
+            test.assert(not fontshape.has_ligature(run))
+            // 137, 137, 100 — `a` is 0x61, and 0x61 + 35 = 132.
+            test.assert(fontshape.placed_at(run, 2).glyph == 132)
+            test.assert(fontshape.cluster_at(run, 2) == 2)
+
+    test.case("an empty run is a run: no glyphs, no width, no ligature")
+    match fontshape.shape(p, "")
+        Err(_)  => test.assert(false)
+        Ok(run) =>
+            test.assert(fontshape.glyph_count(run) == 0)
+            test.assert(run.width == 0)
+            test.assert(run.char_count == 0)
+            test.assert(not fontshape.has_ligature(run))
+            test.assert(fontshape.glyph_at_x(run, 10) == 0 - 1)
+
+// ── The text decoding ────────────────────────────────────────────────
+
+@test
+fn test_the_text_is_decoded_one_codepoint_at_a_time_in_four_shapes() [io]
+    test.case("THE CLAIM: two, three and four byte sequences decode to ONE codepoint each")
+    // U+00E9 is two bytes, U+2192 three, U+10300 four.
+    test.assert(fontshape.first_complex("caf\u{e9}") == 0 - 1)
+    test.assert(fontshape.first_complex("a \u{2192} b") == 0 - 1)
+    test.assert(fontshape.first_complex("\u{10300}") == 0x10300)
+
+    test.case("a codepoint the package will not lay out is named, not skipped over")
+    test.assert(fontshape.first_complex("\u{41}\u{915}\u{627}") == 0x915)
+
+    test.case("and a byte that cannot lead a sequence is ONE codepoint, so the walk ends")
+    // 0xF8 leads a five-byte shape UTF-8 does not have; the decoder
+    // answers it as itself and moves one byte, so the `A` after it is
+    // still read rather than swallowed by a long sequence.
+    let broken = bytes.to_str(bytes_of([0xF8, 0x41]))
+    test.assert(fontshape.first_complex(broken) == 0 - 1)
+    let p = plan_with(fontgsub.no_substitutions(), fontkern.no_kerning())
+    match fontshape.shape(p, broken)
+        Err(_)  => test.assert(false)
+        Ok(run) =>
+            test.assert(run.char_count == 2)
+            test.assert(fontshape.placed_at(run, 1).glyph == 100)
+
+// ── The scripts ──────────────────────────────────────────────────────
+
+@test
+fn test_a_codepoints_script_is_answered_by_predicate_or_by_table() [io]
+    test.case("THE CLAIM: Greek and Cyrillic are answers of their own, not the table's")
+    test.assert(fontshape.script_of(0x03B1) == fontdir.tag_of("grek"))
+    test.assert(fontshape.script_of(0x0410) == fontdir.tag_of("cyrl"))
+
+    test.case("an Armenian letter comes out of the block table, tag and all")
+    test.assert(fontshape.script_of(0x0530) == fontdir.tag_of("armn"))
+    test.assert(fontshape.script_of(0x0600) == fontdir.tag_of("arab"))
+
+    test.case("and a space is `latn`, because that is the table that always exists")
+    test.assert(fontshape.script_of(32) == fontdir.tag_of("latn"))
+    test.assert(fontshape.script_of(0x2192) == fontdir.tag_of("latn"))
+
+// ── The refusal ──────────────────────────────────────────────────────
+
+@test
+fn test_a_run_with_a_script_this_package_cannot_lay_out_is_refused() [io]
+    let p = plan_with(fontgsub.no_substitutions(), fontkern.no_kerning())
+
+    test.case("THE CLAIM: shaping, measuring and fitting all refuse by codepoint")
+    match fontshape.shape(p, "ab\u{627}")
+        Err(FontComplexScript(cp)) => test.assert(cp == 0x627)
+        _                          => test.assert(false)
+    match fontshape.measure(p, "\u{915}")
+        Err(FontComplexScript(cp)) => test.assert(cp == 0x915)
+        _                          => test.assert(false)
+    match fontshape.measure_px(p, "\u{627}", 16.0)
+        Err(FontComplexScript(cp)) => test.assert(cp == 0x627)
+        _                          => test.assert(false)
+    match fontshape.fit_prefix(p, "\u{915}ab", 1000)
+        Err(FontComplexScript(cp)) => test.assert(cp == 0x915)
+        _                          => test.assert(false)
+
+    test.case("and the same run one codepoint at a time is the same refusal")
+    match fontshape.shape_codepoints(p, [65, 0x915])
+        Err(FontComplexScript(cp)) => test.assert(cp == 0x915)
+        _                          => test.assert(false)

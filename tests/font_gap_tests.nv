@@ -1,0 +1,282 @@
+// font_gap_tests.nv — the branches the other suites leave unvisited:
+// the refusals of a table cut short, the defaults of an optional
+// field, and the table-driven names.
+//
+// Every fixture differs from a table that parses in the one field the
+// case names, so each assertion says which check it reached.
+
+use std.test
+use std.list
+use std.bytes
+use geomxform
+use geomrect
+use svgpath
+use fontsrc
+use fontdir
+use fonterror
+use fontmetric
+use fontcmap
+use fontglyf
+use fontcff
+use fontshape
+use fontread
+
+fn bytes_of(xs: [Int]) -> Bytes
+    bytes.from_byte_list(xs)
+
+fn u16(v: Int) -> Bytes
+    bytes.u16_be(v)
+
+fn u32(v: Int) -> Bytes
+    bytes.u32_be(v)
+
+fn latn() -> Int
+    fontdir.tag_of("latn")
+
+// ── fontcff ──────────────────────────────────────────────────────────
+
+fn cff_index(bodies: [Bytes]) -> Bytes
+    if list.len(bodies) == 0
+        return u16(0)
+    var offsets = u16(1)
+    var data = bytes.zeros(0)
+    for b in bodies
+        data = data + b
+        offsets = offsets + u16(bytes.len(data) + 1)
+    u16(list.len(bodies)) + bytes_of([2]) + offsets + data
+
+// A table with the given top DICT and one glyph, `endchar`.
+fn cff_with_dict(dict: Bytes) -> Bytes
+    let head = bytes_of([1, 0, 4, 2])
+    let names = cff_index([bytes_of([97])])
+    let top_len = bytes.len(dict) + 4
+    let strings = cff_index([])
+    let globals = cff_index([])
+    let top_ix_len = 3 + 2 * 2 + top_len
+    let cs_at = 4 + bytes.len(names) + top_ix_len + 2 + 2
+    let full = dict + bytes_of([28]) + u16(cs_at) + bytes_of([17])
+    head + names + cff_index([full]) + strings + globals + cff_index([bytes_of([14])])
+
+// A four-byte DICT integer.
+fn dict_int(v: Int) -> Bytes
+    bytes_of([29]) + u32(v)
+
+fn bare_top(subrs: Bytes) -> FontCffTop
+    FontCffTop { charstrings: fontsrc.empty(0), private: fontsrc.empty(0),
+                 local_subrs: fontsrc.empty(0), global_subrs: fontsrc.range(0, bytes.len(subrs)),
+                 charset: fontsrc.empty(0), matrix: geomxform.identity(),
+                 default_width: 7.0, nominal_width: 100.0, is_cid: false }
+
+@test
+fn test_a_private_dict_whose_subrs_cannot_be_read_names_no_local_subrs() [io]
+    // The Private entry is a size and an offset; the offset is the end of
+    // the table as it stands, where the private DICT is appended, and that
+    // DICT names a Subrs offset far outside the table.
+    let dict_at = fn_priv(0)
+    let probe = cff_with_dict(dict_at)
+    let table = cff_with_dict(fn_priv(bytes.len(probe))) + dict_int(9999) + bytes_of([19])
+
+    test.case("THE CLAIM: a Subrs offset that is no INDEX leaves the local subroutines empty")
+    match fontcff.parse_top(table, fontsrc.range(0, bytes.len(table)))
+        Err(_)  => test.assert(false)
+        Ok(top) =>
+            test.assert(top.private.len == 6)
+            test.assert(fontsrc.is_empty(top.local_subrs))
+
+fn fn_priv(at: Int) -> Bytes
+    dict_int(6) + dict_int(at) + bytes_of([18])
+
+@test
+fn test_a_call_with_a_deeper_stack_and_a_width_on_endchar_are_read() [io]
+    // Global subroutine 0 is a bare `return`.
+    let subrs = cff_index([bytes_of([11])])
+    let top = bare_top(subrs)
+
+    test.case("THE CLAIM: a call takes the number off the top and leaves the rest")
+    // 0, then -107 (the biased number of entry 0), `callgsubr`, `endchar`: the
+    // 0 left behind is endchar's single operand, which is a width.
+    match fontcff.charstring_outline(bytes_of([139, 32, 29, 14]), subrs, top, 0)
+        Err(_) => test.assert(false)
+        Ok(p)  => test.assert(svgpath.command_count(p) == 0)
+
+    test.case("a line with no move before it starts a subpath at the origin")
+    match fontcff.charstring_outline(bytes_of([149, 149, 5, 14]), subrs, top, 0)
+        Err(_) => test.assert(false)
+        Ok(p)  => test.assert(svgpath.command_count(p) == 2)
+
+    test.case("a charstring with no operator that clears the stack carries no width")
+    let none = fontcff.charstring_width(bytes_of([139]), top)
+    test.assert(not none.explicit)
+    test.assert_approx(none.width, 7.0, 0.0)
+
+    test.case("and an operator that draws is passed over on the way to the first move")
+    let after = fontcff.charstring_width(bytes_of([139, 139, 5, 21]), top)
+    test.assert(not after.explicit)
+
+    test.case("a dry run takes a call with no operand to leave an empty stack")
+    test.assert(fontcff.is_interpretable(bytes_of([10])))
+
+@test
+fn test_every_refused_operator_has_a_name() [io]
+    for op in fontcff.operators_refused()
+        test.assert(fontcff.operator_name(op) != "operator ${op}")
+
+// ── fontcmap ─────────────────────────────────────────────────────────
+
+fn format4_with_range_offset(ro: Int) -> Bytes
+    bytes_of([0, 4, 0, 36, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0,
+              0, 0x44, 0xFF, 0xFF, 0, 0, 0, 0x41, 0xFF, 0xFF,
+              0, 5, 0, 1, 0, ro, 0, 0, 0, 7, 0, 0])
+
+@test
+fn test_a_cmap_walk_that_runs_off_its_bytes_is_short_or_empty() [io]
+    test.case("THE CLAIM: a record whose offset is past the table is short by that offset")
+    let beyond = u16(0) + u16(1) + u16(3) + u16(1) + u32(100)
+    match fontcmap.subtables(beyond, fontsrc.range(0, 12))
+        Err(FontShort(_, want, have)) => test.assert(want == 102 and have == 12)
+        _                             => test.assert(false)
+
+    test.case("a format 14 subtable declares its length in the 32-bit field after the format")
+    let t14 = u16(0) + u16(1) + u16(0) + u16(5) + u32(12) + u16(14) + u32(10) + u32(0)
+    match fontcmap.subtables(t14, fontsrc.range(0, bytes.len(t14)))
+        Err(_)   => test.assert(false)
+        Ok(subs) =>
+            test.assert(list.get(subs, 0).format == 14)
+            test.assert(list.get(subs, 0).range.len == 10)
+
+    test.case("a range offset that points before the glyph id array maps nothing")
+    let sub = FontCmapSub { platform: 3, encoding: 1, format: 4, range: fontsrc.range(0, 36) }
+    match fontcmap.parse_subtable(format4_with_range_offset(2), sub)
+        Err(_) => test.assert(false)
+        Ok(c)  =>
+            test.assert(fontcmap.glyph_for(c, 0x41) == 0)
+            test.assert(fontcmap.glyph_for(c, 0 - 1) == 0)
+
+// ── fontdir ──────────────────────────────────────────────────────────
+
+@test
+fn test_the_directory_reads_a_collection_header_and_a_cut_one() [io]
+    let ttc = bytes.from_str("ttcf") + u32(0x00010000) + u32(2) + u32(20) + u32(40)
+
+    test.case("THE CLAIM: a collection header parses as a face with no tables of its own")
+    match fontdir.parse_directory(ttc, 0)
+        Err(_) => test.assert(false)
+        Ok(f)  =>
+            test.assert(f.face_count == 2)
+            test.assert(fontdir.table_count(f) == 0)
+            test.assert(fontdir.flavour(f) == FontOutlinesCollection)
+
+    test.case("a file that is not a collection declares no faces")
+    test.assert(fontdir.collection_faces(bytes.zeros(12)) == 0)
+
+    test.case("a header cut before its offsets is short by the offset it needed")
+    match fontdir.collection_face_at(bytes.from_str("ttcf") + u32(0x00010000) + u32(2), 1)
+        Err(FontShort(_, want, have)) => test.assert(want == 20 and have == 12)
+        _                             => test.assert(false)
+
+    test.case("a directory row is reachable by position, and four bytes are not an sfnt")
+    let face = FontFace { sfnt: 65536, index: 0, face_count: 1,
+                          tables: [FontTable { tag: fontdir.tag_head(), checksum: 0,
+                                               range: fontsrc.range(0, 54) }] }
+    test.assert(fontdir.table_at(face, 0) != None)
+    test.assert(fontdir.table_at(face, 1) == None)
+    test.assert(not fontdir.is_sfnt(bytes_of([0, 1])))
+
+// ── fontglyf ─────────────────────────────────────────────────────────
+
+@test
+fn test_loca_and_glyph_headers_that_contradict_themselves_answer_empty() [io]
+    test.case("THE CLAIM: offsets that run backwards are an empty record, not a negative one")
+    match fontglyf.parse_loca(bytes_of([0, 0, 0, 10, 0, 5]), 2, false)
+        Err(_) => test.assert(false)
+        Ok(l)  =>
+            match fontglyf.glyph_range(l, 1)
+                Some(r) => test.assert(r.len == 0)
+                None    => test.assert(false)
+
+    test.case("a loca with no entries describes no glyph")
+    test.assert(fontglyf.loca_glyph_count(FontLoca { offsets: [], long_format: false }) == 0)
+
+    test.case("a record under ten bytes has no box")
+    test.assert(geomrect.is_empty(fontglyf.glyph_bounds(bytes_of([0, 1, 0, 0]))))
+
+    test.case("a cubic contributes its control points to the box")
+    var p = svgpath.move_to(svgpath.empty(), 0.0, 0.0)
+    p = svgpath.cubic_to(p, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0)
+    let box = fontglyf.bounds_from_points(p)
+    test.assert_approx(geomrect.width(box), 50.0, 0.0)
+    test.assert_approx(geomrect.height(box), 60.0, 0.0)
+
+    test.case("a path that falls below its first point widens the box downward")
+    let down = svgpath.line_to(svgpath.move_to(svgpath.empty(), 5.0, 5.0), 0.0 - 3.0, 0.0 - 4.0)
+    test.assert_approx(geomrect.width(fontglyf.bounds_from_points(down)), 8.0, 0.0)
+    test.assert_approx(geomrect.height(fontglyf.bounds_from_points(down)), 9.0, 0.0)
+
+    test.case("byte arguments that are point numbers are unsigned")
+    match fontglyf.components(bytes_of([255, 255, 0, 0, 0, 0, 0, 0, 0, 0]) + u16(0) + u16(7)
+                              + bytes_of([4, 200]))
+        Err(_) => test.assert(false)
+        Ok(cs) =>
+            test.assert(list.get(cs, 0).point_match)
+            test.assert(list.get(cs, 0).parent_point == 4)
+            test.assert(list.get(cs, 0).child_point == 200)
+
+    test.case("a composite cut inside a component record is short by what the record needs")
+    match fontglyf.components(bytes_of([255, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
+        Err(FontShort(_, want, have)) => test.assert(want == 14 and have == 12)
+        _                             => test.assert(false)
+    match fontglyf.components(bytes_of([255, 255, 0, 0, 0, 0, 0, 0, 0, 0]) + u16(1) + u16(5))
+        Err(FontShort(_, want, have)) => test.assert(want == 18 and have == 14)
+        _                             => test.assert(false)
+
+// ── fontmetric ───────────────────────────────────────────────────────
+
+@test
+fn test_the_ascent_comparison_skips_a_typographic_set_the_table_does_not_have() [io]
+    let hhea = FontHhea { ascender: 800, descender: 0 - 200, line_gap: 0, advance_max: 0,
+                          caret_slope_rise: 1, caret_slope_run: 0, num_h_metrics: 1 }
+    let no_typo = FontOs2 { typo_ascender: 0, typo_descender: 0, typo_line_gap: 0,
+                            win_ascent: 800, win_descent: 200, x_height: 0, cap_height: 0,
+                            fs_selection: 0, version: 0 }
+
+    test.case("THE CLAIM: a version 0 table's zero typographic set is absent, not a disagreement")
+    test.assert(not fontmetric.ascent_sets_disagree(hhea, no_typo, 0))
+
+    test.case("and a set that is higher than the other is a difference in either direction")
+    let high = FontOs2 { typo_ascender: 0, typo_descender: 0, typo_line_gap: 0,
+                         win_ascent: 900, win_descent: 200, x_height: 0, cap_height: 0,
+                         fs_selection: 0, version: 0 }
+    test.assert(fontmetric.ascent_sets_disagree(hhea, high, 50))
+
+// ── fontshape ────────────────────────────────────────────────────────
+
+@test
+fn test_a_sequence_cut_short_or_broken_is_read_as_its_bytes() [io]
+    test.case("THE CLAIM: a lead byte followed by a byte that does not continue it stands alone")
+    test.assert(fontshape.first_complex(bytes.to_str(bytes_of([0xC3, 0x41]))) == 0 - 1)
+
+    test.case("and one cut off by the end of the text stands alone too")
+    test.assert(fontshape.first_complex(bytes.to_str(bytes_of([0xE2, 0x82]))) == 0 - 1)
+    test.assert(fontshape.first_complex(bytes.to_str(bytes_of([0xF0, 0x9F, 0x98]))) == 0 - 1)
+
+// ── fontread ─────────────────────────────────────────────────────────
+
+@test
+fn test_a_source_that_is_not_a_font_or_is_too_short_is_refused() [io]
+    let junk = fontread.buffer(bytes.from_str("PK\u{3}\u{4}") + bytes.zeros(8))
+
+    test.case("THE CLAIM: the first four bytes are named when they open no font")
+    match fontread.read_face(junk, 0)
+        Err(FontNotSfnt(magic)) => test.assert(magic == 0x504B0304)
+        _                       => test.assert(false)
+    match fontread.read_face_count(junk)
+        Err(FontNotSfnt(magic)) => test.assert(magic == 0x504B0304)
+        _                       => test.assert(false)
+
+    test.case("a table the buffer does not hold is short by its end")
+    let face = FontFace { sfnt: 65536, index: 0, face_count: 1,
+                          tables: [FontTable { tag: fontdir.tag_head(), checksum: 0,
+                                               range: fontsrc.range(100, 54) }] }
+    match fontread.read_table(junk, face, fontdir.tag_head())
+        Err(FontShort(_, want, have)) => test.assert(want == 154 and have == 12)
+        _                             => test.assert(false)

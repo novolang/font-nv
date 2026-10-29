@@ -1,0 +1,134 @@
+// probe.nv - shape a text with this package and print the answers that
+// tests/oracle/oracle.py prints for HarfBuzz and FreeType: the units per em,
+// the glyph numbers, the pen position of each glyph, the width, and the
+// control box of each outline (the first twelve distinct glyphs).
+//
+// usage: probe FONT FACE_INDEX TEXT none|liga      (FACE_INDEX is 0 or 1)
+//
+// Run through tests/oracle/compare.sh.
+
+use std.list
+use std.bytes
+use fontread
+use fontdir
+use fontshape
+use fontcff
+use fontsrc
+use svgpath
+
+fn csv(xs: [Int]) -> Str
+    var s = ""
+    for x in xs
+        s = s + "${x} "
+    s
+
+// Control box of a path as "minx miny maxx maxy".
+fn cbox(p: svgpath.SvgPath) -> Str
+    var xs: [Float] = []
+    var ys: [Float] = []
+    for c in svgpath.commands_of(p)
+        match c
+            SvgMoveTo(x, y)                  =>
+                list.push(xs, x)
+                list.push(ys, y)
+            SvgLineTo(x, y)                  =>
+                list.push(xs, x)
+                list.push(ys, y)
+            SvgQuadTo(x1, y1, x, y)          =>
+                list.push(xs, x1)
+                list.push(ys, y1)
+                list.push(xs, x)
+                list.push(ys, y)
+            SvgCubicTo(x1, y1, x2, y2, x, y) =>
+                list.push(xs, x1)
+                list.push(ys, y1)
+                list.push(xs, x2)
+                list.push(ys, y2)
+                list.push(xs, x)
+                list.push(ys, y)
+            _                                => ()
+    if list.len(xs) == 0
+        return "empty"
+    var lx = xs[0]
+    var hx = xs[0]
+    var ly = ys[0]
+    var hy = ys[0]
+    for i in 0..list.len(xs)
+        lx = if xs[i] < lx
+            xs[i]
+        else
+            lx
+        hx = if xs[i] > hx
+            xs[i]
+        else
+            hx
+        ly = if ys[i] < ly
+            ys[i]
+        else
+            ly
+        hy = if ys[i] > hy
+            ys[i]
+        else
+            hy
+    "${lx as Int} ${ly as Int} ${hx as Int} ${hy as Int}"
+
+fn main() [io, fs]
+    let args = env.user_args()
+    let font_path = args[0]
+    let face_index = if args[1] == "1"
+        1
+    else
+        0
+    let text = args[2]
+    let features = args[3]
+    let file = fs.read_bytes(font_path) ?? bytes.zeros(0)
+    let src = fontread.buffer(file)
+    let face = match fontread.read_face(src, face_index)
+        Ok(f)  => f
+        Err(e) =>
+            println("FACE ERR ${e.message()}")
+            return
+    var feats: [Int] = []
+    if features == "liga"
+        feats = [fontdir.tag_of("liga")]
+    let p = match fontread.read_plan(src, face, fontdir.tag_of("latn"), feats)
+        Ok(v)  => v
+        Err(e) =>
+            println("PLAN ERR ${e.message()}")
+            return
+    println("UPEM ${p.metrics.units_per_em}")
+    println("KERNSRC ${p.kern.source}")
+    match fontshape.shape(p, text)
+        Err(e)  => println("SHAPE ERR ${e.message()}")
+        Ok(run) =>
+            var gs: [Int] = []
+            var xs: [Int] = []
+            for pl in run.glyphs
+                list.push(gs, pl.glyph)
+                list.push(xs, pl.x)
+            println("GLYPHS ${csv(gs)}")
+            println("XS ${csv(xs)}")
+            println("WIDTH ${run.width}")
+            if fontdir.has_table(face, fontdir.tag_glyf())
+                let m = fontread.read_metrics(src, face)!
+                let loca = fontread.read_loca(src, face, m)!
+                var seen: [Int] = []
+                for g in gs
+                    if not list.contains(seen, g) and list.len(seen) < 12
+                        list.push(seen, g)
+                        match fontread.read_outline(src, face, loca, g)
+                            Ok(o)  => println("OUT ${g} ${cbox(o)}")
+                            Err(e) => println("OUT ${g} ERR ${e.message()}")
+            else
+                let table = fontread.read_table(src, face, fontdir.tag_cff())!
+                let top = fontcff.parse_top(table, fontsrc.range(0, bytes.len(table)))!
+                var seen: [Int] = []
+                for g in gs
+                    if not list.contains(seen, g) and list.len(seen) < 12
+                        list.push(seen, g)
+                        match fontcff.charstring_range(table, top, g)
+                            None    => println("OUT ${g} NORANGE")
+                            Some(r) =>
+                                match fontcff.charstring_outline(fontsrc.slice(table, r), table, top, 0)
+                                    Ok(o)  => println("OUT ${g} ${cbox(o)}")
+                                    Err(e) => println("OUT ${g} ERR ${e.message()}")

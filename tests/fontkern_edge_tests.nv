@@ -1,0 +1,654 @@
+// fontkern_edge_tests.nv — both `kern` headers, both `PairPos`
+// formats, and the class matrix, over tables assembled in memory.
+//
+// WHY THIS SUITE EXISTS.  `fontsurface_tests.nv` reaches
+// `fontkern.plan` with a twelve-byte stub and matches the result with
+// `Err(_) => test.assert(true)`, and `fontread_edge_tests.nv` reads
+// ONE fixture: a Microsoft-header `kern` table with a single
+// horizontal format 0 subtable, and a `GPOS` whose one lookup is a
+// `PairPos` format 1 with two listed pairs.  Everything else the
+// module can parse — Apple's header, a subtable it must SKIP, the
+// class matrix of `PairPos` format 2, a coverage table in format 2,
+// both class-definition formats, a `ValueRecord` that carries a field
+// before `XAdvance`, the language-specific `LangSys` walk — was read
+// by nothing, which is how a wrong read survives.  This file reads
+// each of them once, against numbers that come off the fixture
+// arithmetic.
+//
+// THE NUMBERS, HAND-COMPUTED.
+//
+//   APPLE'S HEADER IS EIGHT BYTES, MICROSOFT'S FOUR.  The Apple table
+//   below holds two subtables: a vertical one whose declared length is
+//   16 (an 8-byte subtable header, an 8-byte pair header, no pairs),
+//   and a horizontal one of 22 bytes (8 + 8 + 6 for its one pair).  The
+//   vertical one is SKIPPED — `skipped = 1` — and the horizontal one
+//   still contributes its pair, `(1, 2, -50)`.
+//
+//   THE ADVANCE SUM IS THE WIDTH, NOT THE INK.  The two-record pair in
+//   `pair_pos_listed` is listed twice for the same (left, right), which
+//   the format permits and the spec says adds: -40 + -5 = -45.
+//
+//   A CLASS MATRIX IS INDEXED, NOT SEARCHED.  The format 2 subtable is
+//   2 left classes by 2 right classes, and its four entries are
+//   [0, -20, -60, 0] in row-major order, so the entry for (left class
+//   l, right class r) is index `l * 2 + r`: (0,1) is 1 and holds -20,
+//   (1,0) is 2 and holds -60.  `pair_value(2, 5)` reaches -60 through
+//   the right-hand glyph 5, which the class definition leaves unnamed —
+//   `-1`, which the format reads as class 0 — the same -60 as (2, 2).
+//
+//   A PAIR OUTSIDE THE COVERAGE IS 0.  Glyph 3 is not in the left
+//   coverage table, so there is no left class for it and no adjustment
+//   to read: `pair_value(3, 1)` is 0 rather than an error.
+//
+// `x_advance_at` is pinned by a `ValueRecord` whose format is 0x0005 —
+// `XPlacement` and `XAdvance` — where the advance sits at offset 2
+// inside the record, after the placement's two bytes; and by a record
+// of format 0x0001, which carries a placement and NO advance, so a
+// reader that took the first field would answer 7 instead of 0.
+
+use std.test
+use std.list
+use std.bytes
+use fontdir
+use fontkern
+
+fn u16(v: Int) -> Bytes
+    bytes.u16_be(v)
+
+fn u32(v: Int) -> Bytes
+    bytes.u32_be(v)
+
+fn latn() -> Int
+    fontdir.tag_of("latn")
+
+// ── The `kern` table's two headers ──────────────────────────────────
+
+// Apple's header: a version word of 0x00010000, a 32-bit subtable
+// count, and subtables whose header is length(4) + coverage(2) +
+// tupleIndex(2).  Two subtables — a vertical format 0 one and a
+// horizontal one — laid out at 8 and 24.
+fn apple_kern() -> Bytes
+    u32(0x00010000) + u32(2)
+        + u32(16) + u16(0x8000) + u16(0)
+        + u16(0) + u16(0) + u16(0) + u16(0)
+        + u32(22) + u16(0x0000) + u16(0)
+        + u16(1) + u16(0) + u16(0) + u16(0)
+        + u16(1) + u16(2) + u16(0 - 50)
+
+// Microsoft's header: version(2) + subtable count(2), and subtables
+// whose header is version(2) + length(2) + coverage(2).  The first is
+// a horizontal format 2 subtable — a format this module does not read
+// — and the second is a horizontal format 0 with one pair, (3, 4, -30).
+fn ms_kern_with_a_refused_format() -> Bytes
+    u16(0) + u16(2)
+        + u16(0) + u16(26) + u16(0x0201)
+        + u16(2) + u16(0) + u16(0) + u16(0)
+        + u16(1) + u16(1) + u16(0)
+        + u16(1) + u16(2) + u16(0)
+        + u16(0) + u16(20) + u16(0x0001)
+        + u16(1) + u16(0) + u16(0) + u16(0)
+        + u16(3) + u16(4) + u16(0 - 30)
+
+// A header declaring no subtable at all, which is not a kerning source.
+fn kern_with_no_subtable() -> Bytes
+    u16(0) + u16(0)
+
+@test
+fn test_apples_header_is_eight_bytes_and_its_vertical_subtable_is_skipped() [io]
+    let t = fontkern.kern_pairs(apple_kern())!
+
+    test.case("THE CLAIM: the Apple header is recognised")
+    test.assert(t.is_apple)
+    test.assert(t.subtable_count == 2)
+
+    test.case("the vertical subtable is counted as skipped, not refused")
+    test.assert(t.skipped == 1)
+
+    test.case("the horizontal one still contributes its pair, (1, 2, -50)")
+    test.assert(list.len(t.pairs) == 1)
+    test.assert(list.get(t.pairs, 0).left == 1)
+    test.assert(list.get(t.pairs, 0).right == 2)
+    test.assert(list.get(t.pairs, 0).value == 0 - 50)
+
+    test.case("and the plan it makes is the legacy one")
+    let p = fontkern.plan(bytes.zeros(0), apple_kern(), latn(), 0)!
+    test.assert(p.source == FontKernLegacy)
+    test.assert(fontkern.pair_value(p, 1, 2) == 0 - 50)
+    test.assert(not fontkern.kerns_nothing(p))
+
+@test
+fn test_a_subtable_in_a_format_this_module_does_not_read_is_skipped() [io]
+    let t = fontkern.kern_pairs(ms_kern_with_a_refused_format())!
+
+    test.case("THE CLAIM: two subtables declared, one skipped, one pair read")
+    test.assert(not t.is_apple)
+    test.assert(t.subtable_count == 2)
+    test.assert(t.skipped == 1)
+    test.assert(list.len(t.pairs) == 1)
+    test.assert(list.get(t.pairs, 0).left == 3)
+    test.assert(list.get(t.pairs, 0).right == 4)
+    test.assert(list.get(t.pairs, 0).value == 0 - 30)
+
+    test.case("and the skipped format 2 pairs contribute nothing")
+    let p = fontkern.plan(bytes.zeros(0), ms_kern_with_a_refused_format(), latn(), 0)!
+    test.assert(p.source == FontKernLegacy)
+    test.assert(fontkern.pair_count(p) == 1)
+    test.assert(fontkern.pair_value(p, 1, 1) == 0)
+
+@test
+fn test_a_kern_table_with_no_subtable_is_not_a_kerning_source() [io]
+    let t = fontkern.kern_pairs(kern_with_no_subtable())!
+    test.assert(t.subtable_count == 0)
+    test.assert(list.len(t.pairs) == 0)
+    test.assert(t.skipped == 0)
+
+    test.case("THE CLAIM: `plan` reads a declared-nothing table as no source")
+    let p = fontkern.plan(bytes.zeros(0), kern_with_no_subtable(), latn(), 0)!
+    test.assert(p.source == FontKernNone)
+    test.assert(fontkern.kerns_nothing(p))
+    test.assert(fontkern.pair_value(p, 1, 2) == 0)
+
+    test.case("and an absent table is the same answer as an empty one")
+    let q = fontkern.plan(bytes.zeros(0), bytes.zeros(0), latn(), 0)!
+    test.assert(q.source == FontKernNone)
+
+@test
+fn test_a_kern_table_too_short_for_what_it_declares_refuses() [io]
+    test.case("THE CLAIM: fewer than four bytes is a short table, not a plan")
+    match fontkern.kern_pairs(u16(0))
+        Err(_) => test.assert(true)
+        Ok(_)  => test.assert(false)
+
+    test.case("a header declaring one subtable in six bytes cannot hold it")
+    match fontkern.kern_pairs(u16(0) + u16(1))
+        Err(_) => test.assert(true)
+        Ok(_)  => test.assert(false)
+
+    test.case("and a pair record past the end refuses rather than reading zero")
+    let short = u16(0) + u16(1) + u16(0) + u16(8) + u16(0x0001)
+        + u16(1) + u16(0) + u16(0) + u16(0)
+        + u16(1) + u16(2)
+    match fontkern.kern_pairs(short)
+        Err(_) => test.assert(true)
+        Ok(_)  => test.assert(false)
+
+// ── `GPOS`: the pair list, both value records ───────────────────────
+
+// The shared script list: `latn`, its default language, one feature
+// index.  Two bytes of count, six of record, the Script table's four
+// bytes of header, and an eight-byte LangSys.
+fn script_list_default() -> Bytes
+    u16(1) + u32(latn()) + u16(8)
+        + u16(4) + u16(0)
+        + u16(0) + u16(0xFFFF) + u16(1) + u16(0)
+
+// A feature list naming one feature whose Feature table holds one
+// lookup index, and a lookup list with one lookup of `kind` whose
+// subtable sits at offset 8.
+fn kern_headers(kind: Int) -> Bytes
+    script_list_default()
+        + u16(1) + u32(fontdir.tag_of("kern")) + u16(8)
+            + u16(0) + u16(1) + u16(0)
+        + u16(1) + u16(4)
+            + u16(kind) + u16(0) + u16(1) + u16(8)
+
+// A `GPOS` whose one PairPos format 1 subtable covers glyphs [1, 2] and
+// lists (1, 2) with valueFormat 0x0005 twice and (2, 3) once:
+// `XPlacement` first and `XAdvance` second, at -40, -5 and -70.
+fn pair_pos_listed() -> Bytes
+    u16(1) + u16(0) + u16(10) + u16(30) + u16(44)
+        + kern_headers(2)
+        + u16(1) + u16(36) + u16(0x0005) + u16(0) + u16(2) + u16(14) + u16(28)
+        + u16(2)
+            + u16(2) + u16(7) + u16(0 - 40)
+            + u16(2) + u16(0) + u16(0 - 5)
+        + u16(1)
+            + u16(3) + u16(0) + u16(0 - 70)
+        + u16(1) + u16(2) + u16(1) + u16(2)
+
+@test
+fn test_a_pair_listed_twice_adds_and_the_advance_is_read_by_its_format() [io]
+    let gpos = pair_pos_listed()
+    let p = fontkern.plan(gpos, bytes.zeros(0), latn(), 0)!
+
+    test.case("THE CLAIM: -40 and -5 for the same pair add to -45")
+    test.assert(p.source == FontKernGpos)
+    test.assert(fontkern.pair_count(p) == 3)
+    test.assert(fontkern.pair_value(p, 1, 2) == 0 - 45)
+
+    test.case("XAdvance is the second field of a 0x0005 record, not the first")
+    test.assert(fontkern.pair_value(p, 2, 3) == 0 - 70)
+
+    test.case("and the run values are one per gap, in order")
+    let vals = fontkern.run_values(p, [1, 2, 3])
+    test.assert(list.len(vals) == 2)
+    test.assert(list.get(vals, 0) == 0 - 45)
+    test.assert(list.get(vals, 1) == 0 - 70)
+
+@test
+fn test_a_value_record_without_an_advance_field_adjusts_nothing() [io]
+    // The same shape with valueFormat1 = 0x0001: one `XPlacement` of 7
+    // and no `XAdvance` at all, so the answer is 0 rather than 7.
+    let gpos = u16(1) + u16(0) + u16(10) + u16(30) + u16(44)
+        + kern_headers(2)
+        + u16(1) + u16(18) + u16(0x0001) + u16(0) + u16(1) + u16(12)
+        + u16(1) + u16(2) + u16(7)
+        + u16(1) + u16(1) + u16(1)
+    let p = fontkern.plan(gpos, bytes.zeros(0), latn(), 0)!
+
+    test.case("THE CLAIM: a record with no XAdvance answers 0, not its first field")
+    test.assert(fontkern.pair_value(p, 1, 2) == 0)
+    test.assert(fontkern.pair_count(p) == 1)
+
+// ── `GPOS`: the class matrix ────────────────────────────────────────
+
+// A `GPOS` whose one PairPos format 2 subtable is a 2 by 2 class
+// matrix.  The coverage table is FORMAT 2 (one range, glyphs 1..2) and
+// both class definitions are format 2 as well: left glyphs 1 and 2 get
+// classes 0 and 1; right glyphs 1 and 2 get class 0, glyph 3 gets class
+// 1, and glyph 4 gets class 5 — a class past the matrix's own two
+// columns, which is the malformed case the index check exists for.
+fn pair_pos_class_matrix() -> Bytes
+    u16(1) + u16(0) + u16(10) + u16(30) + u16(44)
+        + kern_headers(2)
+        + u16(2) + u16(24) + u16(0x0004) + u16(0) + u16(32) + u16(48)
+        + u16(2) + u16(2)
+        + u16(0) + u16(0 - 20) + u16(0 - 60) + u16(0)
+        + u16(2) + u16(1) + u16(1) + u16(2)
+        + u16(2) + u16(2) + u16(1) + u16(1) + u16(0) + u16(2) + u16(2) + u16(1)
+        + u16(2) + u16(3) + u16(1) + u16(2) + u16(0) + u16(3) + u16(3) + u16(1)
+        + u16(4) + u16(4) + u16(5)
+
+@test
+fn test_the_class_matrix_is_indexed_by_class_and_not_searched_by_pair() [io]
+    let gpos = pair_pos_class_matrix()
+    let p = fontkern.plan(gpos, bytes.zeros(0), latn(), 0)!
+
+    test.case("THE CLAIM: a class matrix has no listed pairs, so its count is its non-zero entries")
+    test.assert(p.source == FontKernGpos)
+    test.assert(fontkern.pair_count(p) == 2)
+    test.assert(not fontkern.kerns_nothing(p))
+
+    test.case("index = left class * 2 + right class: (0,1) is 1 and holds -20")
+    test.assert(fontkern.pair_value(p, 1, 3) == 0 - 20)
+
+    test.case("and (1,0) is 2 and holds -60, through an unnamed right glyph too")
+    test.assert(fontkern.pair_value(p, 2, 2) == 0 - 60)
+    test.assert(fontkern.pair_value(p, 2, 5) == 0 - 60)
+
+    test.case("the zero entries are adjustments of 0, not absent classes")
+    test.assert(fontkern.pair_value(p, 1, 1) == 0)
+    test.assert(fontkern.pair_value(p, 2, 3) == 0)
+    test.assert(fontkern.pair_value(p, 1, 5) == 0)
+
+    test.case("a glyph outside the coverage has no left class and no adjustment")
+    test.assert(fontkern.pair_value(p, 3, 1) == 0)
+
+    test.case("and a class past the matrix refuses rather than reading on")
+    test.assert(fontkern.pair_value(p, 1, 4) == 0)
+
+    test.case("the run values come off the matrix, one per gap")
+    let vals = fontkern.run_values(p, [2, 2, 2])
+    test.assert(list.len(vals) == 2)
+    test.assert(list.get(vals, 0) == 0 - 60)
+    test.assert(list.get(vals, 1) == 0 - 60)
+
+@test
+fn test_a_lookup_of_another_type_is_skipped_and_the_plan_says_so() [io]
+    // The same class matrix behind a lookup of type 3, which this
+    // module refuses by name: the plan still says `Gpos` — the font
+    // does have a `kern` feature — and adjusts nothing.
+    let gpos = u16(1) + u16(0) + u16(10) + u16(30) + u16(44)
+        + kern_headers(3)
+        + u16(2) + u16(24) + u16(0x0004) + u16(0) + u16(32) + u16(48)
+        + u16(2) + u16(2)
+        + u16(0) + u16(0 - 20) + u16(0 - 60) + u16(0)
+        + u16(2) + u16(1) + u16(1) + u16(2)
+        + u16(2) + u16(2) + u16(1) + u16(1) + u16(0) + u16(2) + u16(2) + u16(1)
+        + u16(2) + u16(3) + u16(1) + u16(2) + u16(0) + u16(3) + u16(3) + u16(1)
+        + u16(4) + u16(4) + u16(5)
+    let p = fontkern.plan(gpos, bytes.zeros(0), latn(), 0)!
+
+    test.case("THE CLAIM: the source is decided by the feature, not by the lookup type")
+    test.assert(p.source == FontKernGpos)
+    test.assert(fontkern.kerns_nothing(p))
+    test.assert(fontkern.pair_value(p, 1, 3) == 0)
+    test.assert(fontkern.pair_count(p) == 0)
+
+// ── `GPOS`: the script and language walk ────────────────────────────
+
+// A `GPOS` whose `latn` Script table has a NULL default LangSys and one
+// language-specific LangSys, tagged 0xFFFF, which holds the `kern`
+// feature.  Glyph 1's pair with glyph 2 is (-30).
+fn gpos_language_specific() -> Bytes
+    u16(1) + u16(0) + u16(10) + u16(36) + u16(50)
+        + u16(1) + u32(latn()) + u16(8)
+            + u16(0) + u16(1)
+            + u32(0xFFFF) + u16(10)
+            + u16(0) + u16(0xFFFF) + u16(1) + u16(0)
+        + u16(1) + u32(fontdir.tag_of("kern")) + u16(8)
+            + u16(0) + u16(1) + u16(0)
+        + u16(1) + u16(4)
+            + u16(2) + u16(0) + u16(1) + u16(8)
+        + u16(1) + u16(18) + u16(4) + u16(0) + u16(1) + u16(12)
+        + u16(1) + u16(2) + u16(0 - 30)
+        + u16(1) + u16(1) + u16(1)
+
+@test
+fn test_a_null_default_langsys_kerns_nothing_and_a_language_record_is_found() [io]
+    let gpos = gpos_language_specific()
+
+    test.case("THE CLAIM: a NULL defaultLangSys answers 'this script does not kern'")
+    test.assert(not fontkern.gpos_has_kern(gpos, latn(), 0))
+
+    test.case("the language-specific LangSys is found by its tag")
+    test.assert(fontkern.gpos_has_kern(gpos, latn(), 0xFFFF))
+
+    test.case("an absent language, and an absent script, both answer false")
+    test.assert(not fontkern.gpos_has_kern(gpos, latn(), fontdir.tag_of("ENG ")))
+    test.assert(not fontkern.gpos_has_kern(gpos, fontdir.tag_of("cyrl"), 0xFFFF))
+
+    test.case("and the plan for that language carries the pair, (-30)")
+    let p = fontkern.plan(gpos, bytes.zeros(0), latn(), 0xFFFF)!
+    test.assert(p.source == FontKernGpos)
+    test.assert(fontkern.pair_value(p, 1, 2) == 0 - 30)
+
+    test.case("while the default language is no source at all")
+    let q = fontkern.plan(gpos, bytes.zeros(0), latn(), 0)!
+    test.assert(q.source == FontKernNone)
+
+@test
+fn test_the_scripts_a_table_declares_are_reported_as_tags() [io]
+    test.case("THE CLAIM: the one script is `latn`, and a stub declares none")
+    let one = fontkern.gpos_scripts(gpos_language_specific())
+    test.assert(list.len(one) == 1)
+    test.assert(list.get(one, 0) == latn())
+    test.assert(list.len(fontkern.gpos_scripts(pair_pos_class_matrix())) == 1)
+    test.assert(list.len(fontkern.gpos_scripts(bytes.zeros(0))) == 0)
+    test.assert(list.len(fontkern.gpos_scripts(u16(1) + u16(0) + u16(0) + u16(0) + u16(0))) == 0)
+
+// ── One source, never two ───────────────────────────────────────────
+
+@test
+fn test_a_face_with_both_kerning_tables_kerns_through_one_of_them_only() [io]
+    // A font may carry a legacy `kern` table AND a `GPOS` `kern`
+    // feature holding the same pair.  Applying both moves the letters
+    // twice, and the result is text that is subtly too tight on every
+    // line — README rule 8.  The two fixtures disagree on purpose:
+    // `GPOS` lists (1, 2, -45), (2, 3, -70), and the legacy table
+    // lists (3, 4, -30), so a plan that read both would answer
+    // `pair_value(3, 4) == -30` and count three pairs.
+    let p = fontkern.plan(pair_pos_listed(), ms_kern_with_a_refused_format(),
+                          latn(), 0)!
+
+    test.case("THE CLAIM: `GPOS` wins, and the legacy table is not read alongside it")
+    test.assert(p.source == FontKernGpos)
+    test.assert(fontkern.pair_count(p) == 3)
+    test.assert(fontkern.pair_value(p, 1, 2) == 0 - 45)
+    test.assert(fontkern.pair_value(p, 3, 4) == 0)
+
+    test.case("and with no `GPOS` kern feature the legacy table is the one read")
+    let q = fontkern.plan(bytes.zeros(0), ms_kern_with_a_refused_format(),
+                          latn(), 0)!
+    test.assert(q.source == FontKernLegacy)
+    test.assert(fontkern.pair_value(q, 3, 4) == 0 - 30)
+    test.assert(fontkern.pair_value(q, 1, 2) == 0)
+
+// ── The guards: a table a walk cannot follow ────────────────────────
+//
+// Every reader in `fontkern` checks the length it needs and answers
+// "nothing" or a named fault rather than reading past the end.  The
+// fixtures below are each ONE field away from a working table — a
+// declared length shorter than the header, a class definition that
+// claims more ranges than the bytes hold, a class definition in a
+// format neither of the two — and each one is assembled by hand so the
+// offset it bends is the offset the case names.
+
+// A `PairPos` format 2 whose two class definitions are given as raw
+// bytes.  The subtable is the same 2-by-2 matrix as
+// `pair_pos_class_matrix`, but `valueFormat1` is 0x0006 — a
+// `YPlacement` and an `XAdvance`, so every entry is four bytes and the
+// advance sits at offset 2 of the record, not 0 — and the coverage (8
+// bytes, glyphs 1..2) sits at 32 from the subtable's start.
+//
+// `d1_last` decides which definition is the LAST blob in the table,
+// because "this definition claims more ranges than the bytes hold" can
+// only be a case when the walk reaches the end of the table on the
+// definition's own count.
+fn class_matrix_with(d1: Bytes, d2: Bytes, d1_last: Bool) -> Bytes
+    let cov = u16(2) + u16(1) + u16(1) + u16(2)
+    let base = 32 + bytes.len(cov)
+    var at1 = base
+    var at2 = base + bytes.len(d1)
+    var tail = d1 + d2
+    if d1_last
+        at1 = base + bytes.len(d2)
+        at2 = base
+        tail = d2 + d1
+    u16(1) + u16(0) + u16(10) + u16(30) + u16(44)
+        + kern_headers(2)
+        + u16(2) + u16(32) + u16(0x0006) + u16(0) + u16(at1) + u16(at2)
+        + u16(2) + u16(2)
+        + u16(0) + u16(0) + u16(0) + u16(0 - 20)
+        + u16(0) + u16(0 - 60) + u16(0) + u16(0 - 5)
+        + cov + tail
+
+@test
+fn test_a_class_definition_is_read_in_format_one_and_a_bad_one_names_nothing() [io]
+    test.case("THE CLAIM: a format 1 classDef is an array, and the class of a glyph outside it is 0")
+    // Left: format 1, start 2, one class — so glyph 2 is class 1 and
+    // glyph 1, which the definition does not name, is class 0.  Right:
+    // format 1, start 1, two classes [1, 0], and glyph 0 is the -1 the
+    // definition's own start leaves before it.
+    let x = class_matrix_with(u16(1) + u16(2) + u16(1) + u16(1),
+                              u16(1) + u16(1) + u16(2) + u16(1) + u16(0),
+                              false)
+    let p = fontkern.plan(x, bytes.zeros(0), latn(), 0)!
+    test.assert(p.source == FontKernGpos)
+    test.assert(fontkern.pair_value(p, 2, 1) == 0 - 5)
+    test.assert(fontkern.pair_value(p, 2, 2) == 0 - 60)
+    test.assert(fontkern.pair_value(p, 1, 1) == 0 - 20)
+    test.assert(fontkern.pair_value(p, 1, 2) == 0)
+    test.assert(fontkern.pair_count(p) == 3)
+
+    test.case("the advance of a 0x0006 record is its SECOND word (-5, not the YPlacement 0)")
+    test.assert(fontkern.pair_value(p, 2, 1) == 0 - 5)
+
+    test.case("a classDef claiming nine ranges with one present names nothing past the gap")
+    // Ten bytes, and the LAST blob in the table: a format 2 header
+    // claiming nine ranges, then one range, glyphs 5..6.  Neither
+    // covered glyph (1 and 2) is named, so the walk runs off the end —
+    // and the left class of every covered glyph is 0.
+    let y = fontkern.plan(class_matrix_with(u16(2) + u16(9) + u16(5) + u16(6) + u16(1),
+                                            u16(1) + u16(5) + u16(2) + u16(1) + u16(0),
+                                            true),
+                          bytes.zeros(0), latn(), 0)!
+    test.assert(fontkern.pair_value(y, 2, 1) == 0)
+    test.assert(fontkern.pair_count(y) == 3)
+
+    test.case("the same gap in the right-hand classDef leaves the right glyph unclassed")
+    let w = fontkern.plan(class_matrix_with(u16(1) + u16(2) + u16(1) + u16(1),
+                                            u16(2) + u16(9) + u16(5) + u16(6) + u16(1),
+                                            false),
+                          bytes.zeros(0), latn(), 0)!
+    test.assert(fontkern.pair_value(w, 2, 1) == 0 - 60)
+    test.assert(fontkern.pair_count(w) == 3)
+
+    test.case("and a classDef in a format neither of the two names nothing either")
+    let z = fontkern.plan(class_matrix_with(u16(3) + u16(0) + u16(0), u16(3), false),
+                          bytes.zeros(0), latn(), 0)!
+    test.assert(fontkern.pair_value(z, 2, 1) == 0)
+    test.assert(fontkern.pair_count(z) == 3)
+
+    test.case("a classDef with fewer than six bytes left names nothing for the left glyph")
+    // The left definition is four bytes and LAST in the table, so the
+    // walk reaches it with two of the six bytes a classDef header needs
+    // missing.  The right definition is whole — format 1, start 1, the
+    // classes [1, 0] — so the right side is classed and the left side
+    // is class 0 everywhere: glyph 2 with glyph 1 is entry 0 * 2 + 1 =
+    // 1 of the matrix, -20, and the class the short definition would
+    // have named is lost rather than guessed.
+    let v = fontkern.plan(class_matrix_with(u16(3) + u16(0),
+                                            u16(1) + u16(1) + u16(2) + u16(1) + u16(0),
+                                            true),
+                          bytes.zeros(0), latn(), 0)!
+    test.assert(fontkern.pair_value(v, 2, 1) == 0 - 20)
+    test.assert(fontkern.pair_value(v, 2, 2) == 0)
+    test.assert(fontkern.pair_count(v) == 3)
+
+    test.case("a format 1 classDef claiming three classes with one present stops at the gap")
+    // The right definition is eight bytes — format 1, start 1, a count
+    // of three, and ONE record — and it is last, so the walk reads the
+    // one class (glyph 1 is class 1) and stops: glyph 2 is left unnamed
+    // and reads as class 0.  The left definition is whole (glyph 2 is
+    // class 1), so (2, 1) is entry 1 * 2 + 1 = 3 of the matrix, -5,
+    // while (2, 2) is entry 1 * 2 + 0 = 2, -60 — the dropped class and
+    // the present one are distinguishable.
+    let t = fontkern.plan(class_matrix_with(u16(1) + u16(2) + u16(1) + u16(1),
+                                            u16(1) + u16(1) + u16(3) + u16(1),
+                                            false),
+                          bytes.zeros(0), latn(), 0)!
+    test.assert(fontkern.pair_value(t, 2, 1) == 0 - 5)
+    test.assert(fontkern.pair_value(t, 2, 2) == 0 - 60)
+    test.assert(fontkern.pair_value(t, 1, 1) == 0 - 20)
+    test.assert(fontkern.pair_count(t) == 3)
+
+@test
+fn test_a_script_or_a_feature_the_walk_cannot_follow_answers_nothing() [io]
+    test.case("THE CLAIM: a script list offset of 0 declares no script at all")
+    let no_scripts = u16(1) + u16(0) + u16(0) + u16(30) + u16(44)
+        + script_list_default()
+    test.assert(not fontkern.gpos_has_kern(no_scripts, latn(), 0))
+    test.assert(list.len(fontkern.gpos_scripts(no_scripts)) == 0)
+    test.assert(fontkern.plan(no_scripts, bytes.zeros(0), latn(), 0)!.source == FontKernNone)
+
+    test.case("a feature list offset of 0 is a list with no record in it")
+    let no_features = u16(1) + u16(0) + u16(10) + u16(0) + u16(44)
+        + script_list_default()
+    test.assert(not fontkern.gpos_has_kern(no_features, latn(), 0))
+
+    test.case("a langsys naming a feature past the list's own count is refused as a tag of 0")
+    let past = u16(1) + u16(0) + u16(10) + u16(30) + u16(44)
+        + script_list_default() + u16(0)
+    test.assert(not fontkern.gpos_has_kern(past, latn(), 0))
+
+    test.case("a langsys with a nonzero offset but no six bytes behind it names nothing")
+    let short_lang = u16(1) + u16(0) + u16(10) + u16(30) + u16(44)
+        + u16(1) + u32(latn()) + u16(8)
+        + u16(8) + u16(0)
+    test.assert(not fontkern.gpos_has_kern(short_lang, latn(), 0))
+
+    test.case("and an index list that claims four entries with two present stops at the gap")
+    let short_indices = u16(1) + u16(0) + u16(10) + u16(0) + u16(44)
+        + u16(1) + u32(latn()) + u16(8)
+        + u16(4) + u16(0)
+        + u16(0) + u16(0xFFFF) + u16(4) + u16(0) + u16(1)
+    test.assert(not fontkern.gpos_has_kern(short_indices, latn(), 0))
+
+    test.case("a script list claiming two records with one present reports the one")
+    let one_script = u16(1) + u16(0) + u16(10) + u16(0) + u16(0)
+        + u16(2) + u32(latn()) + u16(8)
+    let scripts = fontkern.gpos_scripts(one_script)
+    test.assert(list.len(scripts) == 1)
+    test.assert(list.get(scripts, 0) == latn())
+
+@test
+fn test_a_subtable_or_a_lookup_the_walk_cannot_reach_is_skipped() [io]
+    test.case("THE CLAIM: a lookup whose subtable offset lands past the table skips it")
+    let far = u16(1) + u16(0) + u16(10) + u16(30) + u16(44)
+        + script_list_default()
+        + u16(1) + u32(fontdir.tag_of("kern")) + u16(8)
+            + u16(0) + u16(1) + u16(0)
+        + u16(1) + u16(4)
+            + u16(2) + u16(0) + u16(1) + u16(0x0F00)
+    let p = fontkern.plan(far, bytes.zeros(0), latn(), 0)!
+    test.assert(p.source == FontKernGpos)
+    test.assert(fontkern.pair_count(p) == 0)
+
+    test.case("a PairPos format 1 whose pair set claims two records with one present stops")
+    let one_record = u16(1) + u16(0) + u16(10) + u16(30) + u16(44)
+        + kern_headers(2)
+        + u16(1) + u16(12) + u16(0x0004) + u16(0) + u16(1) + u16(18)
+        + u16(1) + u16(1) + u16(1)
+        + u16(2) + u16(2) + u16(0 - 30)
+    let q = fontkern.plan(one_record, bytes.zeros(0), latn(), 0)!
+    test.assert(fontkern.pair_value(q, 1, 2) == 0 - 30)
+    test.assert(fontkern.pair_count(q) == 1)
+
+    test.case("a class matrix that declares 300 rows where the bytes hold 2 kerns nothing")
+    let huge = u16(1) + u16(0) + u16(10) + u16(30) + u16(44)
+        + kern_headers(2)
+        + u16(2) + u16(18) + u16(0x0004) + u16(0) + u16(0) + u16(0)
+        + u16(300) + u16(2)
+        + u16(1) + u16(1) + u16(1)
+    let h = fontkern.plan(huge, bytes.zeros(0), latn(), 0)!
+    test.assert(h.source == FontKernGpos)
+    test.assert(fontkern.pair_count(h) == 0)
+
+    test.case("a coverage offset past the end covers no glyph, so no pair is listed")
+    let no_coverage = u16(1) + u16(0) + u16(10) + u16(30) + u16(44)
+        + kern_headers(2)
+        + u16(1) + u16(200) + u16(0x0004) + u16(0) + u16(1) + u16(12)
+        + u16(1) + u16(2) + u16(0 - 30)
+    test.assert(fontkern.pair_count(fontkern.plan(no_coverage, bytes.zeros(0),
+                                                  latn(), 0)!) == 0)
+
+    test.case("a coverage format 1 claiming three glyphs with two present lists the two")
+    let short_cov = u16(1) + u16(0) + u16(10) + u16(30) + u16(44)
+        + kern_headers(2)
+        + u16(1) + u16(18) + u16(0x0004) + u16(0) + u16(1) + u16(12)
+        + u16(1) + u16(2) + u16(0 - 30)
+        + u16(1) + u16(3) + u16(1) + u16(2)
+    let s = fontkern.plan(short_cov, bytes.zeros(0), latn(), 0)!
+    test.assert(fontkern.pair_value(s, 1, 2) == 0 - 30)
+    test.assert(fontkern.pair_count(s) == 1)
+
+    test.case("and a coverage format 2 claiming three ranges with one present expands the one")
+    let short_ranges = u16(1) + u16(0) + u16(10) + u16(30) + u16(44)
+        + kern_headers(2)
+        + u16(1) + u16(18) + u16(0x0004) + u16(0) + u16(1) + u16(12)
+        + u16(1) + u16(2) + u16(0 - 30)
+        + u16(2) + u16(3) + u16(1) + u16(2) + u16(3)
+    let r = fontkern.plan(short_ranges, bytes.zeros(0), latn(), 0)!
+    test.assert(fontkern.pair_value(r, 1, 2) == 0 - 30)
+    test.assert(fontkern.pair_count(r) == 1)
+
+    test.case("a feature naming lookup 5 in a list of one adjusts nothing")
+    let missing_lookup = u16(1) + u16(0) + u16(10) + u16(30) + u16(44)
+        + script_list_default()
+        + u16(1) + u32(fontdir.tag_of("kern")) + u16(8)
+            + u16(0) + u16(1) + u16(5)
+        + u16(1) + u16(4) + u16(2) + u16(0) + u16(1) + u16(0)
+    let m = fontkern.plan(missing_lookup, bytes.zeros(0), latn(), 0)!
+    test.assert(m.source == FontKernGpos)
+    test.assert(fontkern.pair_count(m) == 0)
+
+    test.case("and a font with a kern feature but no lookup list at all kerns nothing")
+    let no_lookups = u16(1) + u16(0) + u16(10) + u16(30) + u16(0)
+        + script_list_default()
+        + u16(1) + u32(fontdir.tag_of("kern")) + u16(8)
+            + u16(0) + u16(1) + u16(0)
+    let n = fontkern.plan(no_lookups, bytes.zeros(0), latn(), 0)!
+    test.assert(n.source == FontKernGpos)
+    test.assert(fontkern.kerns_nothing(n))
+
+@test
+fn test_a_kern_subtable_shorter_than_its_own_header_is_still_walked() [io]
+    // The clamped case: the declared length is 2, less than the six-byte
+    // Microsoft header, and the walk steps by the header anyway — and
+    // then by the pairs' own count, which is zero here.
+    let short_length = u16(0) + u16(1)
+        + u16(0) + u16(2) + u16(0x0001)
+        + u16(0) + u16(0) + u16(0) + u16(0)
+    let t = fontkern.kern_pairs(short_length)!
+    test.assert(t.subtable_count == 1)
+    test.assert(t.skipped == 0)
+    test.assert(list.len(t.pairs) == 0)
+
+    test.case("THE CLAIM: a horizontal subtable whose body does not fit refuses by name")
+    let short_body = u16(0) + u16(1)
+        + u16(0) + u16(6) + u16(0x0001)
+        + u16(1) + u16(2)
+    match fontkern.kern_pairs(short_body)
+        Err(_) => test.assert(true)
+        Ok(_)  => test.assert(false)

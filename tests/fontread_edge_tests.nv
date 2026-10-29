@@ -1,0 +1,793 @@
+// fontread_edge_tests.nv — a whole font assembled in memory, read back
+// through every loop in `fontread`.
+//
+// WHY THIS SUITE EXISTS.  `fontsurface_tests.nv` reaches every entry
+// point in the package with a twelve-byte stub, which is what it is
+// for; it never reads a table.  So the module that owns the DEPENDENT
+// reads — the offset table sizes the directory, `head` sizes `loca`,
+// `loca` finds the glyph, a composite names its components — was
+// exercised by nothing.  Every test here hands the loops a font built
+// byte by byte in this file, so each number asserted below is the one
+// the fixture wrote.
+//
+// THE FONT, ONCE, AS ARITHMETIC A READER CAN CHECK.  1000 units to the
+// em, six glyphs, six `hmtx` pairs with advances 600 500 400 300 200
+// 100, and `loca` in the SHORT format, so both halves of the dependent
+// pair are live:
+//
+//   glyph 0   no outline at all: `loca`'s first two entries are equal,
+//             which is what a space looks like on disk
+//   glyph 1   one contour, four on-curve points — (0,0) (500,0)
+//             (500,700) (0,700) — 34 bytes, the square every bound
+//             asserted below is taken from
+//   glyph 2   a composite of glyph 1, offset (10, 20): the same square,
+//             moved, which is how the composed answer is caught
+//   glyph 3   a composite of glyph 2 — the recursion, one level deeper
+//   glyph 4   a composite that names ITSELF: the record that makes a
+//             naive reader hang rather than answer
+//   glyph 5   a composite whose component is glyph 0, so an empty
+//             component contributes an empty path and no read
+//
+// The `glyf` records run 34 + 16 * 4 bytes and `loca` stores their
+// halves: 0, 0, 17, 25, 33, 41, 49.
+//
+// `cmap` maps `A`..`E` to glyphs 1..5 through one format 4 delta
+// segment; `kern` is a Microsoft-header table with one horizontal
+// format 0 subtable holding the pair (1, 2, -40); `GPOS` carries a
+// `kern` feature for `latn`'s default language with one PairPos format
+// 1 subtable holding (1, 2, -40) and (2, 3, -70); `GSUB` carries a
+// `liga` feature whose one lookup is a format 1 ligature substitution
+// `1 2 -> 3`.  The same pair therefore kerns by -40 through either
+// kerning source, and the shaping numbers in the plan tests read
+// straight off the fixture: "AB" is 500 + 400 - 40 = 860 units with
+// either source, and 500 + 400 - 40 with `GSUB`'s ligature on is one
+// glyph of 400 units.
+//
+// A second, deeper font pins `fontglyf.component_limit`: glyphs 1..6
+// each composite of the next, glyph 7 simple, so the walk reaches
+// depth 6 at glyph 7 and is refused there by number.
+
+use std.test
+use std.list
+use std.bytes
+use fontdir
+use fontmetric
+use fontcmap
+use fontglyf
+use fontgsub
+use fontkern
+use fontshape
+use fontread
+use fonterror
+use svgpath
+use geomrect
+
+// ── Bytes, built as numbers ─────────────────────────────────────────
+
+fn bytes_of(xs: [Int]) -> Bytes
+    bytes.from_byte_list(xs)
+
+fn u16(v: Int) -> Bytes
+    bytes.u16_be(v)
+
+fn u32(v: Int) -> Bytes
+    bytes.u32_be(v)
+
+// A table's bytes padded to a four-byte boundary, which is what a real
+// writer does and what keeps both halves of one layout agreeing.
+fn pad4(b: Bytes) -> Bytes
+    let extra = (4 - bytes.len(b) % 4) % 4
+    if extra == 0
+        bytes.clone(b)
+    else
+        b + bytes.zeros(extra)
+
+// ── The four metric tables ──────────────────────────────────────────
+
+// 54 bytes, and only the fields `fontmetric` reads are non-zero:
+// unitsPerEm at 18, the four bounds, `macStyle` at 44, and
+// `indexToLocFormat` at 50.
+fn head_table(long_loca: Bool) -> Bytes
+    let loc = if long_loca
+        1
+    else
+        0
+    u32(0x00010000) + u32(0x00010000) + u32(0) + u32(0x5F0F3CF5)
+        + u16(3) + u16(1000) + bytes.zeros(8) + bytes.zeros(8)
+        + u16(0 - 100) + u16(0 - 20) + u16(1024) + u16(768)
+        + u16(1) + u16(8) + u16(2) + u16(loc) + u16(0)
+
+// 36 bytes: ascender 800, descender -200, lineGap 90, advanceWidthMax
+// 600, and `numberOfHMetrics` at 34.
+fn hhea_table(num_h_metrics: Int) -> Bytes
+    u32(0x00010000) + u16(800) + u16(0 - 200) + u16(90) + u16(600)
+        + u16(0) + u16(0) + u16(500)
+        + u16(1) + u16(0) + u16(0)
+        + u16(0) + u16(0) + u16(0) + u16(0)
+        + u16(0) + u16(num_h_metrics)
+
+// 32 bytes of version 1.0, with `maxComponentDepth` at 30.
+fn maxp_table(num_glyphs: Int, depth: Int) -> Bytes
+    u32(0x00010000) + u16(num_glyphs) + bytes.zeros(24) + u16(depth)
+
+// One (advance, leftSideBearing) pair per glyph, side bearings zero.
+fn hmtx_table(advances: [Int]) -> Bytes
+    var out = bytes.from_str("")
+    for a in advances
+        out = out + u16(a) + u16(0)
+    out
+
+// ── `cmap` ──────────────────────────────────────────────────────────
+
+// A format 4 subtable, 32 bytes, one delta segment `A`..`E` plus the
+// 0xFFFF terminator.  The delta is `1 - 0x41` = -64, so `A` is glyph 1
+// and `E` is glyph 5; `F` is past the segment and answers 0.
+fn format4() -> Bytes
+    bytes_of([
+        0, 4,   // format 4
+        0, 32,   // length 32
+        0, 0,   // language
+        0, 4,   // segCountX2: two segments
+        0, 0, 0, 0, 0, 0,   // searchRange, entrySelector, rangeShift
+        0, 0x45, 0xFF, 0xFF,   // ends: `E`, terminator
+        0, 0,   // reservedPad
+        0, 0x41, 0xFF, 0xFF,   // starts: `A`, terminator
+        0xFF, 0xC0, 0, 1,   // deltas: -64, 1
+        0, 0, 0, 0])   // idRangeOffsets
+
+// The `cmap` header and its one (3, 1) record, then the subtable.
+fn cmap_table() -> Bytes
+    u16(0) + u16(1) + u16(3) + u16(1) + u32(12) + format4()
+
+// A `cmap` whose only subtable is a format 6 one, which this package
+// does not read: `fontcmap.best_subtable` answers nothing and
+// `read_cmap` says so by name.
+fn cmap_format6_table() -> Bytes
+    u16(0) + u16(1) + u16(3) + u16(1) + u32(12)
+        + u16(6) + u16(10) + u16(0) + u16(1) + u16(1) + u16(1) + u16(1)
+
+// ── `loca` and `glyf` ───────────────────────────────────────────────
+
+// Short `loca`: each entry is the offset in BYTES, stored halved.
+fn loca_short(offsets: [Int]) -> Bytes
+    var out = bytes.from_str("")
+    for o in offsets
+        out = out + u16(o / 2)
+    out
+
+// The offsets `loca` records for a run of glyph record lengths.
+fn loca_from(lengths: [Int]) -> Bytes
+    var offsets: [Int] = [0]
+    var at = 0
+    for n in lengths
+        at = at + n
+        list.push(offsets, at)
+    loca_short(offsets)
+
+// 34 bytes: one contour of four on-curve points.
+fn square() -> Bytes
+    bytes_of([
+        0, 1,   // numberOfContours
+        0, 0, 0, 0, 1, 0xF4, 2, 0xBC,   // xMin 0, yMin 0, xMax 500, yMax 700
+        0, 3,   // endPtsOfContours[0]
+        0, 0,   // instructionLength
+        0x01, 0x01, 0x01, 0x01,   // flags: on-curve, 16-bit deltas
+        0, 0, 1, 0xF4, 0, 0, 0xFE, 0x0C,   // x deltas: 0, 500, 0, -500
+        0, 0, 0, 0, 2, 0xBC, 0, 0])   // y deltas: 0, 0, 700, 0
+
+// 16 bytes: a composite of `glyph`, moved by (dx, dy), with byte
+// arguments — flags 0x0002 is ARGS_ARE_XY_VALUES.
+fn composite_of(glyph: Int, dx: Int, dy: Int) -> Bytes
+    u16(0xFFFF) + u16(0) + u16(0) + u16(500) + u16(700)
+        + u16(2) + u16(glyph) + bytes.u8(dx) + bytes.u8(dy)
+
+fn glyf_table() -> Bytes
+    square() + composite_of(1, 10, 20) + composite_of(2, 0, 0)
+        + composite_of(4, 0, 0) + composite_of(0, 0, 0)
+
+// ── `kern`, `GPOS` and `GSUB` ───────────────────────────────────────
+
+// A Microsoft `kern` header (version 0), one horizontal format 0
+// subtable, one pair: (1, 2, -40).  The subtable is 6 bytes of header
+// plus eight of pair-list header plus six per pair.
+fn kern_table() -> Bytes
+    u16(0) + u16(1)
+        + u16(0) + u16(20) + u16(0x0001)
+        + u16(1) + u16(0) + u16(0) + u16(0)
+        + u16(1) + u16(2) + u16(0 - 40)
+
+// The script list, script table and default LangSys the two layout
+// tables share: `latn`, a default language, and one feature index.
+fn latn_script_list() -> Bytes
+    u16(1) + u32(fontdir.tag_of("latn")) + u16(8)
+        + u16(4) + u16(0)
+        + u16(0) + u16(0xFFFF) + u16(1) + u16(0)
+
+// A feature list naming one feature at `tag`, whose feature table
+// holds one lookup index.
+fn feature_list_for(tag: Int) -> Bytes
+    u16(1) + u32(tag) + u16(8)
+        + u16(0) + u16(1) + u16(0)
+
+// A lookup list with one lookup of `kind`, whose one subtable is at
+// offset 8 inside the lookup.
+fn lookup_list_for(kind: Int) -> Bytes
+    u16(1) + u16(4)
+        + u16(kind) + u16(0) + u16(1) + u16(8)
+
+// 90 bytes of `GPOS` 1.0: the header, the shared script list, a `kern`
+// feature, and one PairPos format 1 subtable with two pair sets —
+// (1, 2, -40) and (2, 3, -70) — where `valueFormat1` is 0x0004, the
+// XAdvance field alone.
+fn gpos_table() -> Bytes
+    u16(1) + u16(0) + u16(10) + u16(30) + u16(44)
+        + latn_script_list()
+        + feature_list_for(fontdir.tag_of("kern"))
+        + lookup_list_for(2)
+        + u16(1) + u16(14) + u16(4) + u16(0) + u16(2) + u16(22) + u16(28)
+        + u16(1) + u16(2) + u16(1) + u16(2)
+        + u16(1) + u16(2) + u16(0 - 40)
+        + u16(1) + u16(3) + u16(0 - 70)
+
+// 86 bytes of `GSUB` 1.0: the same header and script list, a `liga`
+// feature, one ligature lookup (type 4) whose format 1 subtable turns
+// the covered glyph 1 followed by 2 into glyph 3.
+fn gsub_table() -> Bytes
+    u16(1) + u16(0) + u16(10) + u16(30) + u16(44)
+        + latn_script_list()
+        + feature_list_for(fontdir.tag_of("liga"))
+        + lookup_list_for(4)
+        + u16(1) + u16(12) + u16(1) + u16(20)
+        + u16(0) + u16(0)
+        + u16(1) + u16(1) + u16(1)
+        + u16(0)
+        + u16(1) + u16(4)
+        + u16(3) + u16(2) + u16(2)
+
+// ── Assembling a file ───────────────────────────────────────────────
+
+// One face's directory alone, with the table offsets in it relative to
+// the face's own first byte, which is what `parse_directory` adds `at`
+// to.
+fn dir_bytes(tags: [Int], bodies: [Bytes], data_at: Int) -> Bytes
+    var out = u16(list.len(tags)) + u16(0) + u16(0) + u16(0)
+    var at = data_at
+    for i in 0..list.len(tags)
+        let body = list.get(bodies, i)
+        out = out + u32(list.get(tags, i)) + u32(0) + u32(at) + u32(bytes.len(body))
+        at = at + bytes.len(pad4(body))
+    out
+
+// The tables themselves, laid out in the order the directory names
+// them, each padded to four bytes.
+fn data_bytes(bodies: [Bytes]) -> Bytes
+    var out = bytes.from_str("")
+    for b in bodies
+        out = out + pad4(b)
+    out
+
+// A whole font whose only face begins at byte 0.
+fn font_file(sfnt: Int, tags: [Int], bodies: [Bytes]) -> Bytes
+    u32(sfnt) + dir_bytes(tags, bodies, 12 + 16 * list.len(tags))
+        + data_bytes(bodies)
+
+// ── The fixtures ────────────────────────────────────────────────────
+
+// The face at index 0, so each test reads it once rather than inside a
+// match arm.  A fixture that cannot be read answers the zero face,
+// which no assertion below accepts.
+fn face_of(src: fontread.FontBuffer) -> fontdir.FontFace
+    match fontread.read_face(src, 0)
+        Err(_) => FontFace { sfnt: 0, index: 0, face_count: 0, tables: [] }
+        Ok(f)  => f
+
+fn advances() -> [Int]
+    [600, 500, 400, 300, 200, 100]
+
+// The seven tables of the font the header describes, in the order a
+// writer would sort them.
+fn plain_tags() -> [Int]
+    [fontdir.tag_of("cmap"), fontdir.tag_of("glyf"), fontdir.tag_of("head"),
+     fontdir.tag_of("hhea"), fontdir.tag_of("hmtx"), fontdir.tag_of("loca"),
+     fontdir.tag_of("maxp")]
+
+fn plain_bodies() -> [Bytes]
+    [cmap_table(), glyf_table(), head_table(false), hhea_table(6),
+     hmtx_table(advances()), loca_from([0, 34, 16, 16, 16, 16]), maxp_table(6, 2)]
+
+fn plain_font() -> Bytes
+    font_file(0x00010000, plain_tags(), plain_bodies())
+
+// The same font, with `kern` and no `GPOS`.
+fn kern_font() -> Bytes
+    font_file(0x00010000,
+              [fontdir.tag_of("cmap"), fontdir.tag_of("glyf"), fontdir.tag_of("head"),
+               fontdir.tag_of("hhea"), fontdir.tag_of("hmtx"), fontdir.tag_of("kern"),
+               fontdir.tag_of("loca"), fontdir.tag_of("maxp")],
+              [cmap_table(), glyf_table(), head_table(false), hhea_table(6),
+               hmtx_table(advances()), kern_table(),
+               loca_from([0, 34, 16, 16, 16, 16]), maxp_table(6, 2)])
+
+// The font with both kerning sources and both layout tables — which is
+// the situation `has_both_sources` exists to report.
+fn gpos_gsub_font() -> Bytes
+    font_file(0x00010000,
+              [fontdir.tag_of("GPOS"), fontdir.tag_of("GSUB"), fontdir.tag_of("cmap"),
+               fontdir.tag_of("glyf"), fontdir.tag_of("head"), fontdir.tag_of("hhea"),
+               fontdir.tag_of("hmtx"), fontdir.tag_of("kern"), fontdir.tag_of("loca"),
+               fontdir.tag_of("maxp")],
+              [gpos_table(), gsub_table(), cmap_table(), glyf_table(), head_table(false),
+               hhea_table(6), hmtx_table(advances()), kern_table(),
+               loca_from([0, 34, 16, 16, 16, 16]), maxp_table(6, 2)])
+
+// A `cmap` this package will not read, and nothing else wrong.
+fn bad_cmap_font() -> Bytes
+    font_file(0x00010000,
+              [fontdir.tag_of("cmap"), fontdir.tag_of("head"), fontdir.tag_of("hhea"),
+               fontdir.tag_of("hmtx"), fontdir.tag_of("maxp")],
+              [cmap_format6_table(), head_table(false), hhea_table(6),
+               hmtx_table(advances()), maxp_table(6, 2)])
+
+// glyphs 1..6 are each a composite of the next and glyph 7 is the
+// square, so the walk reaches depth 6 at glyph 7 and
+// `fontglyf.component_limit` — 5 — refuses it there.
+fn deep_font() -> Bytes
+    font_file(0x00010000,
+              [fontdir.tag_of("glyf"), fontdir.tag_of("head"), fontdir.tag_of("hhea"),
+               fontdir.tag_of("hmtx"), fontdir.tag_of("loca"), fontdir.tag_of("maxp")],
+              [composite_of(2, 0, 0) + composite_of(3, 0, 0) + composite_of(4, 0, 0)
+                   + composite_of(5, 0, 0) + composite_of(6, 0, 0) + composite_of(7, 0, 0)
+                   + square(),
+               head_table(false), hhea_table(8),
+               hmtx_table([100, 100, 100, 100, 100, 100, 100, 100]),
+               loca_from([0, 16, 16, 16, 16, 16, 16, 34]), maxp_table(8, 6)])
+
+// A whole font whose face begins at byte `base` of the file.  A
+// collection counts every table offset from the start of the FILE, so
+// the offsets here carry the base.
+fn font_file_at(sfnt: Int, tags: [Int], bodies: [Bytes], base: Int) -> Bytes
+    u32(sfnt) + dir_bytes(tags, bodies, base + 12 + 16 * list.len(tags))
+        + data_bytes(bodies)
+
+// Two faces in one file: the plain font first, then a three-table face
+// that answers a different glyph count, so a read aimed at the wrong
+// face cannot pass for the right one.
+fn collection_font() -> Bytes
+    let first = font_file_at(0x00010000, plain_tags(), plain_bodies(), 20)
+    let second = font_file_at(0x00010000,
+                              [fontdir.tag_of("head"), fontdir.tag_of("hhea"),
+                               fontdir.tag_of("maxp")],
+                              [head_table(false), hhea_table(2), maxp_table(2, 0)],
+                              20 + bytes.len(first))
+    u32(fontdir.tag_of("ttcf")) + u32(0x00010000) + u32(2) + u32(20)
+        + u32(20 + bytes.len(first)) + first + second
+
+// A CFF-flavoured face: `OTTO`, and no `glyf` table at all.
+fn otto_font() -> Bytes
+    font_file(fontdir.tag_of("OTTO"),
+              [fontdir.tag_of("head"), fontdir.tag_of("hhea"), fontdir.tag_of("maxp")],
+              [head_table(false), hhea_table(2), maxp_table(2, 0)])
+
+// ── The reads ───────────────────────────────────────────────────────
+
+@test
+fn test_a_plain_font_is_read_back_table_by_table() [io]
+    let src = fontread.buffer(plain_font())
+    let face = face_of(src)
+
+    test.case("THE CLAIM: the directory is twelve bytes and sixteen per table")
+    test.assert(face.sfnt == 0x00010000)
+    test.assert(face.index == 0)
+    test.assert(face.face_count == 1)
+    test.assert(list.len(face.tables) == 7)
+    test.assert(fontdir.table_count(face) == 7)
+    test.assert(fontdir.has_table(face, fontdir.tag_of("glyf")))
+    test.assert(not fontdir.has_table(face, fontdir.tag_of("kern")))
+    test.assert(fontdir.flavour(face) == FontOutlinesGlyf)
+    match fontdir.table_range(face, fontdir.tag_of("head"))
+        None    => test.assert(false)
+        Some(r) => test.assert(r.len == 54)
+
+    test.case("and a face the file does not have is refused with both numbers")
+    match fontread.read_face(src, 1)
+        Err(FontNoSuchFace(index, count)) => test.assert(index == 1 and count == 1)
+        _                                 => test.assert(false)
+
+    test.case("one face in a file that is not a collection")
+    match fontread.read_face_count(src)
+        Err(_) => test.assert(false)
+        Ok(n)  => test.assert(n == 1)
+
+    test.case("a table that is there comes back whole; one that is not is a fault")
+    match fontread.read_table(src, face, fontdir.tag_of("head"))
+        Err(_) => test.assert(false)
+        Ok(b)  => test.assert(bytes.len(b) == 54)
+    match fontread.read_table(src, face, fontdir.tag_of("kern"))
+        Err(FontNoTable(tag)) => test.assert(tag == fontdir.tag_of("kern"))
+        _                     => test.assert(false)
+
+    test.case("and the batch form answers an empty slot rather than a fault")
+    match fontread.read_tables(src, face,
+                               [fontdir.tag_of("head"), fontdir.tag_of("kern"),
+                                fontdir.tag_of("maxp")])
+        Err(_)    => test.assert(false)
+        Ok(three) =>
+            test.assert(list.len(three) == 3)
+            test.assert(bytes.len(list.get(three, 0)) == 54)
+            test.assert(bytes.len(list.get(three, 1)) == 0)
+            test.assert(bytes.len(list.get(three, 2)) == 32)
+
+@test
+fn test_the_metrics_come_out_of_three_tables_read_one_at_a_time() [io]
+    let src = fontread.buffer(plain_font())
+
+    test.case("THE CLAIM: every number is the field the fixture wrote")
+    match fontread.read_metrics(src, face_of(src))
+        Err(_) => test.assert(false)
+        Ok(m)  =>
+            test.assert(m.units_per_em == 1000)
+            test.assert(m.x_min == 0 - 100)
+            test.assert(m.y_min == 0 - 20)
+            test.assert(m.x_max == 1024)
+            test.assert(m.y_max == 768)
+            test.assert(m.num_glyphs == 6)
+            test.assert(m.num_h_metrics == 6)
+            test.assert(m.advance_max == 600)
+            test.assert(not m.long_loca)
+
+    test.case("a font missing `head` is refused by tag, not by a wrong number")
+    let two = font_file(0x00010000,
+                        [fontdir.tag_of("hhea"), fontdir.tag_of("maxp")],
+                        [hhea_table(6), maxp_table(6, 2)])
+    match fontread.read_metrics(fontread.buffer(two),
+                                face_of(fontread.buffer(two)))
+        Err(FontNoTable(tag)) => test.assert(tag == fontdir.tag_of("head"))
+        _                     => test.assert(false)
+
+@test
+fn test_the_cmap_is_read_from_the_subtable_the_order_picks() [io]
+    let src = fontread.buffer(plain_font())
+
+    test.case("THE CLAIM: `A`..`E` are glyphs 1..5, and past `E` is glyph 0")
+    match fontread.read_cmap(src, face_of(src))
+        Err(_) => test.assert(false)
+        Ok(c)  =>
+            test.assert(fontcmap.glyph_for(c, 0x41) == 1)
+            test.assert(fontcmap.glyph_for(c, 0x43) == 3)
+            test.assert(fontcmap.glyph_for(c, 0x45) == 5)
+            test.assert(fontcmap.glyph_for(c, 0x46) == 0)
+            // Six, not five: the count is taken over the segments as
+            // stored, and the 0xFFFF terminator every format 4 table
+            // ends with is one of them — the same model `max_codepoint`
+            // and `covered_ranges` answer with.
+            test.assert(fontcmap.mapped_count(c) == 6)
+
+    test.case("a cmap with no format 4 or 12 subtable is refused as that")
+    let bad = bad_cmap_font()
+    match fontread.read_cmap(fontread.buffer(bad), face_of(fontread.buffer(bad)))
+        Err(FontNoUsableCmap) => test.assert(true)
+        _                     => test.assert(false)
+
+    test.case("and a font with no cmap at all is refused by tag")
+    let none = font_file(0x00010000,
+                         [fontdir.tag_of("head"), fontdir.tag_of("maxp")],
+                         [head_table(false), maxp_table(6, 2)])
+    match fontread.read_cmap(fontread.buffer(none), face_of(fontread.buffer(none)))
+        Err(FontNoTable(tag)) => test.assert(tag == fontdir.tag_of("cmap"))
+        _                     => test.assert(false)
+
+@test
+fn test_loca_is_sized_by_the_head_it_was_read_with() [io]
+    let src = fontread.buffer(plain_font())
+
+    test.case("THE CLAIM: six glyphs are seven entries, and short format halves them")
+    match fontread.read_metrics(src, face_of(src))
+        Err(_) => test.assert(false)
+        Ok(m)  =>
+            match fontread.read_loca(src, face_of(src), m)
+                Err(_)   => test.assert(false)
+                Ok(loca) =>
+                    test.assert(not loca.long_format)
+                    test.assert(fontglyf.loca_glyph_count(loca) == 6)
+
+                    test.case("and each glyph's record is where the fixture put it")
+                    match fontglyf.glyph_range(loca, 0)
+                        None    => test.assert(false)
+                        Some(r) => test.assert(r.at == 0 and r.len == 0)
+                    match fontglyf.glyph_range(loca, 1)
+                        None    => test.assert(false)
+                        Some(r) => test.assert(r.at == 0 and r.len == 34)
+                    match fontglyf.glyph_range(loca, 5)
+                        None    => test.assert(false)
+                        Some(r) => test.assert(r.at == 82 and r.len == 16)
+                    test.assert(fontglyf.glyph_range(loca, 6) == None)
+                    test.assert(fontglyf.glyph_range(loca, 0 - 1) == None)
+
+@test
+fn test_one_outline_follows_its_composites_to_the_components() [io]
+    let src = fontread.buffer(plain_font())
+    let face = face_of(src)
+    let m = match fontread.read_metrics(src, face)
+        Err(_) => FontMetrics { units_per_em: 0, x_min: 0, y_min: 0, x_max: 0,
+                                y_max: 0, num_glyphs: 0, num_h_metrics: 0,
+                                advance_max: 0, long_loca: false }
+        Ok(v)  => v
+    let loca = match fontread.read_loca(src, face, m)
+        Err(_) => FontLoca { offsets: [], long_format: false }
+        Ok(v)  => v
+
+    test.case("THE CLAIM: a simple glyph answers move, three lines and a close")
+    match fontread.read_outline(src, face, loca, 1)
+        Err(_) => test.assert(false)
+        Ok(p)  =>
+            test.assert(svgpath.command_count(p) == 5)
+            let box = svgpath.bounds(p)
+            test.assert_approx(geomrect.width(box), 500.0, 0.0)
+            test.assert_approx(geomrect.height(box), 700.0, 0.0)
+
+    test.case("and a composite is its component moved by the record's offset")
+    match fontread.read_outline(src, face, loca, 2)
+        Err(_) => test.assert(false)
+        Ok(p)  =>
+            test.assert(svgpath.command_count(p) == 5)
+            let box = svgpath.bounds(p)
+            test.assert_approx(geomrect.width(box), 500.0, 0.0)
+            test.assert_approx(geomrect.height(box), 700.0, 0.0)
+
+    test.case("a composite of a composite still lands, one level deeper")
+    match fontread.read_outline(src, face, loca, 3)
+        Err(_) => test.assert(false)
+        Ok(p)  => test.assert(svgpath.command_count(p) == 5)
+
+    test.case("a glyph with no outline is an empty path and not a read")
+    match fontread.read_outline(src, face, loca, 0)
+        Err(_) => test.assert(false)
+        Ok(p)  => test.assert(svgpath.command_count(p) == 0)
+
+    test.case("and a composite of an empty glyph is empty too")
+    match fontread.read_outline(src, face, loca, 5)
+        Err(_) => test.assert(false)
+        Ok(p)  => test.assert(svgpath.command_count(p) == 0)
+
+    test.case("a glyph past the end of `loca` is refused with both numbers")
+    match fontread.read_outline(src, face, loca, 9)
+        Err(FontNoSuchGlyph(glyph, count)) => test.assert(glyph == 9 and count == 6)
+        _                                  => test.assert(false)
+
+@test
+fn test_a_composite_that_names_itself_stops_instead_of_hanging() [io]
+    let src = fontread.buffer(plain_font())
+    let face = face_of(src)
+    let loca = FontLoca { offsets: [0, 0, 34, 50, 66, 82, 98], long_format: false }
+
+    test.case("THE CLAIM: the cycle is caught one level in, by number")
+    match fontread.read_outline(src, face, loca, 4)
+        Err(FontCompositeTooDeep(glyph, depth)) =>
+            test.assert(glyph == 4 and depth == 1)
+        _                                       => test.assert(false)
+
+    test.case("and the same record through the batch call is the same refusal")
+    match fontread.read_outlines(src, face, loca, [1, 4])
+        Err(FontCompositeTooDeep(glyph, depth)) =>
+            test.assert(glyph == 4 and depth == 1)
+        _                                       => test.assert(false)
+
+@test
+fn test_a_chain_deeper_than_the_limit_is_refused_at_the_limit() [io]
+    let src = fontread.buffer(deep_font())
+    let face = face_of(src)
+
+    test.case("THE CLAIM: glyph 1 of a chain of seven reaches depth 6 and stops")
+    match fontread.read_metrics(src, face)
+        Err(_) => test.assert(false)
+        Ok(m)  =>
+            match fontread.read_loca(src, face, m)
+                Err(_)   => test.assert(false)
+                Ok(loca) =>
+                    test.assert(fontglyf.loca_glyph_count(loca) == 8)
+                    match fontread.read_outline(src, face, loca, 1)
+                        Err(FontCompositeTooDeep(glyph, depth)) =>
+                            test.assert(glyph == 7 and depth == 6)
+                        _                                       => test.assert(false)
+
+    test.case("and the limit itself is the number the test above walks to")
+    test.assert(fontglyf.component_limit() == 5)
+
+@test
+fn test_a_batch_answers_one_path_per_glyph_in_the_callers_order() [io]
+    let src = fontread.buffer(plain_font())
+    let face = face_of(src)
+    let loca = FontLoca { offsets: [0, 0, 34, 50, 66, 82, 98], long_format: false }
+
+    test.case("THE CLAIM: the paths come back in the order ASKED FOR, not read in")
+    match fontread.read_outlines(src, face, loca, [3, 1, 2, 0])
+        Err(_)    => test.assert(false)
+        Ok(paths) =>
+            test.assert(list.len(paths) == 4)
+            test.assert(svgpath.command_count(list.get(paths, 0)) == 5)
+            test.assert(svgpath.command_count(list.get(paths, 1)) == 5)
+            test.assert(svgpath.command_count(list.get(paths, 2)) == 5)
+            test.assert(svgpath.command_count(list.get(paths, 3)) == 0)
+
+    test.case("and one bad glyph refuses the whole batch, by number")
+    match fontread.read_outlines(src, face, loca, [1, 9])
+        Err(FontNoSuchGlyph(glyph, count)) => test.assert(glyph == 9 and count == 6)
+        _                                  => test.assert(false)
+
+@test
+fn test_the_plan_reads_the_four_halves_and_one_kerning_source() [io]
+    let kern_src = fontread.buffer(kern_font())
+    let kern_face = face_of(kern_src)
+
+    test.case("THE CLAIM: `AB` is 500 + 400 - 40 = 860 units, legacy kerning")
+    match fontread.read_plan(kern_src, kern_face, fontdir.tag_of("latn"), [])
+        Err(_) => test.assert(false)
+        Ok(p)  =>
+            test.assert(p.kern.source == FontKernLegacy)
+            test.assert(fontkern.pair_count(p.kern) == 1)
+            match fontshape.measure(p, "AB")
+                Err(_) => test.assert(false)
+                Ok(w)  => test.assert(w == 860)
+
+    test.case("and with `GSUB`'s `liga` on, `AB` is ONE glyph of 300 units")
+    let both = fontread.buffer(gpos_gsub_font())
+    let both_face = face_of(both)
+    match fontread.read_plan(both, both_face, fontdir.tag_of("latn"),
+                             [fontdir.tag_of("liga")])
+        Err(_) => test.assert(false)
+        Ok(p)  =>
+            test.assert(p.kern.source == FontKernGpos)
+            test.assert(list.len(fontgsub.ligatures(p.subst)) == 1)
+            match fontshape.shape(p, "AB")
+                Err(_)  => test.assert(false)
+                Ok(run) =>
+                    // One glyph where two characters went in, advancing
+                    // glyph 3's 300 units and kerning nothing: a run of
+                    // one glyph has no pair in it.
+                    test.assert(fontshape.glyph_count(run) == 1)
+                    test.assert(run.width == 300)
+
+    test.case("a font with neither table kerns nothing and substitutes nothing")
+    let plain = fontread.buffer(plain_font())
+    let plain_face = face_of(plain)
+    match fontread.read_plan(plain, plain_face, fontdir.tag_of("latn"), [])
+        Err(_) => test.assert(false)
+        Ok(p)  =>
+            test.assert(p.kern.source == FontKernNone)
+            test.assert(fontkern.kerns_nothing(p.kern))
+            match fontshape.measure(p, "AB")
+                Err(_) => test.assert(false)
+                Ok(w)  => test.assert(w == 900)
+
+@test
+fn test_the_substitution_plan_is_read_on_its_own() [io]
+    let src = fontread.buffer(gpos_gsub_font())
+    let face = face_of(src)
+    let latn = fontdir.tag_of("latn")
+
+    test.case("THE CLAIM: the liga feature is one ligature, `1 2 -> 3`")
+    match fontread.read_table(src, face, fontdir.tag_of("GSUB"))
+        Err(_)   => test.assert(false)
+        Ok(gsub) =>
+            test.assert(list.len(fontgsub.scripts_present(gsub)) == 1)
+            test.assert(list.get(fontgsub.scripts_present(gsub), 0) == latn)
+            test.assert(fontgsub.has_feature(gsub, latn, 0, fontdir.tag_of("liga")))
+            test.assert(not fontgsub.has_feature(gsub, latn, 0, fontdir.tag_of("kern")))
+            test.assert(list.len(fontgsub.features_present(gsub, latn, 0)) == 1)
+
+    match fontread.read_subst(src, face, latn, 0, [fontdir.tag_of("liga")])
+        Err(_)   => test.assert(false)
+        Ok(plan) =>
+            test.assert(list.len(fontgsub.ligatures(plan)) == 1)
+            let lig = list.get(fontgsub.ligatures(plan), 0)
+            test.assert(fontgsub.ligature_len(lig) == 2)
+            test.assert(lig.glyph == 3)
+            test.assert(list.get(lig.components, 0) == 1)
+            test.assert(list.get(lig.components, 1) == 2)
+            test.assert(list.len(plan.features) == 1)
+
+    test.case("and a feature the font does not have answers an empty plan")
+    match fontread.read_subst(src, face, latn, 0, [fontdir.tag_of("calt")])
+        Err(_)   => test.assert(false)
+        Ok(plan) =>
+            test.assert(list.len(fontgsub.ligatures(plan)) == 0)
+            test.assert(list.len(fontgsub.singles(plan)) == 0)
+            test.assert(list.len(plan.features) == 0)
+
+@test
+fn test_the_kerning_plan_is_read_on_its_own_and_gpos_wins() [io]
+    let latn = fontdir.tag_of("latn")
+
+    test.case("THE CLAIM: with both tables the GPOS pairs are the ones read")
+    let both = fontread.buffer(gpos_gsub_font())
+    let both_face = face_of(both)
+    match fontread.read_kerning(both, both_face, latn, 0)
+        Err(_) => test.assert(false)
+        Ok(p)  =>
+            test.assert(p.source == FontKernGpos)
+            // Two pairs, each ONCE: the record's own offset word is not
+            // a lookup index, and a plan that read it as one would
+            // gather the same pairs thousands of times and add them.
+            test.assert(fontkern.pair_count(p) == 2)
+            test.assert(fontkern.pair_value(p, 1, 2) == 0 - 40)
+            test.assert(fontkern.pair_value(p, 2, 3) == 0 - 70)
+
+    test.case("a legacy table is read when GPOS has no kern feature")
+    let kern = fontread.buffer(kern_font())
+    let kern_face = face_of(kern)
+    match fontread.read_kerning(kern, kern_face, latn, 0)
+        Err(_) => test.assert(false)
+        Ok(p)  =>
+            test.assert(p.source == FontKernLegacy)
+            test.assert(fontkern.pair_value(p, 1, 2) == 0 - 40)
+
+    test.case("and no table at all is the plan that kerns nothing")
+    let plain = fontread.buffer(plain_font())
+    let plain_face = face_of(plain)
+    match fontread.read_kerning(plain, plain_face, latn, 0)
+        Err(_) => test.assert(false)
+        Ok(p)  => test.assert(fontkern.kerns_nothing(p))
+
+@test
+fn test_a_collection_answers_each_face_by_index() [io]
+    let src = fontread.buffer(collection_font())
+
+    test.case("THE CLAIM: two faces, told apart by their table counts")
+    match fontread.read_face_count(src)
+        Err(_) => test.assert(false)
+        Ok(n)  => test.assert(n == 2)
+
+    match fontread.read_face(src, 0)
+        Err(_)   => test.assert(false)
+        Ok(face) =>
+            test.assert(list.len(face.tables) == 7)
+            test.assert(fontdir.has_table(face, fontdir.tag_of("glyf")))
+
+    match fontread.read_face(src, 1)
+        Err(_)   => test.assert(false)
+        Ok(face) =>
+            test.assert(list.len(face.tables) == 3)
+            test.assert(not fontdir.has_table(face, fontdir.tag_of("glyf")))
+
+    test.case("and a face past the end is refused with the count it did have")
+    match fontread.read_face(src, 2)
+        Err(FontNoSuchFace(index, count)) => test.assert(index == 2 and count == 2)
+        _                                 => test.assert(false)
+    match fontread.read_face(src, 0 - 1)
+        Err(FontNoSuchFace(index, count)) => test.assert(index == 0 - 1 and count == 2)
+        _                                 => test.assert(false)
+
+    test.case("the second face's tables are its own, read at its own offset")
+    match fontread.read_face(src, 1)
+        Err(_)   => test.assert(false)
+        Ok(face) =>
+            match fontread.read_metrics(src, face)
+                Err(_) => test.assert(false)
+                // Two glyphs, where face 0's `maxp` says six: the
+                // tables were read at the offset the ttcf named, not
+                // at zero.
+                Ok(m)  => test.assert(m.num_glyphs == 2 and m.units_per_em == 1000)
+
+@test
+fn test_a_cff_face_has_no_glyf_table_to_read_outlines_from() [io]
+    let src = fontread.buffer(otto_font())
+
+    test.case("THE CLAIM: the face reads, and its outlines are refused by tag")
+    match fontread.read_face(src, 0)
+        Err(_)   => test.assert(false)
+        Ok(face) =>
+            test.assert(fontdir.flavour(face) == FontOutlinesCff)
+            match fontread.read_metrics(src, face)
+                Err(_) => test.assert(false)
+                Ok(m)  =>
+                    match fontread.read_loca(src, face, m)
+                        Err(FontNoTable(tag)) => test.assert(tag == fontdir.tag_of("loca"))
+                        _                     => test.assert(false)
+            match fontread.read_outline(src, face,
+                                        FontLoca { offsets: [0, 0], long_format: false }, 0)
+                Err(FontNoTable(tag)) => test.assert(tag == fontdir.tag_of("glyf"))
+                _                     => test.assert(false)
+            match fontread.read_outlines(src, face,
+                                         FontLoca { offsets: [0, 0], long_format: false }, [0])
+                Err(FontNoTable(tag)) => test.assert(tag == fontdir.tag_of("glyf"))
+                _                     => test.assert(false)

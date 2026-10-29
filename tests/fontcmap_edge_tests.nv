@@ -1,0 +1,233 @@
+// fontcmap_edge_tests.nv — the two formats read field by field, the
+// idRangeOffset indirection, and the symbol retry.
+//
+// WHY THIS SUITE EXISTS.  `fontcmap_tests.nv` is the oracle for what a
+// `cmap` MEANS: a missing character is glyph 0, the subtable ranges are
+// file offsets, a symbol table is looked up twice.  This suite is the
+// other half: the format 4 segment arithmetic with a negative delta and
+// with `idRangeOffset` set, format 12's groups, the symbol flag read
+// off the platform pair, and every `FontShort` a truncated subtable
+// reaches.  The fixtures are assembled field by field, so each case
+// differs from a good subtable in exactly the field it names.
+
+use std.test
+use std.list
+use std.bytes
+use fontsrc
+use fontdir
+use fontcmap
+
+// A buffer from the numbers a fixture is written as.
+fn bytes_of(xs: [Int]) -> Bytes
+    bytes.from_byte_list(xs)
+
+// A format 4 subtable, two segments, both using the delta.
+//
+// Segment 0 maps U+0041..U+0043 to glyphs 10..12 through a delta of
+// -55; segment 1 is the 0xFFFF terminator every format 4 table ends
+// with.  Thirty-two bytes.
+fn format4_delta() -> Bytes
+    bytes_of([
+        0, 4,   // format 4
+        0, 32,   // length 32
+        0, 0,   // language
+        0, 4,   // segCountX2: two segments
+        0, 0, 0, 0, 0, 0,   // searchRange, entrySelector, rangeShift
+        0, 0x43, 0xFF, 0xFF,   // ends
+        0, 0,   // reservedPad
+        0, 0x41, 0xFF, 0xFF,   // starts
+        0xFF, 0xC9, 0, 1,   // deltas: -55, 1
+        0, 0, 0, 0])   // idRangeOffsets: both zero
+
+// A format 4 subtable whose first segment uses `idRangeOffset` into a
+// two-entry glyph id array, `[7, 0]`, with a delta of 5.
+//
+// The array index the implementation computes is
+// `i + ro / 2 - segCount` plus the codepoint's distance into the
+// segment, which is the specification's own arithmetic with the
+// segment's first codepoint subtracted.  The segment spans FOUR
+// codepoints, U+0041..U+0044, and the array holds two, so the last two
+// indices run off the end of it.
+fn format4_range() -> Bytes
+    bytes_of([
+        0, 4,   // format 4
+        0, 36,   // length 36
+        0, 0,   // language
+        0, 4,   // segCountX2
+        0, 0, 0, 0, 0, 0,
+        0, 0x44, 0xFF, 0xFF,   // ends: U+0044 and the terminator
+        0, 0,
+        0, 0x41, 0xFF, 0xFF,   // starts: U+0041 and the terminator
+        0, 5, 0, 1,   // deltas: 5, 1
+        0, 4, 0, 0,   // idRangeOffsets: 4, 0
+        0, 7, 0, 0])   // glyphIdArray: 7, 0 — two entries
+
+// A format 4 subtable that is a Windows symbol one — (3, 0) — mapping
+// U+F041 to glyph 20.  The delta is stored as the 16-bit form of
+// `20 - 0xF041`, which wraps in the `& 0xFFFF` the format specifies.
+fn format4_symbol() -> Bytes
+    bytes_of([
+        0, 4,
+        0, 32,
+        0, 0,
+        0, 4,
+        0, 0, 0, 0, 0, 0,
+        0xF0, 0x41, 0xFF, 0xFF,
+        0, 0,
+        0xF0, 0x41, 0xFF, 0xFF,
+        0x0F, 0xD3, 0, 1,   // deltas: 4051 (wraps to glyph 20), 1
+        0, 0, 0, 0])
+
+// A format 12 subtable with one group: 0x10000..0x10010 to glyphs
+// 100..116.
+fn format12_one_group() -> Bytes
+    bytes_of([
+        0, 12,   // format 12
+        0, 0,   // reserved
+        0, 0, 0, 28,   // length 28, the 32-bit field
+        0, 0, 0, 0,   // language
+        0, 0, 0, 1,   // numGroups
+        0, 1, 0, 0,   // startCharCode 0x10000
+        0, 1, 0, 0x10,   // endCharCode 0x10010
+        0, 0, 0, 100])   // startGlyphID
+
+// A subtable record pointing at `at`, for a caller that has the bytes.
+fn sub_at(platform: Int, encoding: Int, format: Int, at: Int, len: Int) -> FontCmapSub
+    FontCmapSub { platform: platform, encoding: encoding, format: format,
+                  range: fontsrc.range(at, len) }
+
+@test
+fn test_the_directory_of_subtables_reports_file_offsets() [io]
+    // A cmap table with two rows, then a format 4 subtable at 20 and a
+    // format 12 one at 52.
+    let file = bytes.u16_be(0) + bytes.u16_be(2)
+             + bytes.u16_be(3) + bytes.u16_be(1) + bytes.u32_be(20)
+             + bytes.u16_be(0) + bytes.u16_be(4) + bytes.u32_be(52)
+             + format4_delta() + format12_one_group()
+
+    test.case("THE CLAIM: the count comes out of the header and each row names a subtable")
+    test.assert(fontcmap.subtable_count(file) == 2)
+
+    match fontcmap.subtables(file, fontsrc.range(0, 80))
+        Err(_)   => test.assert(false)
+        Ok(subs) =>
+            test.assert(list.len(subs) == 2)
+
+            test.case("the format is read from the subtable's own first two bytes")
+            let first = list.get(subs, 0)
+            test.assert(first.format == 4 and first.platform == 3 and first.encoding == 1)
+
+            test.case("and the range is a FILE offset, with the length the format declares")
+            test.assert(first.range.at == 20 and first.range.len == 32)
+            let second = list.get(subs, 1)
+            test.assert(second.format == 12 and second.range.at == 52
+                        and second.range.len == 28)
+
+    test.case("the preference order picks (0, 4) before (3, 1), and the pick is a value")
+    match fontcmap.subtables(file, fontsrc.range(0, 80))
+        Err(_)   => test.assert(false)
+        Ok(subs) =>
+            match fontcmap.best_subtable(subs)
+                Some(s) => test.assert(s.platform == 0 and s.encoding == 4)
+                None    => test.assert(false)
+            test.assert(fontcmap.is_readable(list.get(subs, 0)))
+            test.assert(list.len(fontcmap.preference_order()) == 14)
+            test.assert(list.len(fontcmap.formats_covered()) == 2)
+            test.assert(list.len(fontcmap.formats_refused()) == 7)
+
+    test.case("a header the bytes do not cover is short, before any row is read")
+    match fontcmap.subtables(bytes_of([0, 0, 0]), fontsrc.range(0, 4))
+        Err(FontShort(t, _, _)) => test.assert(t == fontdir.tag_cmap())
+        _                       => test.assert(false)
+    match fontcmap.subtables(bytes_of([0, 0, 0, 2]), fontsrc.range(0, 4))
+        Err(FontShort(t, want, have)) =>
+            test.assert(t == fontdir.tag_cmap() and want == 20 and have == 4)
+        _                             => test.assert(false)
+
+@test
+fn test_format_four_looks_up_through_a_delta_and_through_the_array() [io]
+    test.case("THE CLAIM: a delta segment maps with (codepoint + delta) & 0xFFFF")
+    match fontcmap.parse_subtable(format4_delta(), sub_at(3, 1, 4, 0, 32))
+        Err(_) => test.assert(false)
+        Ok(c)  =>
+            test.assert(fontcmap.glyph_for(c, 0x41) == 10)
+            test.assert(fontcmap.glyph_for(c, 0x43) == 12)
+            test.assert(fontcmap.has_codepoint(c, 0x42))
+            test.assert(not fontcmap.has_codepoint(c, 0x44))
+            test.assert(fontcmap.glyph_for(c, 0x44) == 0)
+            test.assert(list.len(fontcmap.glyphs_for(c, [0x41, 0x44, 0x43])) == 3)
+            test.assert(list.get(fontcmap.glyphs_for(c, [0x41, 0x44, 0x43]), 1) == 0)
+
+            test.case("and the run's coverage is answered as ranges and a count")
+            test.assert(fontcmap.mapped_count(c) == 4)
+            let ranges = fontcmap.covered_ranges(c)
+            test.assert(list.len(ranges) == 4)
+            test.assert(fontcmap.max_codepoint(c) == 0xFFFF)
+            test.assert(not fontcmap.covers_astral(c))
+
+    test.case("an idRangeOffset segment reads the glyph array, and 0 there stays missing")
+    match fontcmap.parse_subtable(format4_range(), sub_at(3, 1, 4, 0, 36))
+        Err(_) => test.assert(false)
+        Ok(c)  =>
+            test.assert(fontcmap.glyph_for(c, 0x41) == 12)   // array entry 7, plus delta 5
+            test.assert(fontcmap.glyph_for(c, 0x42) == 0)   // array entry 0, and 0 is missing
+            test.case("and an index PAST the array is missing rather than read off the end")
+            test.assert(fontcmap.glyph_for(c, 0x43) == 0)   // index 2, and the array holds two
+            test.assert(fontcmap.glyph_for(c, 0x44) == 0)   // index 3, the segment's last codepoint
+
+    test.case("a format 4 subtable cut anywhere in its arrays is short")
+    match fontcmap.parse_subtable(bytes_of([0, 4, 0, 20, 0, 0]), sub_at(3, 1, 4, 0, 6))
+        Err(FontShort(t, want, _)) => test.assert(t == fontdir.tag_cmap() and want == 14)
+        _                          => test.assert(false)
+    match fontcmap.parse_subtable(bytes.slice(format4_delta(), 0, 14), sub_at(3, 1, 4, 0, 14))
+        Err(FontShort(_, want, have)) => test.assert(want == 32 and have == 14)
+        _                             => test.assert(false)
+
+@test
+fn test_a_symbol_subtable_is_looked_up_twice_and_the_retry_is_inside() [io]
+    test.case("THE CLAIM: (3, 0) maps U+F041, so asking for `A` finds it anyway")
+    match fontcmap.parse_subtable(format4_symbol(), sub_at(3, 0, 4, 0, 32))
+        Err(_) => test.assert(false)
+        Ok(c)  =>
+            test.assert(c.symbol)
+            test.assert(fontcmap.glyph_for(c, 0x41) == 20)
+            test.assert(fontcmap.has_codepoint(c, 0x41))
+            test.assert(fontcmap.glyph_for(c, 0x51) == 0)
+
+    test.case("and the same bytes read as (3, 1) are NOT retried, which is the point")
+    match fontcmap.parse_subtable(format4_symbol(), sub_at(3, 1, 4, 0, 32))
+        Err(_) => test.assert(false)
+        Ok(c)  =>
+            test.assert(not c.symbol)
+            test.assert(fontcmap.glyph_for(c, 0x41) == 0)
+            test.assert(fontcmap.glyph_for(c, 0xF041) == 20)
+
+@test
+fn test_format_twelve_groups_map_a_distance_into_the_range() [io]
+    test.case("THE CLAIM: the group's startGlyphID is the FIRST glyph, not a delta")
+    match fontcmap.parse_subtable(format12_one_group(), sub_at(0, 4, 12, 0, 28))
+        Err(_) => test.assert(false)
+        Ok(c)  =>
+            test.assert(c.format == 12)
+            test.assert(fontcmap.glyph_for(c, 0x10000) == 100)
+            test.assert(fontcmap.glyph_for(c, 0x10010) == 116)
+            test.assert(fontcmap.glyph_for(c, 0x10011) == 0)
+            test.assert(fontcmap.glyph_for(c, 0x0FFF) == 0)
+            test.assert(fontcmap.mapped_count(c) == 17)
+            test.assert(fontcmap.max_codepoint(c) == 0x10010)
+            test.assert(fontcmap.covers_astral(c))
+
+    test.case("a format 12 subtable cut before its groups is short")
+    match fontcmap.parse_subtable(bytes.slice(format12_one_group(), 0, 15),
+                                  sub_at(0, 4, 12, 0, 15))
+        Err(FontShort(_, want, have)) => test.assert(want == 16 and have == 15)
+        _                             => test.assert(false)
+    match fontcmap.parse_subtable(bytes.slice(format12_one_group(), 0, 16),
+                                  sub_at(0, 4, 12, 0, 16))
+        Err(FontShort(_, want, have)) => test.assert(want == 28 and have == 16)
+        _                             => test.assert(false)
+
+    test.case("and a format this package does not read is refused with its number")
+    match fontcmap.parse_subtable(format12_one_group(), sub_at(3, 1, 6, 0, 28))
+        Err(FontCmapFormat(format)) => test.assert(format == 6)
+        _                           => test.assert(false)

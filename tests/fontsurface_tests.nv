@@ -178,7 +178,8 @@ fn test_the_kerning_tables_are_reachable_and_the_plan_is_built_once() [io]
 
     test.case("the legacy table's two headers are told apart before it is read")
     test.assert(fontkern.kern_subtable_count(d) >= 0)
-    test.assert(fontkern.kern_is_apple(d) == false)
+    test.assert(fontkern.kern_is_apple(bytes.u32_be(0x00010000) + bytes.u32_be(0)))
+    test.assert(fontkern.kern_is_apple(bytes.u16_be(0) + bytes.u16_be(0)) == false)
 
     test.case("and its pairs come back inside a value that also says what was skipped")
     match fontkern.kern_pairs(d)

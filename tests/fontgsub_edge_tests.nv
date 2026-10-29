@@ -1,0 +1,633 @@
+// fontgsub_edge_tests.nv — both substitutions, the longest-ligature
+// rule, and the feature walk, over `GSUB` tables assembled in memory.
+//
+// WHY THIS SUITE EXISTS.  `fontsurface_tests.nv` reaches
+// `fontgsub.plan` with a twelve-byte stub, and `fontread_edge_tests.nv`
+// reads ONE fixture: a `liga` feature whose one lookup is a format 1
+// ligature substitution of two glyphs.  Nothing read a SINGLE
+// substitution in either of its two formats, a language-specific
+// LangSys, a feature whose lookup index is past the lookup list, a
+// lookup whose type this module refuses, or a ligature of one glyph —
+// and the `FontLookupType` refusal, which is the whole of `plan`'s
+// error answer, was never taken by a test.
+//
+// THE RULES, HAND-COMPUTED.
+//
+//   FORMAT 1 IS A DELTA AND FORMAT 2 IS A LIST.  Format 1 below covers
+//   glyphs 10 and 11 with one delta of +100, so the substitutions are
+//   10 -> 110 and 11 -> 111 and glyph 12 is untouched.  Format 2 covers
+//   glyph 20 and lists 220 for it, so 20 -> 220 and 21 is untouched.
+//   Both end up as the same `from_glyph`/`to_glyph` pairs.
+//
+//   THE LONGEST LIGATURE WINS, AND THE SHORTER ONE STILL MATCHES.
+//   The ligature set below holds three records for the covered glyph 1:
+//   `1 2 2 -> 4`, `1 2 -> 3`, and a third whose component count is 0.
+//   Sorting is by first component and then by DESCENDING length — 65536
+//   * 1 - 3 = 65533 before 65536 * 1 - 2 = 65534 — so the three-glyph
+//   record is tried first: `1 2 2` answers 4, and `1 2` answers 3
+//   because the longer record cannot match a two-glyph run.  The
+//   zero-count record is not a ligature at all and is dropped; a
+//   reader that kept it would match the empty run at every position.
+//
+//   ONE SUBSTITUTION, ONE OUTPUT INDEX.  `apply_mapped` names the
+//   FIRST input glyph of each output glyph, so `1 2 2` under the plan
+//   above maps to the single index 0, and `10 11 12` under the delta
+//   plan maps to 0, 1, 2.
+//
+//   THE FEATURE WALK IS BY TAG AND THE LANG SYS IS BY OFFSET.  A
+//   Script table whose default is NULL has no default LangSys, so
+//   asking for its default answers no feature; its language record,
+//   tagged 0xFFFF, answers the `liga` feature.  The LangSys there names
+//   feature indices 0 and 5 while the feature list holds one record, so
+//   index 5 has no tag — 0, which the format never uses — and is left
+//   out of `features_present` rather than reported as a feature that
+//   `has_feature` then denies.
+//
+//   EVERY WALK STOPS WHERE ITS TABLE DOES, AND EACH STOP HAS ONE
+//   ANSWER.  The second half of this suite cuts one offset per case and
+//   asserts what the answer is: a script list of 0 declares no script,
+//   a script record past the end no LangSys, a LangSys two bytes short
+//   of its header no feature, a LangSys claiming four feature indices
+//   the one it has, a feature list of 0 no tag, a feature record whose
+//   table is past the end no lookup, a lookup index past the lookup
+//   list skipped rather than refused.  A format 1 single substitution's
+//   delta is SIGNED (0xFF9C is -100, so 200 answers 100); a format 2
+//   coverage EXPANDS its ranges, so one range 1..3 is three covered
+//   glyphs and three ligature sets; and a coverage, ligature set or
+//   record the walk cannot reach contributes nothing while the records
+//   it could read still stand.  A format 2 substitute list with more
+//   covered glyphs than the table has room for ids stops at the table's
+//   end rather than pairing a glyph with a word that is not there.
+
+use std.test
+use std.list
+use std.bytes
+use fontdir
+use fontgsub
+
+fn u16(v: Int) -> Bytes
+    bytes.u16_be(v)
+
+fn u32(v: Int) -> Bytes
+    bytes.u32_be(v)
+
+fn latn() -> Int
+    fontdir.tag_of("latn")
+
+fn liga() -> Int
+    fontdir.tag_of("liga")
+
+// ── The shared table skeleton ───────────────────────────────────────
+
+// The script list `fontread_edge_tests.nv` uses: `latn` at offset 8, a
+// default LangSys naming one feature index.  Twenty bytes, so the
+// feature list starts at 30 and the lookup list at 44.
+fn script_list_default() -> Bytes
+    u16(1) + u32(latn()) + u16(8)
+        + u16(4) + u16(0)
+        + u16(0) + u16(0xFFFF) + u16(1) + u16(0)
+
+// One feature record, whose Feature table names lookup `index`.
+fn feature_list_n(tag: Int, index: Int) -> Bytes
+    u16(1) + u32(tag) + u16(8)
+        + u16(0) + u16(1) + u16(index)
+
+// One lookup of `kind`, whose single subtable sits at offset 8.
+fn lookup_list(kind: Int) -> Bytes
+    u16(1) + u16(4)
+        + u16(kind) + u16(0) + u16(1) + u16(8)
+
+fn header() -> Bytes
+    u16(1) + u16(0) + u16(10) + u16(30) + u16(44)
+
+// ── Single substitution, both formats ───────────────────────────────
+
+// A `smcp` feature whose one lookup is a format 1 single substitution
+// covering glyphs 10 and 11 with a delta of +100.  The subtable is at
+// 56: format(2) coverageOffset(2) delta(2) is SIX bytes, so the
+// coverage starts at 62 and its offset from the subtable is 6.
+fn gsub_single_delta() -> Bytes
+    header()
+        + script_list_default()
+        + feature_list_n(fontdir.tag_of("smcp"), 0)
+        + lookup_list(1)
+        + u16(1) + u16(6) + u16(100)
+        + u16(1) + u16(2) + u16(10) + u16(11)
+
+// A `smcp` feature whose one lookup is a format 2 single substitution
+// covering glyph 20 and listing 220 for it.  The subtable is at 56:
+// format(2) coverageOffset(2) glyphCount(2) glyph(2) is EIGHT bytes,
+// so the coverage starts at 64 and its offset is 8.
+fn gsub_single_list() -> Bytes
+    header()
+        + script_list_default()
+        + feature_list_n(fontdir.tag_of("smcp"), 0)
+        + lookup_list(1)
+        + u16(2) + u16(8) + u16(1) + u16(220)
+        + u16(1) + u16(1) + u16(20)
+
+@test
+fn test_a_format_1_single_substitution_applies_one_delta_to_each_covered_glyph() [io]
+    let gsub = gsub_single_delta()
+    let p = fontgsub.plan(gsub, latn(), 0, [fontdir.tag_of("smcp")])!
+
+    test.case("THE CLAIM: 10 + 100 = 110 and 11 + 100 = 111, and 12 is untouched")
+    test.assert(list.len(fontgsub.singles(p)) == 2)
+    let out = fontgsub.apply(p, [10, 11, 12])
+    test.assert(list.len(out) == 3)
+    test.assert(list.get(out, 0) == 110)
+    test.assert(list.get(out, 1) == 111)
+    test.assert(list.get(out, 2) == 12)
+
+    test.case("THE CLAIM: the map names the input index of each output glyph")
+    let mapped = fontgsub.apply_mapped(p, [10, 11, 12])
+    test.assert(list.len(mapped) == 3)
+    test.assert(list.get(mapped, 0) == 0)
+    test.assert(list.get(mapped, 1) == 1)
+    test.assert(list.get(mapped, 2) == 2)
+
+    test.case("a run with nothing covered in it is not changed")
+    test.assert(not fontgsub.changes_anything(p, [12, 13]))
+    test.assert(fontgsub.changes_anything(p, [10]))
+
+@test
+fn test_a_format_2_single_substitution_applies_a_listed_glyph() [io]
+    let gsub = gsub_single_list()
+    let p = fontgsub.plan(gsub, latn(), 0, [fontdir.tag_of("smcp")])!
+
+    test.case("THE CLAIM: 20 -> 220 by list, and 21 is untouched")
+    test.assert(list.len(fontgsub.singles(p)) == 1)
+    let out = fontgsub.apply(p, [20, 21])
+    test.assert(list.len(out) == 2)
+    test.assert(list.get(out, 0) == 220)
+    test.assert(list.get(out, 1) == 21)
+    test.assert(fontgsub.changes_anything(p, [20]))
+    test.assert(not fontgsub.changes_anything(p, [21]))
+
+    test.case("the plan says which feature it was built from")
+    test.assert(list.len(p.features) == 1)
+    test.assert(list.get(p.features, 0) == fontdir.tag_of("smcp"))
+
+// ── Ligatures: the longest match, and the ones that are not ─────────
+
+// A `liga` feature whose one lookup is a format 1 ligature substitution
+// covering glyph 1, with three records for it: `1 2 2 -> 4`,
+// `1 2 -> 3`, and a record whose component count is 0.  The subtable is
+// at 56; its set is at 64 and its header is EIGHT bytes — a count and
+// three offsets — so the records are at 72, 80 and 86, and the
+// coverage table is at 90, an offset of 34.
+fn gsub_ligatures() -> Bytes
+    header()
+        + script_list_default()
+        + feature_list_n(liga(), 0)
+        + lookup_list(4)
+        + u16(1) + u16(34) + u16(1) + u16(8)
+        + u16(3) + u16(8) + u16(16) + u16(22)
+        + u16(4) + u16(3) + u16(2) + u16(2)
+        + u16(3) + u16(2) + u16(2)
+        + u16(9) + u16(0)
+        + u16(1) + u16(1) + u16(1)
+
+@test
+fn test_the_longest_ligature_wins_and_the_shorter_one_still_matches() [io]
+    let p = fontgsub.plan(gsub_ligatures(), latn(), 0, fontgsub.default_features())!
+
+    test.case("THE CLAIM: the zero-component record is dropped, not matched empty")
+    test.assert(list.len(fontgsub.ligatures(p)) == 2)
+
+    test.case("THE CLAIM: `1 2 2` answers the three-glyph ligature, glyph 4")
+    let long_one = list.get(fontgsub.ligatures(p), 0)
+    test.assert(fontgsub.ligature_len(long_one) == 3)
+    test.assert(list.get(long_one.components, 0) == 1)
+    test.assert(list.get(long_one.components, 1) == 2)
+    test.assert(list.get(long_one.components, 2) == 2)
+    test.assert(long_one.glyph == 4)
+    let three = fontgsub.apply(p, [1, 2, 2])
+    test.assert(list.len(three) == 1)
+    test.assert(list.get(three, 0) == 4)
+
+    test.case("THE CLAIM: `1 2` still answers the two-glyph ligature, glyph 3")
+    let two = fontgsub.apply(p, [1, 2])
+    test.assert(list.len(two) == 1)
+    test.assert(list.get(two, 0) == 3)
+
+    test.case("a run the ligatures cannot cover is the identity")
+    let one = fontgsub.apply(p, [1])
+    test.assert(list.len(one) == 1)
+    test.assert(list.get(one, 0) == 1)
+    test.assert(not fontgsub.changes_anything(p, [5, 6]))
+
+    test.case("and the map is one index per output glyph, naming the first input")
+    let mapped = fontgsub.apply_mapped(p, [1, 2, 2])
+    test.assert(list.len(mapped) == 1)
+    test.assert(list.get(mapped, 0) == 0)
+
+@test
+fn test_a_one_glyph_ligature_that_maps_to_itself_changes_nothing() [io]
+    // A plan built by hand, because a font would not write this: the
+    // ligature's only component is the glyph it produces.  `apply`
+    // consumes it and pushes it back, and `changes_anything` says the
+    // run is untouched — which is what makes the pre-check useful.
+    let p = FontSubstPlan { ligatures: [FontLigature { components: [7],
+                                                       glyph: 7 }],
+                            singles: [], features: [] }
+    test.assert(not fontgsub.changes_anything(p, [7]))
+    let out = fontgsub.apply(p, [7, 8])
+    test.assert(list.len(out) == 2)
+    test.assert(list.get(out, 0) == 7)
+    test.assert(list.get(out, 1) == 8)
+
+// ── The refusal, and the lookup that is not there ───────────────────
+
+// A `calt` feature whose one lookup is of type 3 (alternate), which
+// this module refuses by name.
+fn gsub_refused_lookup() -> Bytes
+    header()
+        + script_list_default()
+        + feature_list_n(fontdir.tag_of("calt"), 0)
+        + lookup_list(3)
+        + u16(1) + u16(8) + u16(100)
+        + u16(1) + u16(2) + u16(10) + u16(11)
+
+// A `liga` feature whose Feature table names lookup 7 while the lookup
+// list holds one.
+fn gsub_missing_lookup() -> Bytes
+    header()
+        + script_list_default()
+        + feature_list_n(liga(), 7)
+        + lookup_list(4)
+        + u16(1) + u16(34) + u16(1) + u16(8)
+        + u16(3) + u16(8) + u16(16) + u16(22)
+        + u16(4) + u16(3) + u16(2) + u16(2)
+        + u16(3) + u16(2) + u16(2)
+        + u16(9) + u16(0)
+        + u16(1) + u16(1) + u16(1)
+
+@test
+fn test_a_lookup_of_a_refused_type_stops_the_plan_by_name() [io]
+    test.case("THE CLAIM: a `calt` feature reaching a type 3 lookup is refused")
+    match fontgsub.plan(gsub_refused_lookup(), latn(), 0,
+                        fontgsub.default_features())
+        Err(_) => test.assert(true)
+        Ok(_)  => test.assert(false)
+
+    test.case("and a feature the caller did not ask for is never walked")
+    match fontgsub.plan(gsub_refused_lookup(), latn(), 0, [liga()])
+        Err(_) => test.assert(false)
+        Ok(p)  => test.assert(list.len(fontgsub.ligatures(p)) == 0)
+
+@test
+fn test_a_feature_naming_a_lookup_that_is_not_there_is_skipped() [io]
+    test.case("THE CLAIM: lookup 7 past a one-lookup list is skipped, not refused")
+    let p = fontgsub.plan(gsub_missing_lookup(), latn(), 0,
+                          fontgsub.default_features())!
+    test.assert(list.len(fontgsub.ligatures(p)) == 0)
+    test.assert(list.len(fontgsub.singles(p)) == 0)
+    test.assert(not fontgsub.changes_anything(p, [1, 2]))
+
+@test
+fn test_a_table_that_is_not_gsub_1_refuses_and_a_short_one_too() [io]
+    test.case("THE CLAIM: a major version that is not 1 is refused before any offset")
+    match fontgsub.plan(u16(2) + u16(0) + u16(10) + u16(30) + u16(44),
+                        latn(), 0, fontgsub.default_features())
+        Err(_) => test.assert(true)
+        Ok(_)  => test.assert(false)
+
+    test.case("and fewer than ten bytes is a short table")
+    match fontgsub.plan(u16(1), latn(), 0, fontgsub.default_features())
+        Err(_) => test.assert(true)
+        Ok(_)  => test.assert(false)
+
+// ── The feature and script walk ─────────────────────────────────────
+
+@test
+fn test_the_features_and_scripts_a_table_declares_are_reported() [io]
+    let gsub = gsub_single_delta()
+
+    test.case("THE CLAIM: `smcp` is present, and `liga` is not")
+    let present = fontgsub.features_present(gsub, latn(), 0)
+    test.assert(list.len(present) == 1)
+    test.assert(list.get(present, 0) == fontdir.tag_of("smcp"))
+    test.assert(fontgsub.has_feature(gsub, latn(), 0, fontdir.tag_of("smcp")))
+    test.assert(not fontgsub.has_feature(gsub, latn(), 0, liga()))
+
+    test.case("one script, `latn`, and a stub declares none")
+    let scripts = fontgsub.scripts_present(gsub)
+    test.assert(list.len(scripts) == 1)
+    test.assert(list.get(scripts, 0) == latn())
+    test.assert(list.len(fontgsub.scripts_present(bytes.zeros(0))) == 0)
+    test.assert(list.len(fontgsub.features_present(bytes.zeros(0), latn(), 0)) == 0)
+    test.assert(not fontgsub.has_feature(bytes.zeros(0), latn(), 0, liga()))
+
+    test.case("asking for no feature builds a plan that substitutes nothing")
+    let p = fontgsub.plan(gsub, latn(), 0, [])!
+    test.assert(list.len(fontgsub.singles(p)) == 0)
+
+@test
+fn test_a_null_default_langsys_answers_nothing_and_its_language_record_answers_liga() [io]
+    // The same Script list with a NULL default and one language-specific
+    // LangSys, tagged 0xFFFF, which names feature indices 0 and 5 while
+    // the feature list holds one record.  The subtable is the `1 2 -> 3`
+    // ligature.  Offsets: script list at 10, feature list at 38, lookup
+    // list at 52, lookup table at 56, subtable at 64, its set at 72, its
+    // one record at 76, and the coverage table at 82.
+    let gsub = u16(1) + u16(0) + u16(10) + u16(38) + u16(52)
+        + u16(1) + u32(latn()) + u16(8)
+            + u16(0) + u16(1)
+            + u32(0xFFFF) + u16(10)
+            + u16(0) + u16(0xFFFF) + u16(2) + u16(0) + u16(5)
+        + u16(1) + u32(liga()) + u16(8)
+            + u16(0) + u16(1) + u16(0)
+        + u16(1) + u16(4)
+            + u16(4) + u16(0) + u16(1) + u16(8)
+        + u16(1) + u16(18) + u16(1) + u16(8)
+        + u16(1) + u16(4)
+        + u16(3) + u16(2) + u16(2)
+        + u16(1) + u16(1) + u16(1)
+
+    test.case("THE CLAIM: a NULL default LangSys answers no feature")
+    test.assert(not fontgsub.has_feature(gsub, latn(), 0, liga()))
+    test.assert(list.len(fontgsub.features_present(gsub, latn(), 0)) == 0)
+
+    test.case("THE CLAIM: the language record answers `liga`, and not index 5")
+    test.assert(fontgsub.has_feature(gsub, latn(), 0xFFFF, liga()))
+    let present = fontgsub.features_present(gsub, latn(), 0xFFFF)
+    test.assert(list.len(present) == 1)
+    test.assert(list.get(present, 0) == liga())
+
+    test.case("and the plan follows the language: `1 2` is glyph 3 there")
+    let p = fontgsub.plan(gsub, latn(), 0xFFFF, fontgsub.default_features())!
+    test.assert(list.len(fontgsub.ligatures(p)) == 1)
+    let out = fontgsub.apply(p, [1, 2])
+    test.assert(list.len(out) == 1)
+    test.assert(list.get(out, 0) == 3)
+
+    test.case("while the default language plans nothing at all")
+    let q = fontgsub.plan(gsub, latn(), 0, fontgsub.default_features())!
+    test.assert(list.len(fontgsub.ligatures(q)) == 0)
+    test.assert(list.len(fontgsub.singles(q)) == 0)
+
+    test.case("the refusal lists are published as data")
+    test.assert(list.len(fontgsub.lookup_types_covered()) == 2)
+    test.assert(list.len(fontgsub.lookup_types_refused()) == 5)
+    test.assert(list.len(fontgsub.no_substitutions().features) == 0)
+
+// ── The walks that stop: cut tables and refused records ─────────────
+
+// The header, the script list, one feature record and one type 4
+// lookup, so a fixture is only its subtable: the subtable lands at 56.
+fn ligature_prefix() -> Bytes
+    header() + script_list_default() + feature_list_n(liga(), 0) + lookup_list(4)
+
+// The same, with a type 1 lookup, for single substitution.
+fn single_prefix(tag: Int) -> Bytes
+    header() + script_list_default() + feature_list_n(tag, 0) + lookup_list(1)
+
+@test
+fn test_a_format_1_delta_is_signed_so_a_negative_one_subtracts() [io]
+    test.case("THE CLAIM: a delta of 0xFF9C is -100, so 200 answers 100")
+    // The subtable is at 56: format(2) coverageOffset(2) delta(2).  The
+    // delta word is 0xFF9C, which as a SIGNED word is -100; read
+    // unsigned it would be 65436 and glyph 200 would plan a glyph id
+    // 65636.  The coverage at 62 names one glyph, so the answer is the
+    // single pair 200 -> 100.
+    let gsub = single_prefix(fontdir.tag_of("smcp"))
+        + u16(1) + u16(6) + u16(0xFF9C)
+        + u16(1) + u16(1) + u16(200)
+    let p = fontgsub.plan(gsub, latn(), 0, [fontdir.tag_of("smcp")])!
+    test.assert(list.len(fontgsub.singles(p)) == 1)
+    test.assert(list.get(fontgsub.singles(p), 0).to_glyph == 100)
+    let out = fontgsub.apply(p, [200, 201])
+    test.assert(list.len(out) == 2)
+    test.assert(list.get(out, 0) == 100)
+    test.assert(list.get(out, 1) == 201)
+
+@test
+fn test_a_script_and_a_feature_walk_that_cannot_be_followed_answers_nothing() [io]
+    test.case("THE CLAIM: a script list offset of 0 declares no script and no feature")
+    // Ten bytes and nothing else: the header alone, with `scriptList`
+    // 0.  `scripts_present` and every feature question read the same
+    // word, and 0 is "there is no list", not an offset.
+    let no_scripts = u16(1) + u16(0) + u16(0) + u16(30) + u16(44)
+    test.assert(list.len(fontgsub.scripts_present(no_scripts)) == 0)
+    test.assert(list.len(fontgsub.features_present(no_scripts, latn(), 0)) == 0)
+    test.assert(not fontgsub.has_feature(no_scripts, latn(), 0, liga()))
+
+    test.case("THE CLAIM: a script record whose offset is past the table names no LangSys")
+    // The one `latn` record points at 0x0F00, far past the eighteen
+    // bytes there are, so the script is found and its LangSys is not.
+    let far_script = u16(1) + u16(0) + u16(10) + u16(30) + u16(44)
+        + u16(1) + u32(latn()) + u16(0x0F00)
+    test.assert(list.len(fontgsub.features_present(far_script, latn(), 0)) == 0)
+    test.assert(not fontgsub.has_feature(far_script, latn(), 0, liga()))
+
+    test.case("THE CLAIM: a LangSys two bytes short of its own header names no feature")
+    // The Script table at 18 sets its default LangSys offset to 6, so
+    // the LangSys starts at 24 — and the table ends at 26, two bytes
+    // into the six-byte header a LangSys needs.
+    let short_lang = u16(1) + u16(0) + u16(10) + u16(30) + u16(44)
+        + u16(1) + u32(latn()) + u16(8)
+        + u16(6) + u16(0)
+        + u16(0) + u16(0)
+    test.assert(list.len(fontgsub.features_present(short_lang, latn(), 0)) == 0)
+    test.assert(not fontgsub.has_feature(short_lang, latn(), 0, liga()))
+
+    test.case("THE CLAIM: a LangSys claiming four feature indices keeps the one present")
+    // The LangSys at 22 says four indices and the table ends after the
+    // first, so the list is [0] rather than empty — and index 0 is read
+    // against a feature list the header points past, so the tag is 0
+    // and no feature is reported.
+    let cut_indices = u16(1) + u16(0) + u16(10) + u16(30) + u16(44)
+        + u16(1) + u32(latn()) + u16(8)
+        + u16(4) + u16(0)
+        + u16(0) + u16(0) + u16(4) + u16(0)
+    test.assert(list.len(fontgsub.features_present(cut_indices, latn(), 0)) == 0)
+    let q = fontgsub.plan(cut_indices, latn(), 0, fontgsub.default_features())!
+    test.assert(list.len(fontgsub.ligatures(q)) == 0)
+
+    test.case("THE CLAIM: a table with no feature list has no tag to match")
+    // `featureList` 0 with a script list that names one index: the
+    // index is asked for a tag and the answer is 0, which is not a
+    // feature the format can write.
+    let no_features = u16(1) + u16(0) + u16(10) + u16(0) + u16(44)
+        + script_list_default()
+    test.assert(list.len(fontgsub.features_present(no_features, latn(), 0)) == 0)
+    let r = fontgsub.plan(no_features, latn(), 0, fontgsub.default_features())!
+    test.assert(list.len(fontgsub.ligatures(r)) == 0)
+
+    test.case("THE CLAIM: a feature record whose table is past the end plans no lookup")
+    // The record itself is intact — its tag is `liga` and the list
+    // holds one — but its offset field points at 0x0F00, so the table
+    // it names cannot be read.  The feature is still REPORTED (the tag
+    // is real); it just has no lookup to run.
+    let far_feature = header() + script_list_default()
+        + u16(1) + u32(liga()) + u16(0x0F00)
+    test.assert(list.len(fontgsub.features_present(far_feature, latn(), 0)) == 1)
+    let s = fontgsub.plan(far_feature, latn(), 0, fontgsub.default_features())!
+    test.assert(list.len(fontgsub.ligatures(s)) == 0)
+
+    test.case("THE CLAIM: a feature claiming five lookups keeps the one in the table")
+    // The Feature table at 38 says five lookup indices and the table
+    // ends after the first, so the list is [0] — and lookup 0 is asked
+    // for its type against a lookup list offset the header puts past
+    // the end, which answers -1 and is skipped rather than refused.
+    let cut_lookups = header() + script_list_default()
+        + u16(1) + u32(liga()) + u16(8)
+        + u16(0) + u16(5) + u16(0)
+    let t = fontgsub.plan(cut_lookups, latn(), 0, fontgsub.default_features())!
+    test.assert(list.len(fontgsub.ligatures(t)) == 0)
+
+    test.case("and a LookupList whose one entry is past the end is skipped too")
+    let far_lookup = header() + script_list_default() + feature_list_n(liga(), 0)
+        + u16(1) + u16(0x0F00)
+    let u = fontgsub.plan(far_lookup, latn(), 0, fontgsub.default_features())!
+    test.assert(list.len(fontgsub.ligatures(u)) == 0)
+    test.assert(list.len(fontgsub.singles(u)) == 0)
+
+@test
+fn test_a_coverage_and_the_tables_it_names_are_read_only_as_far_as_they_go() [io]
+    test.case("THE CLAIM: a ligature subtable whose coverage is past the end answers nothing")
+    // Format 1 with its coverage offset at 0x0F00: the subtable is
+    // readable, the coverage is not, and a ligature set with no
+    // covered glyph to pair it with contributes nothing.
+    let far_coverage = ligature_prefix() + u16(1) + u16(0x0F00) + u16(1) + u16(8)
+    let a = fontgsub.plan(far_coverage, latn(), 0, fontgsub.default_features())!
+    test.assert(list.len(fontgsub.ligatures(a)) == 0)
+
+    test.case("THE CLAIM: a coverage claiming three glyphs with one present keeps the one")
+    // The subtable at 56: coverage offset 8 (to 64), one set whose
+    // offset is 20 (to 76, past the table's own 70 bytes).  The
+    // coverage at 64 says three glyphs and holds one, so the covered
+    // list is [1] — and the set that belongs to glyph 1 lies past the
+    // end, so nothing is planned.
+    let cut_coverage = ligature_prefix()
+        + u16(1) + u16(8) + u16(1) + u16(20)
+        + u16(1) + u16(3) + u16(1)
+    let b = fontgsub.plan(cut_coverage, latn(), 0, fontgsub.default_features())!
+    test.assert(list.len(fontgsub.ligatures(b)) == 0)
+
+    test.case("THE CLAIM: a ligature set whose record offset is past the end is dropped")
+    // The set at 70 is readable and names one record at 70 + 0x0F00,
+    // which is not.
+    let far_record = ligature_prefix()
+        + u16(1) + u16(8) + u16(1) + u16(14)
+        + u16(1) + u16(1) + u16(1)
+        + u16(1) + u16(0x0F00)
+    let c = fontgsub.plan(far_record, latn(), 0, fontgsub.default_features())!
+    test.assert(list.len(fontgsub.ligatures(c)) == 0)
+
+    test.case("THE CLAIM: a type 4 lookup whose subtable is not format 1 is not a ligature")
+    let not_a_ligature = ligature_prefix() + u16(2) + u16(0) + u16(0)
+    let d = fontgsub.plan(not_a_ligature, latn(), 0, fontgsub.default_features())!
+    test.assert(list.len(fontgsub.ligatures(d)) == 0)
+
+    test.case("THE CLAIM: a type 1 lookup whose table is four bytes long names no substitution")
+    // The lookup table starts at 48 and the table ends at 60: the type
+    // word is there and the six-byte subtable header is not.
+    let short_single = single_prefix(fontdir.tag_of("smcp")) + u16(1) + u16(0)
+    let e = fontgsub.plan(short_single, latn(), 0, [fontdir.tag_of("smcp")])!
+    test.assert(list.len(fontgsub.singles(e)) == 0)
+
+    test.case("THE CLAIM: a substitute list claiming ten glyphs stops at the table's end")
+    // The subtable at 56 is format 2 with ten glyphs claimed; the
+    // coverage at 62 (an offset of 6) expands one range to six glyphs,
+    // 1 to 6, so there are six glyphs to pair.  The id array lives at
+    // 62 and the table ends at 72, so five id words fit: the sixth read
+    // would need byte 74 and the walk stops there.  A format 2 subtable
+    // stores no offset for its ids, so the five ids ARE the coverage's
+    // own first words — which is the point: the reader takes the id
+    // array where the format puts it, and stops where the table does.
+    let cut_single_list = single_prefix(fontdir.tag_of("smcp"))
+        + u16(2) + u16(6) + u16(10)
+        + u16(2) + u16(1) + u16(1) + u16(6) + u16(0)
+    let f = fontgsub.plan(cut_single_list, latn(), 0, [fontdir.tag_of("smcp")])!
+    test.assert(list.len(fontgsub.singles(f)) == 5)
+    test.assert(list.get(fontgsub.singles(f), 0).from_glyph == 1)
+    test.assert(list.get(fontgsub.singles(f), 0).to_glyph == 2)
+    test.assert(list.get(fontgsub.singles(f), 4).from_glyph == 5)
+    test.assert(list.get(fontgsub.singles(f), 4).to_glyph == 0)
+
+    test.case("THE CLAIM: a lookup table too short for its own header is skipped")
+    // A lookup list at 44 whose entry is at 48 and whose table ends at
+    // 52: the type word says 4 and the six bytes a lookup header needs
+    // are not there.
+    let short_lookup = header() + script_list_default() + feature_list_n(liga(), 0)
+        + u16(1) + u16(4) + u16(4) + u16(0)
+    let g = fontgsub.plan(short_lookup, latn(), 0, fontgsub.default_features())!
+    test.assert(list.len(fontgsub.ligatures(g)) == 0)
+
+    test.case("and the same cut in a single-substitution lookup is skipped too")
+    let short_single_lookup = header() + script_list_default()
+        + feature_list_n(fontdir.tag_of("smcp"), 0)
+        + u16(1) + u16(4) + u16(1) + u16(0)
+    let h = fontgsub.plan(short_single_lookup, latn(), 0, [fontdir.tag_of("smcp")])!
+    test.assert(list.len(fontgsub.singles(h)) == 0)
+
+// A `liga` feature whose one lookup is a format 1 ligature substitution
+// covering glyphs 1 to 3 through one FORMAT 2 coverage range, with one
+// ligature set per covered glyph: `1 2 -> 3`, `2 2 -> 4`, `3 3 -> 5`.
+//
+// The subtable is at 56 and its header is 6 + 3 * 2 = 12 bytes, so the
+// sets are at 68, 78 and 88 and the coverage at 98, an offset of 42.
+// Each set is a count, an offset and one six-byte record.
+fn gsub_ligatures_cov2() -> Bytes
+    ligature_prefix()
+        + u16(1) + u16(42) + u16(3) + u16(12) + u16(22) + u16(32)
+        + u16(1) + u16(4) + u16(3) + u16(2) + u16(2)
+        + u16(1) + u16(4) + u16(4) + u16(2) + u16(2)
+        + u16(1) + u16(4) + u16(5) + u16(2) + u16(3)
+        + u16(2) + u16(1) + u16(1) + u16(3) + u16(0)
+
+// The same table with two sets, and a coverage that claims two ranges
+// while only the first is whole: `1 2 -> 3` and `2 3 -> 4`, and the
+// second range (4..5) has four of its six bytes.  The header is
+// 6 + 2 * 2 = 10 bytes, so the sets are at 66 and 76 and the coverage
+// at 86, an offset of 30.
+fn gsub_ligatures_cov2_cut() -> Bytes
+    ligature_prefix()
+        + u16(1) + u16(30) + u16(2) + u16(10) + u16(20)
+        + u16(1) + u16(4) + u16(3) + u16(2) + u16(2)
+        + u16(1) + u16(4) + u16(4) + u16(2) + u16(3)
+        + u16(2) + u16(2) + u16(1) + u16(2) + u16(0) + u16(4) + u16(5)
+
+@test
+fn test_a_format_2_coverage_expands_its_ranges_and_a_cut_one_stops_at_what_it_has() [io]
+    test.case("THE CLAIM: one range 1..3 is three covered glyphs, one per ligature set")
+    let p = fontgsub.plan(gsub_ligatures_cov2(), latn(), 0,
+                          fontgsub.default_features())!
+    test.assert(list.len(fontgsub.ligatures(p)) == 3)
+    test.assert(fontgsub.changes_anything(p, [1, 2]))
+    let three = fontgsub.apply(p, [1, 2])
+    test.assert(list.len(three) == 1)
+    test.assert(list.get(three, 0) == 3)
+    let four = fontgsub.apply(p, [2, 2])
+    test.assert(list.len(four) == 1)
+    test.assert(list.get(four, 0) == 4)
+    let five = fontgsub.apply(p, [3, 3])
+    test.assert(list.len(five) == 1)
+    test.assert(list.get(five, 0) == 5)
+    test.assert(not fontgsub.changes_anything(p, [1, 3]))
+
+    test.case("THE CLAIM: two ranges with one present expand the one that is there")
+    let q = fontgsub.plan(gsub_ligatures_cov2_cut(), latn(), 0,
+                          fontgsub.default_features())!
+    test.assert(list.len(fontgsub.ligatures(q)) == 2)
+    let a = fontgsub.apply(q, [1, 2])
+    test.assert(list.len(a) == 1)
+    test.assert(list.get(a, 0) == 3)
+    let b = fontgsub.apply(q, [2, 3])
+    test.assert(list.len(b) == 1)
+    test.assert(list.get(b, 0) == 4)
+    test.assert(not fontgsub.changes_anything(q, [1, 3]))
+
+@test
+fn test_the_scripts_a_table_declares_stop_at_the_records_it_has() [io]
+    test.case("THE CLAIM: a count of two with one record answers the one script")
+    // Eighteen bytes: the header, a script list whose count says two,
+    // and one six-byte record.  The count is what the table claims and
+    // the records are what it has; the answer is the record.
+    let cut_scripts = u16(1) + u16(0) + u16(10) + u16(30) + u16(44)
+        + u16(2) + u32(latn()) + u16(8)
+    let scripts = fontgsub.scripts_present(cut_scripts)
+    test.assert(list.len(scripts) == 1)
+    test.assert(list.get(scripts, 0) == latn())

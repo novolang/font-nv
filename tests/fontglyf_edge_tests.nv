@@ -1,0 +1,514 @@
+// fontglyf_edge_tests.nv — the glyph record read field by field: the
+// contour ends, the flag run with its repeats, both coordinate
+// encodings, and the four matrices a composite may name.
+//
+// WHY THIS SUITE EXISTS.  `fontglyf_tests.nv` is the oracle for what a
+// `glyf` table MEANS: `loca`'s halves, an empty glyph that is a space,
+// a composite answered rather than followed.  It never builds an
+// outline from a simple record, and this suite is that half, with the
+// two pins that carry the design:
+//
+//   THE ROUND TRIP.  A record written coordinate by coordinate comes
+//   back as path commands whose numbers ARE the numbers written.  The
+//   tolerance is 0.0, and zero is the honest value: the record stores
+//   integers of at most 2^15, each carried through `int.to_float`
+//   exactly, and the only number the decoder invents is a midpoint of
+//   two of them, which is a half and is exact in binary.  A reader
+//   that rounds, clamps or scales anywhere fails on the numbers below.
+//
+//   THE IMPLIED ON-CURVE POINT.  Two off-curve points in a row mean
+//   the point BETWEEN them is on the curve, at their midpoint.  That
+//   is what makes a TrueType contour a curve rather than a polygon,
+//   and contour 4 below is written to catch a reader that skipped it.
+//
+// The fixtures are assembled field by field, so each case differs from
+// a record the format allows in exactly the field it names.
+
+use std.test
+use std.list
+use std.bytes
+use svgpath
+use fontsrc
+use fontdir
+use fontglyf
+use fonterror
+
+// A buffer from the numbers a fixture is written as.
+fn bytes_of(xs: [Int]) -> Bytes
+    bytes.from_byte_list(xs)
+
+// ── A record with every encoding in it ───────────────────────────────
+//
+// Five contours, fourteen points, and a bounding box the points do NOT
+// fill — a font is allowed to be wrong there, and this one is, so a
+// computed box that copies the header fails.
+//
+// Every coordinate is a DELTA from the point before it, so the numbers
+// below are written as differences; the absolute points they land on
+// are spelled out in the round-trip test, which is where a reader can
+// check them.
+//
+// The points, in contour order: (0,0) (20,40) (40,0) (20,-40) — one
+// quadratic either side of the axis; (100,0) (140,0) — a line; (180,0)
+// (220,0) (260,0) (300,0) — three off-curve points in a row, with the
+// ON-curve one last; (340,0) (380,0) — no on-curve point at all;
+// (400,0) (420,0) — the first off-curve and the last on.
+//
+// The deltas use every encoding the format has: a byte either sign, a
+// sixteen-bit delta either sign, a zero that takes no bytes at all, and
+// a flag run repeated over three points.
+fn rich_glyph() -> Bytes
+    let head = bytes_of([0, 5,   // five contours
+                         0xFF, 0xFB, 0xFF, 0xCE,   // xMin -5, yMin -50
+                         0x01, 0xBD, 0x00, 0x32])   // xMax 445, yMax 50
+    let ends = bytes.u16_be(3) + bytes.u16_be(5) + bytes.u16_be(9)
+             + bytes.u16_be(11) + bytes.u16_be(13)   // ends: 14 points
+    let instr = bytes.u16_be(0)   // no instructions
+    // flags, one per point: 0x01 on-curve, 0x02 x is a byte, 0x04 y is a
+    // byte, 0x08 repeat, 0x10/0x20 the short form is positive (and with
+    // 0x02/0x04 clear, that the delta is zero and takes no bytes).
+    let flags = bytes_of([0x31,   // P0  on,  x 0, y 0
+                          0x36,   // P1  off, x +20 byte, y +40 byte
+                          0x13,   // P2  on,  x +20 byte, y -40 as 16 bits
+                          0x06,   // P3  off, x -20 byte, y -40 byte
+                          0x25,   // P4  on,  16-bit x, y +40 byte
+                          0x21,   // P5  on,  16-bit x, y 0
+                          0x28, 0x02,   // P6  off, 16-bit x, y 0 — twice over
+                          0x21,   // P9  on,  16-bit x, y 0
+                          0x20,   // P10 off, 16-bit x, y 0
+                          0x20,   // P11 off, 16-bit x, y 0
+                          0x32,   // P12 off, x +20 byte, y 0
+                          0x33])   // P13 on,  x +20 byte, y 0
+    // x deltas, in point order
+    let xs = bytes_of([20, 20, 20,   // P1..P3  +20, +20, -20
+                       0, 80,   // P4  +80
+                       0, 40, 0, 40, 0, 40,   // P5..P7  +40 each
+                       0, 40, 0, 40, 0, 40,   // P8..P10 +40 each
+                       0, 40,   // P11 +40
+                       20, 20])   // P12, P13 +20 each
+    // y deltas, in point order — five bytes, because the rest are zero
+    let ys = bytes_of([40,   // P1  +40
+                       0xFF, 0xD8,   // P2  -40 as a 16-bit delta
+                       40,   // P3  -40
+                       40])   // P4  +40
+    head + ends + instr + flags + xs + ys
+
+// A one-contour, one-point record of `n` bytes: the header, and the one
+// end point once there is room for it.  Nothing else is written, so the
+// instruction length is zero and the flag run is what the caller adds.
+fn one_point_record(n: Int) -> Bytes
+    var g = bytes.zeros(n)
+    bytes.set_u16_be(g, 0, 1)
+    if n >= 12
+        bytes.set_u16_be(g, 10, 0)
+    g
+
+// The same, with `flag_bytes` as its flags — and nothing after them.
+fn one_point_with_flags(flag_bytes: [Int]) -> Bytes
+    let head = bytes_of([0, 1,   // one contour
+                         0, 0, 0, 0, 0, 0, 0, 0,   // an empty box
+                         0, 0,   // the point ends contour 1
+                         0, 0])   // no instructions
+    head + bytes_of(flag_bytes)
+
+// The same, sixteen bytes long, claiming `n` instruction bytes.
+fn one_point_with_instructions(n: Int) -> Bytes
+    var g = one_point_record(16)
+    bytes.set_u16_be(g, 12, n)
+    g
+
+// ── Composite records ────────────────────────────────────────────────
+
+// The ten-byte header of a composite: a negative contour count, and a
+// box the components fill.
+fn composite_header() -> Bytes
+    bytes_of([0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0])
+
+// One component: words, xy values, WE_HAVE_A_SCALE.  Glyph 5, offset
+// (+100, -500), scale one half.
+fn composite_scale() -> Bytes
+    let comp = bytes.u16_be(0x000B) + bytes.u16_be(5)
+             + bytes.u16_be(100) + bytes_of([0xFE, 0x0C])   // +100, -500
+             + bytes_of([0x20, 0x00])   // F2Dot14: 0.5
+    composite_header() + comp
+
+// Two components with BYTE arguments: glyph 7 at (-20, +20), and glyph
+// 9, whose USE_MY_METRICS makes it the composite's metric source.
+fn composite_bytes() -> Bytes
+    let c0 = bytes.u16_be(0x0022) + bytes.u16_be(7)   // xy values, byte args, more
+           + bytes_of([0xEC, 0x14])   // -20, +20
+    let c1 = bytes.u16_be(0x0202) + bytes.u16_be(9)   // xy values, byte args, USE_MY_METRICS
+           + bytes_of([0, 0])   // placed at the origin
+    composite_header() + c0 + c1
+
+// Three components, one for each remaining matrix encoding: point
+// matching, X_AND_Y_SCALE, and TWO_BY_TWO with a scaled offset.
+fn composite_matrices() -> Bytes
+    // words, and NO ARGS_ARE_XY_VALUES: the two args are point indices
+    let c0 = bytes.u16_be(0x0021) + bytes.u16_be(3)
+           + bytes.u16_be(4) + bytes.u16_be(9)   // parent point 4, child point 9
+    // xy values, byte args, X_AND_Y_SCALE, more
+    let c1 = bytes.u16_be(0x0062) + bytes.u16_be(11)
+           + bytes_of([0x0A, 0xF6])   // +10, -10
+           + bytes_of([0x40, 0x00, 0x20, 0x00])   // a 1.0, d 0.5
+    // words, xy values, TWO_BY_TWO, SCALED_COMPONENT_OFFSET, last
+    let c2 = bytes.u16_be(0x0883) + bytes.u16_be(13)
+           + bytes.u16_be(100) + bytes.u16_be(200)   // +100, +200
+           // xx .25 (0x1000), yx .125 (0x0800), xy .5 (0x2000), yy -1 (0xC000 —
+           // F2Dot14 is a SIGNED value, so -1.0 is the two's complement)
+           + bytes_of([0x10, 0, 0x08, 0, 0x20, 0, 0xC0, 0])
+    composite_header() + c0 + c1 + c2
+
+// ── Reading a path back ──────────────────────────────────────────────
+
+// One command as numbers: its kind, and up to four coordinates.  A move
+// and a line use `a` and `b`; a quadratic uses all four.  Kinds are 0
+// move, 1 line, 2 quadratic, 3 close — and -1 for a command this record
+// never writes, so a wrong shape fails instead of passing.
+struct Cmd
+    kind: Int
+    a: Float
+    b: Float
+    c: Float
+    d: Float
+
+// The command at `i`, or a kind of -1 when the path is shorter than the
+// table expects.
+fn cmd_at(cmds: [SvgPathCmd], i: Int) -> Cmd
+    match list.nth(cmds, i)
+        Some(c) => cmd_of(c)
+        None    => Cmd { kind: 0 - 1, a: 0.0, b: 0.0, c: 0.0, d: 0.0 }
+
+// One command's payload, with the fields it does not carry at zero.
+fn cmd_of(c: SvgPathCmd) -> Cmd
+    match c
+        SvgMoveTo(x, y)         => Cmd { kind: 0, a: x, b: y, c: 0.0, d: 0.0 }
+        SvgLineTo(x, y)         => Cmd { kind: 1, a: x, b: y, c: 0.0, d: 0.0 }
+        SvgQuadTo(x1, y1, x, y) => Cmd { kind: 2, a: x1, b: y1, c: x, d: y }
+        SvgClosePath            => Cmd { kind: 3, a: 0.0, b: 0.0, c: 0.0, d: 0.0 }
+        _                       => Cmd { kind: 0 - 1, a: 0.0, b: 0.0, c: 0.0, d: 0.0 }
+
+// A move to `(x, y)`.
+fn move_cmd(x: Float, y: Float) -> Cmd
+    Cmd { kind: 0, a: x, b: y, c: 0.0, d: 0.0 }
+
+// A line to `(x, y)`.
+fn line_cmd(x: Float, y: Float) -> Cmd
+    Cmd { kind: 1, a: x, b: y, c: 0.0, d: 0.0 }
+
+// A quadratic with control `(x1, y1)` ending at `(x, y)`.
+fn quad_cmd(x1: Float, y1: Float, x: Float, y: Float) -> Cmd
+    Cmd { kind: 2, a: x1, b: y1, c: x, d: y }
+
+// The close of a contour.
+fn close_cmd() -> Cmd
+    Cmd { kind: 3, a: 0.0, b: 0.0, c: 0.0, d: 0.0 }
+
+// Assert that command `i` is `want`, number by number, at a tolerance of
+// exactly zero — see the header for why zero is the honest value.
+fn assert_cmd(cmds: [SvgPathCmd], i: Int, want: Cmd)
+    let got = cmd_at(cmds, i)
+    test.assert(got.kind == want.kind)
+    test.assert_approx(got.a, want.a, 0.0)
+    test.assert_approx(got.b, want.b, 0.0)
+    test.assert_approx(got.c, want.c, 0.0)
+    test.assert_approx(got.d, want.d, 0.0)
+
+// ── `loca` ───────────────────────────────────────────────────────────
+
+@test
+fn test_loca_refuses_a_table_that_cannot_hold_its_terminator() [io]
+    test.case("THE CLAIM: the length is one entry per glyph PLUS the terminator")
+    match fontglyf.parse_loca(bytes_of([0, 0, 0, 64]), 4, false)
+        Err(FontShort(t, want, have)) =>
+            test.assert(t == fontdir.tag_loca() and want == 10 and have == 4)
+        _                             => test.assert(false)
+
+    test.case("the long format is twice the size, and refused by its own length")
+    match fontglyf.parse_loca(bytes.zeros(16), 4, true)
+        Err(FontShort(_, want, have)) => test.assert(want == 20 and have == 16)
+        _                             => test.assert(false)
+
+    test.case("and a font with no glyphs still needs its one terminator")
+    match fontglyf.parse_loca(bytes_of([0]), 0, false)
+        Err(FontShort(_, want, have)) => test.assert(want == 2 and have == 1)
+        _                             => test.assert(false)
+
+    test.case("a glyph id past the last one has no file offset either")
+    match fontglyf.parse_loca(bytes_of([0, 0, 0, 32, 0, 32, 0, 64]), 3, false)
+        Err(_) => test.assert(false)
+        Ok(l)  =>
+            test.assert(fontglyf.loca_glyph_count(l) == 3)
+            match fontglyf.glyph_file_range(l, fontsrc.range(1000, 100), 9)
+                None    => test.assert(true)
+                Some(_) => test.assert(false)
+
+// ── The outline, and the round trip ──────────────────────────────────
+
+@test
+fn test_the_outline_round_trips_the_record_the_font_wrote() [io]
+    match fontglyf.outline(rich_glyph())
+        Err(_) => test.assert(false)
+        Ok(p)  =>
+            let cmds = svgpath.commands_of(p)
+
+            test.case("THE CLAIM: five contours, nineteen commands, every number exact")
+            test.assert(list.len(cmds) == 19)
+
+            test.case("contour 0 starts at a point that is ON the curve")
+            assert_cmd(cmds, 0, move_cmd(0.0, 0.0))
+            assert_cmd(cmds, 1, quad_cmd(20.0, 40.0, 40.0, 0.0))
+            assert_cmd(cmds, 2, quad_cmd(20.0, 0.0 - 40.0, 0.0, 0.0))
+            assert_cmd(cmds, 3, close_cmd())
+
+            test.case("contour 1 is two on-curve points, so it is a LINE")
+            assert_cmd(cmds, 4, move_cmd(100.0, 0.0))
+            assert_cmd(cmds, 5, line_cmd(140.0, 0.0))
+            assert_cmd(cmds, 6, close_cmd())
+
+            test.case("contour 2 starts at its LAST point, the one that is on the curve, and")
+            assert_cmd(cmds, 7, move_cmd(300.0, 0.0))
+            test.case("three off-curve points in a row put the MIDPOINTS on the curve")
+            // (180+220)/2 = 200, then (220+260)/2 = 240, and finally the
+            // segment back to the start, whose control is the last one.
+            assert_cmd(cmds, 8, quad_cmd(180.0, 0.0, 200.0, 0.0))
+            assert_cmd(cmds, 9, quad_cmd(220.0, 0.0, 240.0, 0.0))
+            assert_cmd(cmds, 10, quad_cmd(260.0, 0.0, 300.0, 0.0))
+            assert_cmd(cmds, 11, close_cmd())
+
+            test.case("contour 3 has no on-curve point at all, so it starts at the midpoint")
+            // (340 + 380) / 2 = 360, and each off-curve point is the control of
+            // one quadratic that ends there.
+            assert_cmd(cmds, 12, move_cmd(360.0, 0.0))
+            assert_cmd(cmds, 13, quad_cmd(340.0, 0.0, 360.0, 0.0))
+            assert_cmd(cmds, 14, quad_cmd(380.0, 0.0, 360.0, 0.0))
+            assert_cmd(cmds, 15, close_cmd())
+
+            test.case("THE IMPLIED POINT: contour 4 is off-curve FIRST, so it starts on the last")
+            assert_cmd(cmds, 16, move_cmd(420.0, 0.0))
+            assert_cmd(cmds, 17, quad_cmd(400.0, 0.0, 420.0, 0.0))
+            assert_cmd(cmds, 18, close_cmd())
+
+            test.case("and the tight box is the CURVE's, not the control points' box")
+            let tight = fontglyf.bounds_from_points(p)
+            // Each quadratic reaches half its control point's reach: the
+            // y of ±40 gives ±20, while x runs 0 to 420.
+            test.assert_approx(geomrect.width(tight), 420.0, 0.0)
+            test.assert_approx(geomrect.height(tight), 40.0, 0.0)
+            test.assert_approx(tight.min.y, 0.0 - 20.0, 0.0)
+            test.assert_approx(tight.max.y, 20.0, 0.0)
+
+// ── Records that name no outline, or one that runs backwards ─────────
+
+// A two-contour record whose end points go BACKWARDS: the ends are 3 and
+// then 1, so the second contour starts after it finishes.  Two points
+// are written, which is what the last end (1) asks for, and both are on
+// the curve.
+fn descending_ends() -> Bytes
+    let head = bytes_of([0, 2,   // two contours
+                         0, 0, 0, 0, 0, 0, 0, 0])   // an empty box
+    let ends = bytes.u16_be(3) + bytes.u16_be(1)
+    let instr = bytes.u16_be(0)
+    let flags = bytes_of([0x31,   // P0 on,  x 0, y 0
+                          0x21])   // P1 on,  16-bit x, y 0
+    let xs = bytes_of([0, 50])   // P1 at +50
+    head + ends + instr + flags + xs
+
+@test
+fn test_a_contour_that_ends_before_it_starts_adds_no_commands() [io]
+    test.case("THE CLAIM: the ends are read as written, and a backwards one is a contour of none")
+    match fontglyf.outline(descending_ends())
+        Err(_) => test.assert(false)
+        Ok(p)  =>
+            let cmds = svgpath.commands_of(p)
+            // The first contour is points 0..3; only 0 and 1 were
+            // written, and the two past the end read as the origin and
+            // as ON the curve, so they close the run with lines.
+            test.assert(list.len(cmds) == 5)
+            assert_cmd(cmds, 0, move_cmd(0.0, 0.0))
+            assert_cmd(cmds, 1, line_cmd(50.0, 0.0))
+            test.case("and nothing at all is appended for the contour that runs backwards")
+            assert_cmd(cmds, 4, close_cmd())
+
+@test
+fn test_a_record_with_no_outline_of_its_own_answers_an_empty_path() [io]
+    test.case("THE CLAIM: a record with no contours is a space, not an error")
+    match fontglyf.outline(bytes.from_str(""))
+        Err(_) => test.assert(false)
+        Ok(p)  => test.assert(svgpath.command_count(p) == 0)
+
+    test.case("and a composite has no outline of its own — its components do")
+    match fontglyf.outline(composite_bytes())
+        Err(_) => test.assert(false)
+        Ok(p)  => test.assert(svgpath.command_count(p) == 0)
+
+// ── The refusals ─────────────────────────────────────────────────────
+
+@test
+fn test_a_record_cut_anywhere_past_its_header_names_the_field_it_ran_out_of() [io]
+    test.case("THE CLAIM: under ten bytes there is not even a header")
+    match fontglyf.outline(bytes_of([0, 1, 0, 0]))
+        Err(FontShort(t, want, have)) =>
+            test.assert(t == fontdir.tag_glyf() and want == 10 and have == 4)
+        _                             => test.assert(false)
+
+    test.case("a count of two contours with room for one is short by the count")
+    var two = bytes.zeros(12)
+    bytes.set_u16_be(two, 0, 2)
+    match fontglyf.outline(two)
+        Err(FontShort(_, want, have)) => test.assert(want == 14 and have == 12)
+        _                             => test.assert(false)
+
+    test.case("and a header that ends where the instruction length should be names it")
+    match fontglyf.outline(one_point_record(12))
+        Err(FontBadField(_, "instructionLength", at)) => test.assert(at == 12)
+        _                                             => test.assert(false)
+
+    test.case("instruction bytes that run past the end name the length that did it")
+    match fontglyf.outline(one_point_with_instructions(5))
+        Err(FontBadField(_, "instructions", n)) => test.assert(n == 5)
+        _                                       => test.assert(false)
+
+    test.case("a flag run cut before a flag names the count decoded so far")
+    match fontglyf.outline(one_point_with_flags([]))
+        Err(FontBadField(_, "flags", k)) => test.assert(k == 0)
+        _                                => test.assert(false)
+
+    test.case("and cut before a REPEAT COUNT it names the flag it just read")
+    match fontglyf.outline(one_point_with_flags([9]))
+        Err(FontBadField(_, "flags", k)) => test.assert(k == 1)
+        _                                => test.assert(false)
+
+    test.case("the x bytes are a separate run, and they say so")
+    match fontglyf.outline(one_point_with_flags([0x13]))
+        Err(FontBadField(_, "xCoordinates", at)) => test.assert(at == 15)
+        _                                        => test.assert(false)
+    match fontglyf.outline(one_point_with_flags([0x01]))
+        Err(FontBadField(_, "xCoordinates", at)) => test.assert(at == 15)
+        _                                        => test.assert(false)
+
+    test.case("so are the y bytes, after a flag that spends none on x")
+    match fontglyf.outline(one_point_with_flags([0x15]))
+        Err(FontBadField(_, "yCoordinates", at)) => test.assert(at == 15)
+        _                                        => test.assert(false)
+    match fontglyf.outline(one_point_with_flags([0x11]))
+        Err(FontBadField(_, "yCoordinates", at)) => test.assert(at == 15)
+        _                                        => test.assert(false)
+
+@test
+fn test_a_point_count_refuses_a_record_it_cannot_index() [io]
+    test.case("THE CLAIM: an empty record and a composite have no count, not a negative one")
+    test.assert(fontglyf.point_count(bytes.from_str("")) == 0)
+    test.assert(fontglyf.point_count(composite_bytes()) == 0)
+
+    test.case("a simple record cut before its end points is 0, not a read past the end")
+    test.assert(fontglyf.point_count(bytes_of([0, 2, 0, 0, 0, 0, 0, 0, 0, 0])) == 0)
+
+    test.case("and a whole one is the last contour's end plus one")
+    test.assert(fontglyf.point_count(rich_glyph()) == 14)
+
+// ── Composites ───────────────────────────────────────────────────────
+
+@test
+fn test_the_composite_flags_name_their_matrix_and_their_offset() [io]
+    test.case("a simple record has no components, and the question is still answerable")
+    match fontglyf.components(rich_glyph())
+        Err(_) => test.assert(false)
+        Ok(cs) => test.assert(list.len(cs) == 0)
+
+    test.case("THE CLAIM: WE_HAVE_A_SCALE is ONE F2Dot14, and it sets both axes")
+    match fontglyf.components(composite_scale())
+        Err(_) => test.assert(false)
+        Ok(cs) =>
+            test.assert(list.len(cs) == 1)
+            let c = list.get(cs, 0)
+            test.assert(c.glyph == 5)
+            test.assert_approx(c.xform.a, 0.5, 0.0)
+            test.assert_approx(c.xform.d, 0.5, 0.0)
+            test.assert_approx(c.xform.b, 0.0, 0.0)
+            test.assert_approx(c.xform.c, 0.0, 0.0)
+
+            test.case("and a 16-bit offset is NOT scaled unless the flag says so")
+            test.assert_approx(c.xform.e, 100.0, 0.0)
+            test.assert_approx(c.xform.f, 0.0 - 500.0, 0.0)
+            test.assert(not c.scaled_offset)
+            test.assert(not c.point_match)
+            test.assert(fontglyf.metrics_component(cs) == 0 - 1)
+
+    test.case("byte arguments are SIGNED, and USE_MY_METRICS picks the metrics")
+    match fontglyf.components(composite_bytes())
+        Err(_) => test.assert(false)
+        Ok(cs) =>
+            test.assert(list.len(cs) == 2)
+            test.assert(list.get(cs, 0).glyph == 7)
+            test.assert_approx(list.get(cs, 0).xform.e, 0.0 - 20.0, 0.0)
+            test.assert_approx(list.get(cs, 0).xform.f, 20.0, 0.0)
+            test.assert(not list.get(cs, 0).use_my_metrics)
+            test.assert(list.get(cs, 1).use_my_metrics)
+            test.assert(fontglyf.metrics_component(cs) == 1)
+
+    test.case("point matching is kept as indices, and the two components still compose")
+    match fontglyf.components(composite_matrices())
+        Err(_) => test.assert(false)
+        Ok(cs) =>
+            test.assert(list.len(cs) == 3)
+            let a = list.get(cs, 0)
+            test.assert(a.glyph == 3)
+            test.assert(a.point_match)
+            test.assert(a.parent_point == 4)
+            test.assert(a.child_point == 9)
+            test.assert(geomxform.is_identity(a.xform))
+
+            test.case("X_AND_Y_SCALE is two F2Dot14s, one per axis")
+            let b = list.get(cs, 1)
+            test.assert(b.glyph == 11)
+            test.assert_approx(b.xform.a, 1.0, 0.0)
+            test.assert_approx(b.xform.d, 0.5, 0.0)
+            test.assert_approx(b.xform.e, 10.0, 0.0)
+            test.assert_approx(b.xform.f, 0.0 - 10.0, 0.0)
+
+            test.case("TWO_BY_TWO is four of them, and the offset goes through the matrix")
+            let d = list.get(cs, 2)
+            test.assert(d.glyph == 13)
+            test.assert_approx(d.xform.a, 0.25, 0.0)
+            test.assert_approx(d.xform.b, 0.125, 0.0)
+            test.assert_approx(d.xform.c, 0.5, 0.0)
+            test.assert_approx(d.xform.d, 0.0 - 1.0, 0.0)
+            test.assert(d.scaled_offset)
+            // (0.25 * 100) + (0.5 * 200) = 125, and (0.125 * 100) + (-1.0 * 200) = -187.5
+            test.assert_approx(d.xform.e, 125.0, 0.0)
+            test.assert_approx(d.xform.f, 0.0 - 187.5, 0.0)
+
+            test.case("and every id the composite names comes back in order")
+            let ids = fontglyf.component_glyphs(cs)
+            test.assert(list.len(ids) == 3)
+            test.assert(list.get(ids, 0) == 3)
+            test.assert(list.get(ids, 1) == 11)
+            test.assert(list.get(ids, 2) == 13)
+            test.assert(fontglyf.names_itself(11, cs))
+            test.assert(not fontglyf.names_itself(12, cs))
+
+@test
+fn test_compose_places_every_component_or_names_the_one_it_cannot() [io]
+    let dot = svgpath.move_to(svgpath.empty(), 1.0, 2.0)
+
+    test.case("THE CLAIM: each part is placed by its own component's matrix, in order")
+    match fontglyf.compose(composite_bytes(), [dot, dot])
+        Err(_) => test.assert(false)
+        Ok(p)  =>
+            let cmds = svgpath.commands_of(p)
+            test.assert(list.len(cmds) == 2)
+            // The dot is written at (1, 2); the first component carries it
+            // by (-20, +20), so the point itself lands at (-19, 22).
+            assert_cmd(cmds, 0, move_cmd(0.0 - 19.0, 22.0))
+            assert_cmd(cmds, 1, move_cmd(1.0, 2.0))
+
+    test.case("and a point-matching component is refused, not placed by its indices")
+    match fontglyf.compose(composite_matrices(), [dot, dot, dot])
+        Err(FontBadField(_, "pointMatch", gid)) => test.assert(gid == 3)
+        _                                       => test.assert(false)
+
+    test.case("more paths than components names the component nothing answers for")
+    match fontglyf.compose(one_point_record(14), [dot])
+        Err(FontComponentMissing(gid, have)) => test.assert(gid == 0 and have == 1)
+        _                                    => test.assert(false)

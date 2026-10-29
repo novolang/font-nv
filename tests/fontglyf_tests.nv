@@ -114,8 +114,12 @@ fn test_a_negative_contour_count_is_a_composite_and_says_so_in_two_bytes() [io]
 
 @test
 fn test_a_composite_is_answered_rather_than_followed() [io]
+    // The ten-byte header, then one component: glyph 5, placed by byte
+    // offsets (0, 0).
     let composite = bytes.concat([bytes.from_byte_list([255, 255]), bytes.u16_be(0),
-                                  bytes.u16_be(0), bytes.u16_be(100), bytes.u16_be(200)])
+                                  bytes.u16_be(0), bytes.u16_be(100), bytes.u16_be(200),
+                                  bytes.u16_be(2), bytes.u16_be(5),
+                                  bytes.from_byte_list([0, 0])])
 
     test.case("THE CLAIM: the package names the components; the HOST reads them")
     match fontglyf.components(composite)

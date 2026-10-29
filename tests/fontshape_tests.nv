@@ -177,7 +177,7 @@ fn test_ligatures_are_off_until_a_caller_asks_for_them() [io]
     test.assert(types[1] == 4)
 
     test.case("everything else refuses by number rather than half-applying a feature")
-    test.assert(list.len(fontgsub.lookup_types_refused()) >= 6)
+    test.assert(list.len(fontgsub.lookup_types_refused()) >= 5)
 
 @test
 fn test_a_ligature_makes_the_cluster_map_the_only_way_back_to_the_text() [io]

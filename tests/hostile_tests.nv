@@ -1,0 +1,263 @@
+// hostile_tests.nv — tables built to make a reader do unbounded work.
+
+use std.test
+use std.list
+use std.bytes
+use fontdir
+use fontsrc
+use fontread
+use fontglyf
+use fontglyf.{ FontLoca }
+use fontgsub
+use fontkern
+use fontcff
+use geomxform
+use svgpath
+
+fn u16(v: Int) -> Bytes
+    bytes.u16_be(v)
+
+fn u32(v: Int) -> Bytes
+    bytes.u32_be(v)
+
+fn repeat_bytes(b: Bytes, times: Int) -> Bytes
+    var out = bytes.zeros(0)
+    var i = 0
+    while i < times
+        out = out + b
+        i = i + 1
+    out
+
+// ── Contour ends that run backwards ─────────────────────────────────
+
+// Contours alternating between ending at the last point and ending at
+// the first, over 1024 on-curve points.
+fn alternating_ends(pairs: Int) -> Bytes
+    let head = bytes.from_byte_list([0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+    let ends = repeat_bytes(u16(1023) + u16(0), pairs)
+    var flags = bytes.from_byte_list([0x39, 255, 0x39, 255, 0x39, 255, 0x39, 255])
+    u16(2 * pairs) + bytes.slice(head, 2, 10) + ends + u16(0) + flags
+
+@test
+fn test_contour_ends_that_run_backwards_do_not_repeat_points() [io]
+    match fontglyf.outline(alternating_ends(200))
+        Err(_) => test.fail("the record is well formed")
+        Ok(p)  =>
+            test.assert(list.len(svgpath.commands_of(p)) < 3000)
+
+// ── A composite glyph fan-out ───────────────────────────────────────
+
+// A composite record naming glyph `target` `times` times.
+fn composite_of(target: Int, times: Int) -> Bytes
+    var out = u16(0xFFFF) + bytes.from_byte_list([0, 0, 0, 0, 0, 0, 0, 0])
+    var i = 0
+    while i < times
+        var flags = 0x0003
+        if i + 1 < times
+            flags = 0x0023
+        out = out + u16(flags) + u16(target) + u16(0) + u16(0)
+        i = i + 1
+    out
+
+// Glyphs 0..4 each name the next `times` times; glyph 5 has no outline.
+fn fan_out(times: Int) -> (Bytes, fontglyf.FontLoca)
+    var glyf = bytes.zeros(0)
+    var offsets: [Int] = [0]
+    var g = 0
+    while g < 5
+        glyf = glyf + composite_of(g + 1, times)
+        list.push(offsets, bytes.len(glyf))
+        g = g + 1
+    list.push(offsets, bytes.len(glyf))
+    var table = bytes.zeros(0)
+    for o in offsets
+        table = table + u32(o)
+    match fontglyf.parse_loca(table, 6, true)
+        Ok(loca) => (glyf, loca)
+        Err(_)   => (glyf, FontLoca { offsets: [], long_format: true })
+
+fn face_over(glyf: Bytes) -> fontdir.FontFace
+    FontFace { sfnt: 65536, index: 0, face_count: 1,
+               tables: [FontTable { tag: fontdir.tag_glyf(), checksum: 0,
+                                    range: fontsrc.range(0, bytes.len(glyf)) }] }
+
+@test
+fn test_a_composite_that_fans_out_at_every_level_is_refused() [io]
+    let (glyf, loca) = fan_out(300)
+    match fontread.read_outline(fontread.buffer(glyf), face_over(glyf), loca, 0)
+        Ok(_)  => test.fail("300 to the fifth components are not drawn")
+        Err(_) => ()
+
+@test
+fn test_a_composite_of_a_few_parts_still_draws() [io]
+    let (glyf, loca) = fan_out(2)
+    match fontread.read_outline(fontread.buffer(glyf), face_over(glyf), loca, 0)
+        Ok(_)  => ()
+        Err(_) => test.fail("32 parts are well within the ceiling")
+
+// ── GSUB subtables sharing one coverage ─────────────────────────────
+
+// A GSUB header over one `liga` feature naming one single-substitution
+// lookup of `subtables` subtables that all share one coverage of every
+// glyph.
+fn shared_coverage_gsub(subtables: Int) -> Bytes
+    let latn = fontdir.tag_of("latn")
+    let liga = fontdir.tag_of("liga")
+    // 0: header; 10: script list; 30: feature list; 44: lookup list.
+    let header = u16(1) + u16(0) + u16(10) + u16(30) + u16(44)
+    let script_list = u16(1) + u32(latn) + u16(8) + u16(4) + u16(0)
+        + u16(0) + u16(0xFFFF) + u16(1) + u16(0)
+    let feature_list = u16(1) + u32(liga) + u16(8) + u16(0) + u16(1) + u16(0)
+    // The lookup list: one lookup at 4; the lookup is 6 + 2n bytes and
+    // its subtables follow.
+    let lookup_head = u16(1) + u16(4) + u16(1) + u16(0) + u16(subtables)
+    let sub_at = 4 + 6 + 2 * subtables
+    var offsets = bytes.zeros(0)
+    var i = 0
+    while i < subtables
+        offsets = offsets + u16(sub_at - 4)
+        i = i + 1
+    // The subtable: format 1, coverage 6 bytes on, delta 1.  The
+    // coverage: format 2, one range 0..65535.
+    let sub = u16(1) + u16(6) + u16(1) + u16(2) + u16(1) + u16(0) + u16(65535) + u16(0)
+    header + script_list + feature_list + lookup_head + offsets + sub
+
+@test
+fn test_gsub_subtables_that_share_a_coverage_are_not_expanded_per_path() [io]
+    let gsub = shared_coverage_gsub(20000)
+    match fontgsub.plan(gsub, fontdir.tag_of("latn"), 0, [fontdir.tag_of("liga")])
+        Ok(_)  => test.fail("20000 subtables of 65536 substitutions are not read")
+        Err(_) => ()
+
+@test
+fn test_gsub_with_one_shared_subtable_still_plans() [io]
+    let gsub = shared_coverage_gsub(1)
+    match fontgsub.plan(gsub, fontdir.tag_of("latn"), 0, [fontdir.tag_of("liga")])
+        Ok(p)  => test.assert(list.len(fontgsub.singles(p)) == 65536)
+        Err(_) => test.fail("one subtable is well within the ceiling")
+
+// ── GPOS pair adjustment with an empty value record ─────────────────
+
+// A GPOS header over one `kern` feature naming one pair-adjustment
+// lookup whose `subtables` subtables all share `sub`.
+fn gpos_with(sub: Bytes, subtables: Int) -> Bytes
+    let latn = fontdir.tag_of("latn")
+    let kern = fontdir.tag_of("kern")
+    let header = u16(1) + u16(0) + u16(10) + u16(30) + u16(44)
+    let script_list = u16(1) + u32(latn) + u16(8) + u16(4) + u16(0)
+        + u16(0) + u16(0xFFFF) + u16(1) + u16(0)
+    let feature_list = u16(1) + u32(kern) + u16(8) + u16(0) + u16(1) + u16(0)
+    let lookup_head = u16(1) + u16(4) + u16(2) + u16(0) + u16(subtables)
+    let sub_at = 4 + 6 + 2 * subtables
+    var offsets = bytes.zeros(0)
+    var i = 0
+    while i < subtables
+        offsets = offsets + u16(sub_at - 4)
+        i = i + 1
+    header + script_list + feature_list + lookup_head + offsets + sub
+
+@test
+fn test_a_class_matrix_of_zero_byte_records_is_not_expanded() [io]
+    // Format 2, both value formats empty, 65535 by 65535 classes; the
+    // coverage and both class definitions are empty tables after it.
+    let sub = u16(2) + u16(16) + u16(0) + u16(0) + u16(20) + u16(24)
+        + u16(65535) + u16(65535) + u16(1) + u16(0) + u16(2) + u16(0) + u16(2) + u16(0)
+    match fontkern.plan(gpos_with(sub, 1), bytes.zeros(0), fontdir.tag_of("latn"), 0)
+        Ok(p)  => test.assert(fontkern.kerns_nothing(p))
+        Err(_) => test.fail("a matrix of empty records adjusts nothing")
+
+@test
+fn test_gpos_subtables_that_share_a_wide_coverage_are_not_expanded_per_path() [io]
+    // Format 2 with one class cell of one x advance, a coverage of every
+    // glyph and an empty class definition.
+    let sub = u16(2) + u16(18) + u16(4) + u16(0) + u16(28) + u16(32)
+        + u16(1) + u16(1) + u16(0)
+        + u16(2) + u16(1) + u16(0) + u16(65535) + u16(0)
+        + u16(2) + u16(0) + u16(2) + u16(0)
+    match fontkern.plan(gpos_with(sub, 20000), bytes.zeros(0), fontdir.tag_of("latn"), 0)
+        Ok(_)  => test.fail("20000 subtables of 65536 covered glyphs are not read")
+        Err(_) => ()
+
+// ── CFF: huge exponent, huge private size, subroutine fan-out ───────
+
+fn cff_index(bodies: [Bytes]) -> Bytes
+    if list.len(bodies) == 0
+        return u16(0)
+    var offsets = u16(1)
+    var data = bytes.zeros(0)
+    for b in bodies
+        data = data + b
+        offsets = offsets + u16(bytes.len(data) + 1)
+    u16(list.len(bodies)) + bytes.from_byte_list([2]) + offsets + data
+
+// A CFF table whose top DICT is `dict` followed by a CharStrings
+// operator naming the one-glyph index placed after the other indexes.
+fn cff_with_dict(dict: Bytes) -> Bytes
+    let head = bytes.from_byte_list([1, 0, 4, 2])
+    let names = cff_index([bytes.from_byte_list([97])])
+    let top_len = bytes.len(dict) + 4
+    let strings = cff_index([])
+    let globals = cff_index([])
+    let top_ix_len = 3 + 2 * 2 + top_len
+    let cs_at = 4 + bytes.len(names) + top_ix_len + 2 + 2
+    let full = dict + bytes.from_byte_list([28]) + u16(cs_at) + bytes.from_byte_list([17])
+    head + names + cff_index([full]) + strings + globals
+        + cff_index([bytes.from_byte_list([14])])
+
+// A real operand of 1e followed by 22 nines, then the operator for
+// `version`.
+fn huge_exponent() -> Bytes
+    bytes.from_byte_list([30, 0x1B, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99,
+                          0x99, 0x99, 0x99, 0xFF, 0])
+
+// A Private DICT operator naming a size of 1e15 bytes at offset 0.
+fn huge_private() -> Bytes
+    bytes.from_byte_list([30, 0x1B, 0x15, 0xFF, 139, 18])
+
+@test
+fn test_a_real_number_with_a_huge_exponent_is_read_without_overflow() [io]
+    let table = cff_with_dict(huge_exponent())
+    match fontcff.parse_top(table, fontsrc.range(0, bytes.len(table)))
+        Ok(_)  => ()
+        Err(_) => ()
+
+@test
+fn test_a_private_dict_of_a_huge_declared_size_is_read_in_bounds() [io]
+    let table = cff_with_dict(huge_private())
+    match fontcff.parse_top(table, fontsrc.range(0, bytes.len(table)))
+        Ok(_)  => ()
+        Err(_) => ()
+
+@test
+fn test_an_honest_top_dict_parses() [io]
+    let table = cff_with_dict(bytes.from_byte_list([]))
+    match fontcff.parse_top(table, fontsrc.range(0, bytes.len(table)))
+        Ok(top) => test.assert(fontcff.glyph_count(top, table) == 1)
+        Err(_)  => test.fail("the table is well formed")
+
+// Subroutine j calls subroutine j+1 two hundred times; the last
+// returns.
+fn fan_out_subrs() -> Bytes
+    var bodies: [Bytes] = []
+    var j = 0
+    while j < 10
+        if j == 9
+            list.push(bodies, bytes.from_byte_list([11]))
+        else
+            list.push(bodies, repeat_bytes(bytes.from_byte_list([j + 33, 29]), 200)
+                              + bytes.from_byte_list([11]))
+        j = j + 1
+    cff_index(bodies)
+
+@test
+fn test_subroutines_that_call_subroutines_two_hundred_times_are_cut_off() [io]
+    let subrs = fan_out_subrs()
+    let top = FontCffTop { charstrings: fontsrc.empty(0), private: fontsrc.empty(0),
+                           local_subrs: fontsrc.empty(0),
+                           global_subrs: fontsrc.range(0, bytes.len(subrs)),
+                           charset: fontsrc.empty(0), matrix: geomxform.identity(),
+                           default_width: 0.0, nominal_width: 0.0, is_cid: false }
+    let cs = repeat_bytes(bytes.from_byte_list([32, 29]), 200) + bytes.from_byte_list([14])
+    match fontcff.charstring_outline(cs, subrs, top, 0)
+        Ok(_)  => test.fail("200 to the tenth calls are not run")
+        Err(_) => ()

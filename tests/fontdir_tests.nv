@@ -209,5 +209,5 @@ fn test_the_head_table_is_the_checksum_exception_every_font_trips() [io]
 
     test.case("and head excludes its own checkSumAdjustment, or every font fails")
     let head_tbl = FontTable { tag: fontdir.tag_head(), checksum: 0,
-                               range: fontsrc.range(0, 8) }
-    test.assert(fontdir.checksum_matches(head_tbl, bytes.from_byte_list([0, 0, 0, 0, 9, 9, 9, 9])))
+                               range: fontsrc.range(0, 12) }
+    test.assert(fontdir.checksum_matches(head_tbl, bytes.from_byte_list([0, 0, 0, 0, 0, 0, 0, 0, 9, 9, 9, 9])))

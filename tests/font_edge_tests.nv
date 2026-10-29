@@ -1,0 +1,507 @@
+// font_edge_tests.nv — the second half of each parser: the length
+// checks, the clamps, and the fields a conformant font never holds.
+//
+// WHY THIS SUITE EXISTS.  The six suites that came with the interface
+// release are the oracle — each one asserts what its name says, over
+// one small fixture, and they are the reason the implementation answers
+// at all.  A binary parser has a second half, though: every `FontShort`
+// a truncated table reaches, every `FontBadField` a bent field reaches,
+// every clamp in the range arithmetic.  Those lines are what a hostile
+// or merely subset font executes first, and they are executed here
+// rather than excused, because a length check that no test runs is a
+// length check nobody has seen answer.
+//
+// The fixtures are assembled field by field — `bytes.zeros(n)` and the
+// big-endian setters — so each one differs from a good table in exactly
+// the field the case names.
+
+use std.test
+use std.list
+use std.bytes
+use fontsrc
+use fontdir
+use fonterror
+use fontmetric
+
+// A buffer from the numbers a fixture is written as.
+fn bytes_of(xs: [Int]) -> Bytes
+    bytes.from_byte_list(xs)
+
+// A 54-byte `head` that parses, before any field is bent.
+fn head_bytes() -> Bytes
+    var h = bytes.zeros(54)
+    bytes.set_u32_be(h, 12, 0x5F0F3CF5)
+    bytes.set_u16_be(h, 18, 1000)
+    bytes.set_u16_be(h, 36, 0xFF9C)
+    bytes.set_u16_be(h, 44, 1)
+    bytes.set_u16_be(h, 46, 8)
+    h
+
+// A 36-byte `hhea` that parses, before any field is bent.
+fn hhea_bytes() -> Bytes
+    var h = bytes.zeros(36)
+    bytes.set_u32_be(h, 0, 0x00010000)
+    bytes.set_u16_be(h, 4, 800)
+    bytes.set_u16_be(h, 6, 0xFE0C)
+    bytes.set_u16_be(h, 34, 2)
+    h
+
+// A 32-byte `maxp` version 1.0.
+fn maxp_v1() -> Bytes
+    var m = bytes.zeros(32)
+    bytes.set_u32_be(m, 0, 0x00010000)
+    bytes.set_u16_be(m, 4, 300)
+    bytes.set_u16_be(m, 30, 5)
+    m
+
+// An `OS/2` of `n` bytes at `version`, with the x-height fields filled.
+fn os2_bytes(version: Int, n: Int) -> Bytes
+    var o = bytes.zeros(n)
+    bytes.set_u16_be(o, 0, version)
+    bytes.set_u16_be(o, 62, 0x0040)
+    if n >= 90
+        bytes.set_u16_be(o, 86, 500)
+        bytes.set_u16_be(o, 88, 700)
+    o
+
+// A `head` claiming `mac`, and no other field of interest.
+fn head_with_style(mac: Int) -> FontHead
+    FontHead { units_per_em: 1000, x_min: 0, y_min: 0, x_max: 0, y_max: 0,
+               flags: 0, mac_style: mac, index_to_loc_format: 0, lowest_rec_ppem: 8 }
+
+// An `OS/2` claiming `sel`, and no other field of interest.
+fn os2_with_selection(sel: Int) -> FontOs2
+    FontOs2 { typo_ascender: 0, typo_descender: 0, typo_line_gap: 0,
+              win_ascent: 0, win_descent: 0, x_height: 0, cap_height: 0,
+              fs_selection: sel, version: 0 }
+
+// ── fontsrc: the clamps ──────────────────────────────────────────────
+
+@test
+fn test_the_range_arithmetic_clamps_instead_of_escaping() [io]
+    let outer = fontsrc.range(100, 40)
+
+    test.case("THE CLAIM: a sub-range is clipped into its outer range at both ends")
+    let lo_clip = fontsrc.sub(outer, 0 - 20, 10)
+    test.assert(lo_clip.at == 100 and lo_clip.len == 10)
+
+    let hi_clip = fontsrc.sub(outer, 1000, 5)
+    test.assert(hi_clip.at == 140 and hi_clip.len == 0)
+
+    let end_clip = fontsrc.sub(outer, 35, 10)
+    test.assert(end_clip.at == 135 and end_clip.len == 5)
+
+    test.case("a negative length is a zero, not a range that runs backwards")
+    let negative = fontsrc.sub(outer, 5, 0 - 3)
+    test.assert(negative.at == 105 and negative.len == 0)
+
+    test.case("the empty range is a word for the common case, and it is empty")
+    test.assert(fontsrc.empty(9).len == 0)
+    test.assert(fontsrc.is_empty(fontsrc.empty(9)))
+    test.assert(fontsrc.is_empty(fontsrc.range(0, 0 - 4)))
+
+    test.case("a slice of a file clamps the same way rather than panicking")
+    let file = bytes_of([1, 2, 3, 4, 5, 6, 7, 8])
+    test.assert(bytes.len(fontsrc.slice(file, fontsrc.range(0 - 5, 3))) == 0)
+    test.assert(bytes.len(fontsrc.slice(file, fontsrc.range(100, 5))) == 0)
+    test.assert(bytes.len(fontsrc.slice(file, fontsrc.range(2, 100))) == 6)
+    test.assert(bytes.len(fontsrc.slice(file, fontsrc.range(0, 8))) == 8)
+
+    test.case("and `range_fits` says no for either half being negative")
+    test.assert(not fontsrc.range_fits(fontsrc.range(0 - 1, 10), 100))
+    test.assert(not fontsrc.range_fits(fontsrc.range(0, 0 - 1), 100))
+    test.assert(fontsrc.range_fits(fontsrc.range(90, 10), 100))
+    test.assert(not fontsrc.range_fits(fontsrc.range(91, 10), 100))
+
+// ── fontdir: the refusals before the loop ────────────────────────────
+
+@test
+fn test_the_directory_refuses_what_it_cannot_read_and_parses_what_it_can() [io]
+    test.case("THE CLAIM: fewer than twelve bytes cannot hold an offset table")
+    match fontdir.parse_directory(bytes_of([0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]), 0)
+        Err(FontShort(t, _, have)) => test.assert(t == 0 and have == 11)
+        _                          => test.assert(false)
+
+    test.case("and four bytes that are not an sfnt version carry the word they are")
+    match fontdir.parse_directory(bytes.u32_be(0x12345678) + bytes.zeros(8), 0)
+        Err(FontNotSfnt(magic)) => test.assert(magic == 0x12345678)
+        _                       => test.assert(false)
+
+    test.case("a table count the bytes do not cover is refused before the loop")
+    match fontdir.parse_directory(bytes.u32_be(0x00010000) + bytes.u16_be(3)
+                                  + bytes.u16_be(0) + bytes.u16_be(0)
+                                  + bytes.u16_be(0),
+                                  0)
+        Err(FontShort(t, want, have)) =>
+            test.assert(t == 0 and want == 60 and have == 12)
+        _                             => test.assert(false)
+
+    test.case("a directory that IS there parses into tables the face's offset moves")
+    let dir = bytes.u32_be(0x00010000) + bytes.u16_be(2) + bytes.u16_be(0)
+            + bytes.u16_be(0) + bytes.u16_be(0)
+            + bytes.u32_be(fontdir.tag_cmap()) + bytes.u32_be(0x11111111)
+            + bytes.u32_be(32) + bytes.u32_be(4)
+            + bytes.u32_be(fontdir.tag_head()) + bytes.u32_be(0)
+            + bytes.u32_be(64) + bytes.u32_be(12)
+    match fontdir.parse_directory(dir, 100)
+        Err(_)   => test.assert(false)
+        Ok(face) =>
+            test.assert(fontdir.table_count(face) == 2)
+            test.assert(fontdir.flavour(face) == FontOutlinesGlyf)
+            match fontdir.table_range(face, fontdir.tag_cmap())
+                Some(r) => test.assert(r.at == 132 and r.len == 4)
+                None    => test.assert(false)
+
+    test.case("a collection's required list is empty: the faces inside carry the tables")
+    test.assert(list.len(fontdir.required_tags(FontOutlinesCollection)) == 0)
+
+    test.case("and a table that is not `head` checksums with no hole in it")
+    let data = bytes_of([1, 2, 3, 4, 5, 6, 7, 8])
+    let t = FontTable { tag: fontdir.tag_cmap(), checksum: fontdir.checksum(data),
+                        range: fontsrc.range(0, 8) }
+    test.assert(fontdir.checksum_matches(t, data))
+    test.assert(not fontdir.checksum_matches(FontTable { tag: fontdir.tag_cmap(),
+                                                     checksum: 0,
+                                                     range: fontsrc.range(0, 8) },
+                                         data))
+
+// ── fonterror: every variant answers every question ──────────────────
+
+@test
+fn test_every_fault_answers_its_table_its_severity_and_its_sentence() [io]
+    let faults: [FontFault] = [
+        FontShort(fontdir.tag_kern(), 12, 4),
+        FontNotSfnt(0x00010000),
+        FontNoSuchFace(4, 2),
+        FontNoTable(fontdir.tag_cmap()),
+        FontTableOutside(fontdir.tag_head(), 900, 54),
+        FontBadField(fontdir.tag_head(), "magicNumber", 0),
+        FontCmapFormat(6),
+        FontNoUsableCmap,
+        FontNoSuchGlyph(7, 3),
+        FontCompositeTooDeep(2, 11),
+        FontComponentMissing(1, 2),
+        FontCharstringOp(3072 + 35),
+        FontCharstringState("stack overflow"),
+        FontLookupType(fontdir.tag_gpos(), 3),
+        FontComplexScript(0x0644),
+        FontSourceFailed("connection reset")]
+
+    test.case("THE CLAIM: every fault describes itself and names its table or 0")
+    for f in faults
+        test.assert(fonterror.describe(f) != "")
+        test.assert(f.message() != "")
+        test.assert(fonterror.fault_table(f) >= 0)
+
+    test.case("and `is_recoverable` is `severity` asked the one-line way")
+    for f in faults
+        test.assert(fonterror.is_recoverable(f)
+                    == (fonterror.severity(f) != FontFatal))
+
+    test.case("the four optional tables cost kerning and substitution, not text")
+    for t in [fontdir.tag_kern(), fontdir.tag_gpos(),
+              fontdir.tag_gsub(), fontdir.tag_os2()]
+        test.assert(fonterror.severity(FontShort(t, 4, 0)) == FontDegraded)
+
+    test.case("the three outline tables cost one glyph each, not the line")
+    for t in [fontdir.tag_glyf(), fontdir.tag_loca(), fontdir.tag_cff()]
+        test.assert(fonterror.severity(FontShort(t, 4, 0)) == FontGlyphOnly)
+
+    test.case("and the tables the text itself lives in are fatal")
+    test.assert(fonterror.severity(FontShort(fontdir.tag_head(), 54, 0)) == FontFatal)
+    test.assert(fonterror.severity(FontNoTable(fontdir.tag_cmap())) == FontFatal)
+
+    test.case("a glyph fault substitutes glyph 0, which is .notdef, and anything else -1")
+    test.assert(fonterror.substitute_glyph(FontNoSuchGlyph(7, 3)) == 0)
+    test.assert(fonterror.substitute_glyph(FontNoUsableCmap) == 0 - 1)
+
+    test.case("the sentence spells the table's four characters, or `<none>` for 0")
+    test.assert(fonterror.describe(FontShort(fontdir.tag_head(), 54, 12))
+                == "the head table is short: 54 bytes wanted, 12 read")
+    test.assert(fonterror.describe(FontShort(0, 4, 2))
+                == "the <none> table is short: 4 bytes wanted, 2 read")
+    test.assert(fonterror.describe(FontNotSfnt(0x00010000))
+                != fonterror.describe(FontNotSfnt(0)))
+
+// ── fontmetric: the fields a conformant font holds ───────────────────
+
+@test
+fn test_head_refuses_the_three_fields_it_is_the_check_on() [io]
+    test.case("THE CLAIM: a good `head` answers its fields, signed where they are signed")
+    match fontmetric.parse_head(head_bytes())
+        Err(_) => test.assert(false)
+        Ok(h)  =>
+            test.assert(h.units_per_em == 1000)
+            test.assert(h.x_min == 0 - 100)
+            test.assert(h.mac_style == 1)
+            test.assert(h.lowest_rec_ppem == 8)
+
+    test.case("a wrong magicNumber is named as the field it is")
+    var bad_magic = head_bytes()
+    bytes.set_u32_be(bad_magic, 12, 0)
+    match fontmetric.parse_head(bad_magic)
+        Err(FontBadField(_, field, value)) => test.assert(field == "magicNumber" and value == 0)
+        _                                  => test.assert(false)
+
+    test.case("unitsPerEm outside 16..16384 is refused at both ends")
+    var small = head_bytes()
+    bytes.set_u16_be(small, 18, 15)
+    match fontmetric.parse_head(small)
+        Err(FontBadField(_, field, _)) => test.assert(field == "unitsPerEm")
+        _                              => test.assert(false)
+    var big = head_bytes()
+    bytes.set_u16_be(big, 18, 16385)
+    match fontmetric.parse_head(big)
+        Err(FontBadField(_, _, _)) => test.assert(true)
+        _                          => test.assert(false)
+
+    test.case("and indexToLocFormat is 0 or 1, because everything downstream trusts it")
+    var bad_loc = head_bytes()
+    bytes.set_u16_be(bad_loc, 50, 2)
+    match fontmetric.parse_head(bad_loc)
+        Err(FontBadField(_, field, _)) => test.assert(field == "indexToLocFormat")
+        _                              => test.assert(false)
+    var good_loc = head_bytes()
+    bytes.set_u16_be(good_loc, 50, 1)
+    match fontmetric.parse_head(good_loc)
+        Err(_) => test.assert(false)
+        Ok(h)  => test.assert(h.index_to_loc_format == 1)
+
+@test
+fn test_hhea_refuses_a_version_and_a_count_it_cannot_use() [io]
+    test.case("THE CLAIM: a good `hhea` answers its line metrics")
+    match fontmetric.parse_hhea(hhea_bytes())
+        Err(_) => test.assert(false)
+        Ok(hh) =>
+            test.assert(hh.ascender == 800)
+            test.assert(hh.descender == 0 - 500)
+            test.assert(hh.num_h_metrics == 2)
+            test.assert(not fontmetric.descender_sign_is_wrong(hh))
+
+    test.case("the version word is 1.0 and a different one is named")
+    var bad_version = hhea_bytes()
+    bytes.set_u32_be(bad_version, 0, 0x00020000)
+    match fontmetric.parse_hhea(bad_version)
+        Err(FontBadField(_, field, _)) => test.assert(field == "version")
+        _                              => test.assert(false)
+
+    test.case("and numberOfHMetrics of 0 is refused rather than answered with a zero advance")
+    var no_metrics = hhea_bytes()
+    bytes.set_u16_be(no_metrics, 34, 0)
+    match fontmetric.parse_hhea(no_metrics)
+        Err(FontBadField(_, field, _)) => test.assert(field == "numberOfHMetrics")
+        _                              => test.assert(false)
+
+    test.case("a descender stored positive is a font this package reports rather than flips")
+    var upside_down = hhea_bytes()
+    bytes.set_u16_be(upside_down, 6, 200)
+    match fontmetric.parse_hhea(upside_down)
+        Err(_) => test.assert(false)
+        Ok(hh) => test.assert(fontmetric.descender_sign_is_wrong(hh))
+
+@test
+fn test_maxp_reads_both_versions_it_publishes() [io]
+    test.case("THE CLAIM: version 1.0 is 32 bytes and has the composite depth")
+    match fontmetric.parse_maxp(maxp_v1())
+        Err(_) => test.assert(false)
+        Ok(m)  =>
+            test.assert(m.num_glyphs == 300)
+            test.assert(m.max_component_depth == 5)
+
+    test.case("version 0.5 is 6 bytes and has only the glyph count")
+    match fontmetric.parse_maxp(bytes.u32_be(0x00005000) + bytes.u16_be(3))
+        Err(_) => test.assert(false)
+        Ok(m)  => test.assert(m.num_glyphs == 3 and m.max_component_depth == 0)
+
+    test.case("a version 1.0 header cut at 6 bytes is short, not a glyph count alone")
+    match fontmetric.parse_maxp(bytes.u32_be(0x00010000) + bytes.u16_be(300))
+        Err(FontShort(t, want, _)) => test.assert(t == fontdir.tag_maxp() and want == 32)
+        _                          => test.assert(false)
+
+    test.case("fewer than six bytes cannot hold the version word")
+    match fontmetric.parse_maxp(bytes_of([0, 1, 0, 0, 0]))
+        Err(FontShort(_, want, _)) => test.assert(want == 6)
+        _                          => test.assert(false)
+
+    test.case("and a version that is neither is refused by number")
+    match fontmetric.parse_maxp(bytes.u32_be(0x00030000) + bytes.zeros(28))
+        Err(FontBadField(_, field, _)) => test.assert(field == "version")
+        _                              => test.assert(false)
+
+@test
+fn test_metrics_gathers_the_three_tables_and_derives_the_loca_format() [io]
+    let head = FontHead { units_per_em: 1000, x_min: 0 - 100, y_min: 0 - 20,
+                          x_max: 1024, y_max: 768, flags: 3, mac_style: 1,
+                          index_to_loc_format: 1, lowest_rec_ppem: 8 }
+    let hhea = FontHhea { ascender: 800, descender: 0 - 500, line_gap: 100,
+                          advance_max: 900, caret_slope_rise: 1,
+                          caret_slope_run: 0, num_h_metrics: 2 }
+    let maxp = FontMaxp { num_glyphs: 300, max_component_depth: 5 }
+
+    test.case("THE CLAIM: every number comes through from the table it was parsed from")
+    let m = fontmetric.metrics(head, hhea, maxp)
+    test.assert(m.units_per_em == 1000)
+    test.assert(m.x_min == 0 - 100 and m.y_min == 0 - 20)
+    test.assert(m.x_max == 1024 and m.y_max == 768)
+    test.assert(m.num_glyphs == 300)
+    test.assert(m.num_h_metrics == 2)
+    test.assert(m.advance_max == 900)
+
+    test.case("and `loca`'s format is the head's own field, answered as the flag it is")
+    test.assert(m.long_loca)
+    let short = FontHead { units_per_em: 1000, x_min: 0, y_min: 0, x_max: 0,
+                           y_max: 0, flags: 0, mac_style: 0,
+                           index_to_loc_format: 0, lowest_rec_ppem: 8 }
+    test.assert(not fontmetric.metrics(short, hhea, maxp).long_loca)
+
+@test
+fn test_os2_answers_the_version_it_was_given_and_no_more() [io]
+    test.case("THE CLAIM: version 0 is 78 bytes and has no x-height, which is separate")
+    match fontmetric.parse_os2(os2_bytes(0, 78))
+        Err(_) => test.assert(false)
+        Ok(o)  =>
+            test.assert(o.version == 0)
+            test.assert(not fontmetric.has_x_height(o))
+            test.assert(not fontmetric.has_cap_height(o))
+
+    test.case("version 1 is 86 bytes, still without the pair")
+    match fontmetric.parse_os2(os2_bytes(1, 86))
+        Err(_) => test.assert(false)
+        Ok(o)  => test.assert(o.version == 1 and not fontmetric.has_x_height(o))
+
+    test.case("version 2 is 96 bytes, and xHeight and sCapHeight are read")
+    match fontmetric.parse_os2(os2_bytes(2, 96))
+        Err(_) => test.assert(false)
+        Ok(o)  =>
+            test.assert(fontmetric.has_x_height(o))
+            test.assert(o.x_height == 500 and o.cap_height == 700)
+
+    test.case("version 5 is 100 bytes, the last one this package reads")
+    match fontmetric.parse_os2(os2_bytes(5, 100))
+        Err(_) => test.assert(false)
+        Ok(o)  => test.assert(o.version == 5)
+
+    test.case("a version outside 0..5 is refused by number, and the short ones are short")
+    match fontmetric.parse_os2(os2_bytes(6, 100))
+        Err(FontBadField(_, field, _)) => test.assert(field == "version")
+        _                              => test.assert(false)
+    match fontmetric.parse_os2(os2_bytes(0, 77))
+        Err(FontShort(t, want, have)) =>
+            test.assert(t == fontdir.tag_os2() and want == 78 and have == 77)
+        _                             => test.assert(false)
+    match fontmetric.parse_os2(bytes_of([0]))
+        Err(FontShort(_, want, _)) => test.assert(want == 2)
+        _                          => test.assert(false)
+
+@test
+fn test_hmtx_has_fewer_entries_than_the_font_has_glyphs() [io]
+    // two pairs and two side-bearing-only entries, for four glyphs.
+    let hmtx = bytes_of([0, 100, 0, 10, 0, 200, 0, 20, 0, 30, 0, 40])
+
+    test.case("THE CLAIM: a glyph past numberOfHMetrics takes the LAST pair's advance")
+    let last = fontmetric.h_metrics(hmtx, 2, 4, 3)
+    test.assert(last.advance == 200)
+    test.assert(last.lsb == 40)
+
+    test.case("the glyphs inside the count read their own pair")
+    let first = fontmetric.h_metrics(hmtx, 2, 4, 0)
+    test.assert(first.advance == 100 and first.lsb == 10)
+
+    test.case("a glyph past the glyph count answers the advance with no bearing")
+    let past = fontmetric.h_metrics(hmtx, 2, 2, 5)
+    test.assert(past.advance == 200 and past.lsb == 0)
+
+    test.case("a negative glyph answers zeros, because the caller's match failed")
+    let none = fontmetric.h_metrics(hmtx, 2, 4, 0 - 1)
+    test.assert(none.advance == 0 and none.lsb == 0)
+
+    test.case("and a font claiming no h-metrics at all does not read the LAST pair")
+    let odd = fontmetric.h_metrics(hmtx, 0, 4, 1)
+    test.assert(odd.advance == 0)
+
+    test.case("`advance_of` is the width a measuring caller wants")
+    test.assert(fontmetric.advance_of(hmtx, 2, 4, 1) == 200)
+
+    test.case("and `hmtx_len` never goes negative when the counts contradict")
+    test.assert(fontmetric.hmtx_len(2, 4) == 12)
+    test.assert(fontmetric.hmtx_len(2, 1) == 8)
+    test.assert(fontmetric.hmtx_len(1, 4) == 10)
+
+@test
+fn test_the_three_ascent_sets_are_kept_apart_and_compared() [io]
+    let hhea = FontHhea { ascender: 800, descender: 0 - 200, line_gap: 100,
+                          advance_max: 1000, caret_slope_rise: 1,
+                          caret_slope_run: 0, num_h_metrics: 1 }
+    let typo = FontOs2 { typo_ascender: 750, typo_descender: 0 - 250,
+                         typo_line_gap: 50, win_ascent: 780, win_descent: 220,
+                         x_height: 0, cap_height: 0, fs_selection: 128,
+                         version: 2 }
+    let matching = FontOs2 { typo_ascender: 800, typo_descender: 0 - 200,
+                             typo_line_gap: 100, win_ascent: 800,
+                             win_descent: 200, x_height: 0, cap_height: 0,
+                             fs_selection: 0, version: 2 }
+
+    test.case("THE CLAIM: `line_metrics` answers the set the caller named, sign normalised")
+    let t = fontmetric.line_metrics(hhea, typo, FontAscentTypo)
+    test.assert(t.ascent == 750 and t.descent == 0 - 250 and t.line_gap == 50)
+
+    let w = fontmetric.line_metrics(hhea, typo, FontAscentWin)
+    test.assert(w.ascent == 780 and w.descent == 0 - 220 and w.line_gap == 0)
+
+    let h = fontmetric.line_metrics(hhea, typo, FontAscentHhea)
+    test.assert(h.ascent == 800 and h.descent == 0 - 200 and h.line_gap == 100)
+
+    test.case("the line's height is one number, and the descent's sign is spent once")
+    test.assert(fontmetric.line_height(h) == 1100)
+
+    test.case("the font's own recommendation is the typo set when it sets the bit")
+    test.assert(fontmetric.ascent_recommended(typo) == FontAscentTypo)
+    test.assert(fontmetric.ascent_recommended(matching) == FontAscentHhea)
+
+    test.case("and the three sets agreeing inside a tolerance is the quiet case")
+    test.assert(fontmetric.ascent_sets_disagree(hhea, typo, 0))
+    test.assert(not fontmetric.ascent_sets_disagree(hhea, matching, 0))
+    test.assert(not fontmetric.ascent_sets_disagree(hhea, typo, 1000))
+
+@test
+fn test_a_style_claimed_twice_is_compared_and_both_ways_count() [io]
+    test.case("THE CLAIM: bold in `macStyle` against regular in `fsSelection` disagrees")
+    test.assert(fontmetric.style_disagrees(head_with_style(1), os2_with_selection(0)))
+
+    test.case("and the disagreement is a disagreement from either side")
+    test.assert(fontmetric.style_disagrees(head_with_style(0), os2_with_selection(32)))
+    test.assert(fontmetric.style_disagrees(head_with_style(2), os2_with_selection(0)))
+    test.assert(fontmetric.style_disagrees(head_with_style(0), os2_with_selection(1)))
+
+    test.case("the two words agreeing is the case a font picker relies on")
+    test.assert(not fontmetric.style_disagrees(head_with_style(3), os2_with_selection(33)))
+
+    test.case("and `head_flag` reads a bit of the OTHER word, which is why the pair is a trap")
+    let flagged = FontHead { units_per_em: 1000, x_min: 0, y_min: 0, x_max: 0,
+                             y_max: 0, flags: 3, mac_style: 0,
+                             index_to_loc_format: 0, lowest_rec_ppem: 8 }
+    test.assert(fontmetric.head_flag(flagged, 0))
+    test.assert(not fontmetric.head_flag(flagged, 2))
+
+@test
+fn test_the_pixel_transform_refuses_a_font_with_no_em() [io]
+    let none = FontMetrics { units_per_em: 0, x_min: 0, y_min: 0, x_max: 0, y_max: 0,
+                             num_glyphs: 0, num_h_metrics: 0, advance_max: 0,
+                             long_loca: false }
+
+    test.case("THE CLAIM: unitsPerEm 0 cannot be divided by, so the identity answers")
+    test.assert(geomxform.is_identity(fontmetric.scale_for_px(none, 16.0)))
+    test.assert(geomxform.is_identity(fontmetric.scale_for_px_y_up(none, 16.0)))
+
+    test.case("and every length conversion answers a zero rather than a nan")
+    test.assert(fontmetric.units_to_px(none, 500, 16.0) == 0.0)
+    test.assert(fontmetric.px_to_units(none, 10.0, 16.0) == 0)
+    test.assert(geomrect.width(fontmetric.px_bounds(none, 16.0)) <= 0.0)
+
+    test.case("a 1000-upem font is 16 pixels at 16 px per em, and the y axis flips")
+    let m = FontMetrics { units_per_em: 1000, x_min: 0, y_min: 0, x_max: 1000,
+                          y_max: 1000, num_glyphs: 1, num_h_metrics: 1,
+                          advance_max: 500, long_loca: false }
+    test.assert(fontmetric.units_to_px(m, 500, 16.0) == 8.0)
+    test.assert(fontmetric.px_to_units(m, 8.0, 16.0) == 500)
+    test.assert(geomrect.width(fontmetric.px_bounds(m, 16.0)) == 16.0)

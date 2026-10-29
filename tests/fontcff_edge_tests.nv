@@ -1,0 +1,1066 @@
+// fontcff_edge_tests.nv — the container, the two DICTs and the stack
+// machine, over a `CFF ` table assembled in memory.
+//
+// WHY THIS SUITE EXISTS.  `fontcff_tests.nv` reaches the subroutine
+// bias, the two published operator lists and `is_cff2`, and its one
+// INDEX is four bytes of hand-written header.  Nothing in the package
+// ever built a CFF table, so nothing read a top DICT, nothing decoded a
+// DICT real, nothing ran a charstring, and every drawing operator in
+// the module was reached by no test at all — which is how a wrong read
+// survives.  This file builds one small font and reads it back through
+// all of them.
+//
+// THE TABLE, AND WHERE EVERY OFFSET COMES FROM.  One CFF font: a
+// header, the four INDEXes the format puts in front of the glyphs, a
+// Private DICT with a local subroutine INDEX, and thirty-one
+// charstrings.  The bytes are assembled by `ix` (an INDEX), `num`/`op`
+// (the Type 2 number encoding) and `real` (a DICT real), so no offset
+// is a literal that can drift; the layout those helpers produce is the
+// one below, and the tests assert it against `parse_top`'s answer:
+//
+//     bytes   what
+//     0       the header: major 1, minor 0, hdrSize 4, offSize 1
+//     4       the name INDEX, empty — a sixteen-bit count of zero and
+//             nothing after it, which is the case a reader that always
+//             looks for an `offSize` gets wrong
+//     6       the top DICT INDEX: one 41-byte DICT, so 2 + 1 + 2 + 41
+//     52      the string INDEX, empty
+//     54      the global subroutine INDEX: one four-byte subr, 9 bytes
+//     63      the Private DICT, 14 bytes — the number its own `Subrs`
+//             entry carries, because that offset is relative to THIS
+//             dict rather than to the table (the format's second
+//             off-by-one, and the first thing this suite pins)
+//     77      the local subroutine INDEX: four entries, 20 bytes
+//     97      the CharStrings INDEX: thirty-one entries of 279 bytes of
+//             charstring, so 2 + 1 + 32 two-byte offsets + 279 = 346
+//     443     the end of the table
+//
+// THE NUMBERS, HAND-COMPUTED.  Everything asserted below comes off this
+// arithmetic, and a reader can check any line of it:
+//
+//   THE ONE-BYTE OPERAND is `value + 139`: 0 is 139, 10 is 149, 50 is
+//   189, 100 is 239, -5 is 134 and -107 is 32.  Two bytes cover
+//   108..1131 as `247 + (v - 108) / 256` and `(v - 108) % 256`, so 200
+//   is `247, 92` ((247-247)*256 + 92 + 108 = 200) and 300 is `247, 192`.
+//   Two more cover -1131..-108 the same way from 251, subtracted: `251,
+//   0` is -(0)*256 - 0 - 108 = -108, and `251, 192` is -300.
+//
+//   THE SHORTINT is `28` and a signed sixteen-bit word, so `28, 255,
+//   251` is 0xFFFB = -5.  The 16.16 fixed number is `255` and a signed
+//   thirty-two-bit word over 65536, so `255, 0, 10, 0, 0` is 0x000A0000
+//   / 65536 = 10.0.
+//
+//   A DICT REAL is `30` and packed nibbles, `a` for the point, `b` and
+//   `c` for the exponent's sign, `e` for the number's, `f` for the end.
+//   So `E2 A5 B1 FF` is -2.5e1 = -25.0 and `1C 3F` is 1e-3 = 0.001 and
+//   `0A 5F` is 0.5 — three values this suite asserts exactly.
+//
+//   THE WIDTH CONVENTION.  `nominalWidthX` is 50 and `defaultWidthX` is
+//   -25.0, so a charstring whose first operator takes one operand too
+//   many carries a width: a leading 200 with a three-operand `rmoveto`
+//   is 50 + 200 = 250.  A charstring that carries none is -25.
+//
+//   THE SUBROUTINE BIAS.  Four local subroutines is under 1240, so the
+//   bias is 107 and a pushed -107 calls entry 0, -106 entry 1, -105
+//   entry 2 and -104 entry 3.  Two of those entries do not draw: one
+//   calls another, one leaves an operand for its caller.  The format's
+//   three bias widths change at 1240 and at 33900 subroutines, and both
+//   boundaries are asserted from below and above: 1239 is 107, 1240 is
+//   1131, 33899 is 1131, 33900 is 32768.
+//
+//   THE STEM MASK is sized by the stem count: one stem is (1 + 7) / 8 =
+//   one mask byte, which the interpreter steps over without reading.
+//
+//   EVERY POINT is a sum of relative deltas, spelled out beside the
+//   glyph it belongs to below.  The curves are cubic and the endpoints
+//   are what the assertions name.
+//
+// WHAT IS COVERED THAT A FIRST DRAFT MISSES.  Both INDEX offset sizes
+// the fixture uses (one and two), and all four by hand near the end; the
+// empty INDEX; every one of the DICT's operand encodings including the
+// four-byte integer and the real, and the byte that begins no DICT
+// number at all; the signed readers; both `endchar` forms; every move
+// operator's operand count refused by name, `vmoveto` included; the
+// shared operand stack; the ten-call depth limit; all three bias widths;
+// the two published operator lists, which are asserted to be disjoint
+// and to name every number they hold; `is_cff2` true and false; and the
+// width read twice — once by the interpreter and once by
+// `charstring_width`, which is a separate loop and settles on the first
+// clearing operator rather than interpreting.
+//
+// ONE WORKAROUND, AT THE SITE THAT NEEDS IT.  `ix` below binds a
+// `list.get` read to a local before using it as an operand of `+`,
+// because on the compiled path — `novo test`, `novo build` — an inline
+// `list.get(...)` operand of `Bytes + Bytes` contributes the element's
+// LENGTH instead of its bytes.  The comment in `ix` carries the
+// measurement and names the toolchain filing; the interpreter is right
+// and the compiled path is not.
+
+use std.test
+use std.list
+use std.bytes
+use fontdir
+use fontsrc
+use fonterror
+use fontcff
+use svgpath
+
+// ── The encodings a fixture is written in ────────────────────────────
+
+fn bytes_of(xs: [Int]) -> Bytes
+    bytes.from_byte_list(xs)
+
+// The bytes of one charstring integer, in the format's three widths.
+fn num(v: Int) -> Bytes
+    if v >= 0 - 107 and v <= 107
+        bytes.u8(v + 139)
+    else if v >= 108 and v <= 1131
+        let d = v - 108
+        bytes.u8(247 + d / 256) + bytes.u8(d % 256)
+    else
+        let d = 0 - v - 108
+        bytes.u8(251 + d / 256) + bytes.u8(d % 256)
+
+// The bytes of a run of operands.
+fn nums(xs: [Int]) -> Bytes
+    var out = bytes.zeros(0)
+    for x in xs
+        out = out + num(x)
+    out
+
+// `n` copies of one operand, for the charstring that overflows the
+// stack.
+fn many(n: Int, v: Int) -> Bytes
+    var out = bytes.zeros(0)
+    var i = 0
+    while i < n
+        out = out + num(v)
+        i = i + 1
+    out
+
+// One operator: its operands, then its number.
+fn op(byte: Int, operands: [Int]) -> Bytes
+    nums(operands) + bytes.u8(byte)
+
+// An escape-prefixed operator, which the interpreter numbers 3072 + x.
+fn esc(x: Int) -> Bytes
+    bytes_of([12, x])
+
+// A DICT real from its nibbles, packed two to a byte with a trailing
+// `f` when the count is odd.
+fn real(nibbles: [Int]) -> Bytes
+    var out = bytes.u8(30)
+    for k in 0..(list.len(nibbles) + 1) / 2
+        var lo = 15
+        if 2 * k + 1 < list.len(nibbles)
+            lo = list.get(nibbles, 2 * k + 1)
+        out = out + bytes.u8(list.get(nibbles, 2 * k) * 16 + lo)
+    out
+
+// The four-byte DICT integer: `29` and a signed word, which is the
+// operand width a DICT has and a charstring does not.
+fn i32(v: Int) -> Bytes
+    bytes.u8(29) + bytes.u32_be(v)
+
+// A CFF INDEX: the count, the offset size, the offsets, then the data.
+//
+// The offsets are relative to the byte BEFORE the data, which is why
+// the first one is 1.  An empty INDEX is its count and nothing else.
+fn ix(entries: [Bytes]) -> Bytes
+    let count = list.len(entries)
+    if count == 0
+        return bytes.u16_be(0)
+    var body = bytes.zeros(0)
+    var offsets: [Int] = [1]
+    for e in entries
+        body = body + e
+        list.push(offsets, bytes.len(body) + 1)
+    let last = list.nth(offsets, count) ?? 1
+    var head = bytes.u16_be(count)
+    if last <= 255
+        head = head + bytes.u8(1)
+        for o in offsets
+            head = head + bytes.u8(o)
+    else
+        head = head + bytes.u8(2)
+        for o in offsets
+            head = head + bytes.u16_be(o)
+    head + body
+
+// ── The fixture ──────────────────────────────────────────────────────
+
+// The four local subroutines.  Entry 0 draws one line of (10, 10);
+// entry 1 calls entry 0, so a glyph that calls it is two deep; entry 2
+// calls itself, which is how the depth limit is reached; entry 3 leaves
+// its 10 on the stack for whoever called it, which the format allows
+// and which the interpreter's shared stack is for.
+fn local_subrs() -> [Bytes]
+    [op(5, [10, 10]) + bytes.u8(11),
+     op(10, [0 - 107]) + bytes.u8(11),
+     op(10, [0 - 105]) + bytes.u8(11),
+     nums([10]) + bytes.u8(11)]
+
+// One global subroutine, which draws a line of (20, 20).
+fn global_subrs() -> [Bytes]
+    [op(5, [20, 20]) + bytes.u8(11)]
+
+// The Private DICT: the local subrs offset, defaultWidthX and
+// nominalWidthX.  It is fourteen bytes and the `Subrs` operand says so
+// — the offset is relative to this dict, so it IS the length here.
+fn private_dict() -> Bytes
+    i32(14) + op(19, [])
+        + real([14, 2, 10, 5, 11, 1, 15]) + op(20, [])
+        + op(21, [50])
+
+// The top DICT, whose operator order is the order the operands are read
+// in.  The leading 31 is a byte a DICT has no meaning for: the decoder
+// drops what it has and reads on, so the operators after it stay
+// aligned.
+fn top_dict(priv_at: Int, priv_size: Int, cs_at: Int) -> Bytes
+    bytes_of([31])
+        + i32(0 - 300) + op(15, [])   // charset: under 3, predefined
+        + i32(cs_at) + op(17, [])   // CharStrings
+        + bytes.u8(28) + bytes.u16_be(priv_size)
+          + i32(priv_at) + op(18, [])   // Private: size, offset
+        + real([1, 12, 3, 15]) + nums([0, 0])   // FontMatrix: 0.001, 0, 0,
+          + real([0, 10, 5, 15])   //   0.5, 300, -300
+          + nums([300, 0 - 300]) + esc(7)
+        + nums([0, 0, 0]) + esc(30)   // ROS: three operands
+
+// The thirty-one charstrings, in glyph order.  The comment on each one
+// is the arithmetic its own test asserts.
+fn glyphs() -> [Bytes]
+    [bytes_of([14]),   // 0  .notdef
+     // 1  width, move, two lines
+     op(21, [200, 100, 50]) + op(5, [100, 0, 0, 100])
+        + bytes_of([14]),
+     // 2  h, v, alternating
+     op(22, [10]) + op(6, [100, 50, 100])
+        + op(7, [20, 30]) + bytes_of([14]),
+     // 3  16.16 curve
+     op(4, [50]) + bytes_of([255, 0, 10, 0, 0])
+        + op(8, [20, 30, 40, 50, 60]) + bytes_of([14]),
+     // 4  shortint, negatives
+     op(21, [100, 0]) + bytes_of([251, 0])
+        + nums([0, 0]) + bytes_of([28, 255, 251])
+        + op(5, []) + bytes_of([14]),
+     // 5  hh, vv, vv with dx1
+     op(21, [100, 100]) + op(27, [10, 20, 3, 4, 5])
+        + op(26, [6, 7, 8, 9]) + op(26, [2, 3, 4, 5, 6])
+        + bytes_of([14]),
+     // 6  hv, vh, trailing
+     op(21, [0, 0]) + op(31, [10, 20, 30, 40,
+                              50, 60, 70, 80, 90])
+        + op(30, [5, 6, 7, 8, 9]) + bytes_of([14]),
+     // 7  rcurveline
+     op(21, [0, 0]) + op(24, [10, 10, 10, 10, 10, 10,
+                              20, 20]) + bytes_of([14]),
+     // 8  rlinecurve
+     op(21, [0, 0]) + op(25, [10, 10,
+                              5, 5, 5, 5, 5, 5]) + bytes_of([14]),
+     // 9  stem, mask, width
+     nums([200, 0, 0]) + bytes_of([1, 19, 255])
+        + op(21, [10, 10]) + op(5, [10, 10]) + bytes_of([14]),
+     // 10 callsubr
+     op(21, [0, 0]) + op(10, [0 - 107]) + bytes_of([14]),
+     // 11 nested
+     op(21, [0, 0]) + op(10, [0 - 106]) + bytes_of([14]),
+     // 12 shared stack
+     op(21, [0, 0]) + op(10, [0 - 104])
+        + op(5, [10]) + bytes_of([14]),
+     // 13 callgsubr
+     op(21, [0, 0]) + op(29, [0 - 107]) + bytes_of([14]),
+     // 14 flex: refused
+     nums([0, 0]) + esc(35) + bytes_of([14]),
+     // 15 reserved byte
+     bytes_of([9]),
+     // 16 odd rlineto
+     nums([0]) + op(5, []) + bytes_of([14]),
+     // 17 seac
+     nums([0, 0, 0, 0]) + bytes_of([14]),
+     // 18 fifty operands
+     many(49, 0),
+     // 19 mask past the end
+     nums([0, 0]) + bytes_of([1, 19]),
+     // 20 subr past the end
+     bytes_of([139, 10]),
+     // 21 escape before the width
+     nums([0, 0]) + esc(3) + nums([0, 0])
+        + op(21, []) + bytes_of([14]),
+     // 22 rmoveto, nothing
+     op(21, []) + bytes_of([14]),
+     // 23 hmoveto, nothing
+     op(22, []) + bytes_of([14]),
+     // 24 hmoveto, three
+     nums([0, 0, 0]) + op(22, []) + bytes_of([14]),
+     // 25 five for a curve
+     nums([0, 0, 1, 2, 3]) + op(8, []) + bytes_of([14]),
+     // 26 seven
+     nums([0, 0, 1, 2, 3, 4, 5]) + op(24, []) + bytes_of([14]),
+     // 27 seven
+     nums([0, 0, 1, 2, 3, 4, 5]) + op(25, []) + bytes_of([14]),
+     // 28 three for a curve
+     nums([0, 0, 1]) + op(27, []) + bytes_of([14]),
+     // 29 hlineto, nothing
+     op(6, []) + bytes_of([14]),
+     // 30 calls itself
+     op(21, [0, 0]) + op(10, [0 - 105]) + bytes_of([14])]
+
+// The whole table.  The two offsets the top DICT names are computed
+// from the parts' own lengths: every operand in that DICT is a fixed
+// width, so a probe with placeholder offsets measures exactly what the
+// real one will be.
+fn table() -> Bytes
+    let head = bytes_of([1, 0, 4, 1])
+    let name_ix = ix([])
+    let string_ix = ix([])
+    let gsubrs = ix(global_subrs())
+    let lsubrs = ix(local_subrs())
+    let charstrings = ix(glyphs())
+    let priv = private_dict()
+    let top_len = bytes.len(ix([top_dict(0, 0, 0)]))
+    let priv_at = 4 + bytes.len(name_ix) + top_len
+                  + bytes.len(string_ix) + bytes.len(gsubrs)
+    let lsubrs_at = priv_at + bytes.len(priv)
+    let cs_at = lsubrs_at + bytes.len(lsubrs)
+    head + name_ix + ix([top_dict(priv_at, bytes.len(priv), cs_at)])
+        + string_ix + gsubrs + priv + lsubrs + charstrings
+
+// A CFF table with one `endchar` glyph and a top DICT that is the
+// CharStrings entry followed by `extra`, for the entries the fixture
+// above does not carry.  The CharStrings operand is the four-byte form,
+// so the DICT's length does not depend on the offset it names.
+fn mini_with(extra: Bytes, glyph_list: [Bytes]) -> Bytes
+    let dict_len = 6 + bytes.len(extra)
+    let top_len = 2 + 1 + 2 + dict_len
+    let cs_at = 4 + 2 + top_len + 2 + 2
+    let dict = i32(cs_at) + op(17, []) + extra
+    bytes_of([1, 0, 4, 1]) + bytes.u16_be(0) + ix([dict])
+        + bytes.u16_be(0) + bytes.u16_be(0) + ix(glyph_list)
+
+fn mini(extra: Bytes) -> Bytes
+    mini_with(extra, [bytes_of([14])])
+
+// The fixture table, parsed.  Every test that walks the table starts
+// here.
+fn fixture() -> (Bytes, FontCffTop)
+    let t = table()
+    (t, top_of(t))
+
+// A top DICT out of a table this file built, so `!` is the
+// unwrap-or-panic reading: a fixture that does not parse is a defect in
+// this file rather than a claim about the module.
+fn top_of(t: Bytes) -> FontCffTop
+    fontcff.parse_top(t, fontsrc.range(0, bytes.len(t)))!
+
+// Glyph `i`'s charstring.
+fn cs_of(t: Bytes, top: FontCffTop, i: Int) -> Bytes
+    match fontcff.charstring_range(t, top, i)
+        Some(r) => fontsrc.slice(t, r)
+        None    => bytes.zeros(0)
+
+// Glyph `i`'s outline, which every charstring in the fixture produces.
+fn outline_of(t: Bytes, top: FontCffTop, i: Int) -> svgpath.SvgPath
+    fontcff.charstring_outline(cs_of(t, top, i), t, top, 0)!
+
+// ── Reading a path back ──────────────────────────────────────────────
+
+// One command as numbers: its kind and up to six coordinates.  Kinds
+// are 0 move, 1 line and 2 cubic, and -1 for a command this suite never
+// writes, so a wrong shape fails rather than passing.
+struct Cmd
+    kind: Int
+    a: Float
+    b: Float
+    c: Float
+    d: Float
+    e: Float
+    f: Float
+
+fn cmd_at(cmds: [SvgPathCmd], i: Int) -> Cmd
+    match list.nth(cmds, i)
+        Some(c) => cmd_of(c)
+        None    => Cmd { kind: 0 - 1, a: 0.0, b: 0.0, c: 0.0, d: 0.0, e: 0.0, f: 0.0 }
+
+fn cmd_of(c: SvgPathCmd) -> Cmd
+    match c
+        SvgMoveTo(x, y)                  =>
+            Cmd { kind: 0, a: x, b: y, c: 0.0, d: 0.0, e: 0.0, f: 0.0 }
+        SvgLineTo(x, y)                  =>
+            Cmd { kind: 1, a: x, b: y, c: 0.0, d: 0.0, e: 0.0, f: 0.0 }
+        SvgCubicTo(x1, y1, x2, y2, x, y) =>
+            Cmd { kind: 2, a: x1, b: y1, c: x2, d: y2, e: x, f: y }
+        _                                =>
+            Cmd { kind: 0 - 1, a: 0.0, b: 0.0, c: 0.0, d: 0.0, e: 0.0, f: 0.0 }
+
+fn move_cmd(x: Float, y: Float) -> Cmd
+    Cmd { kind: 0, a: x, b: y, c: 0.0, d: 0.0, e: 0.0, f: 0.0 }
+
+fn line_cmd(x: Float, y: Float) -> Cmd
+    Cmd { kind: 1, a: x, b: y, c: 0.0, d: 0.0, e: 0.0, f: 0.0 }
+
+fn cubic_cmd(x1: Float, y1: Float, x2: Float, y2: Float, x: Float, y: Float) -> Cmd
+    Cmd { kind: 2, a: x1, b: y1, c: x2, d: y2, e: x, f: y }
+
+// Assert that command `i` is `want`, number by number at a tolerance of
+// exactly zero: every coordinate here is a sum of small integers in
+// binary floating point, where zero is the honest tolerance.
+fn assert_cmd(cmds: [SvgPathCmd], i: Int, want: Cmd)
+    let got = cmd_at(cmds, i)
+    test.assert(got.kind == want.kind)
+    test.assert_approx(got.a, want.a, 0.0)
+    test.assert_approx(got.b, want.b, 0.0)
+    test.assert_approx(got.c, want.c, 0.0)
+    test.assert_approx(got.d, want.d, 0.0)
+    test.assert_approx(got.e, want.e, 0.0)
+    test.assert_approx(got.f, want.f, 0.0)
+
+// The commands of a path that is expected to hold exactly `n` of them.
+fn commands_are(p: svgpath.SvgPath, n: Int) -> [SvgPathCmd]
+    test.assert(svgpath.command_count(p) == n)
+    let cmds = svgpath.commands_of(p)
+    test.assert(list.len(cmds) == n)
+    cmds
+
+// ── The container ────────────────────────────────────────────────────
+
+@test
+fn test_the_four_indexes_are_walked_in_the_formats_order() [io]
+    let (t, top) = fixture()
+
+    test.case("THE CLAIM: the four INDEXes sit in front of the glyphs, and the fourth is global")
+    test.assert(bytes.len(t) == 443)
+    test.assert(top.charstrings.at == 97)
+    test.assert(top.global_subrs.at == 54)
+    test.assert(fontcff.glyph_count(top, t) == 31)
+
+    test.case("and the table's own range is the INDEX the CharStrings entry names")
+    match fontcff.index_at(t, top.charstrings.at)
+        Err(_) => test.assert(false)
+        Ok(ix) =>
+            test.assert(ix.count == 31)
+            test.assert(ix.off_size == 2)   // 279 bytes of charstrings
+            test.assert(fontcff.index_end(t, ix) == 443)
+
+    test.case("a glyph is a range into the table, and its length is its own")
+    match fontcff.charstring_range(t, top, 0)
+        Some(r) => test.assert(r.len == 1)   // glyph 0 is a bare endchar
+        None    => test.assert(false)
+    match fontcff.charstring_range(t, top, 18)
+        Some(r) => test.assert(r.len == 49)   // the forty-nine operands
+        None    => test.assert(false)
+
+    test.case("a negative glyph and one past the count are nothing, not a read")
+    test.assert(fontcff.charstring_range(t, top, 0 - 1) == None)
+    test.assert(fontcff.charstring_range(t, top, 31) == None)
+    test.assert(fontcff.charstring_range(t, top, 1000) == None)
+
+@test
+fn test_the_index_offsets_are_relative_to_the_byte_before_the_data() [io]
+    // count 2, offSize 3, offsets 1 and 3 and 5, then four bytes: the
+    // three-byte offsets are how the format reaches past 65535 bytes,
+    // and an INDEX this small still writes them wide.
+    let wide = bytes_of([0, 2, 3, 0, 0, 1, 0, 0, 3, 0, 0, 5, 65, 66, 67, 68])
+
+    test.case("THE CLAIM: offSize 3 is read as three bytes, high one first")
+    match fontcff.index_at(wide, 0)
+        Err(_) => test.assert(false)
+        Ok(ix) =>
+            test.assert(ix.count == 2)
+            test.assert(ix.off_size == 3)
+            test.assert(ix.data_at == 11)
+            test.assert(fontcff.index_end(wide, ix) == 16)
+            match fontcff.index_entry(wide, ix, 0)
+                Some(r) => test.assert(r.at == 12 and r.len == 2)
+                None    => test.assert(false)
+
+    test.case("and offSize 4 is four, which is the width the format stops at")
+    let wider = bytes_of([0, 1, 4, 0, 0, 0, 1, 0, 0, 0, 2, 65, 66])
+    match fontcff.index_at(wider, 0)
+        Err(_) => test.assert(false)
+        Ok(ix) =>
+            test.assert(ix.off_size == 4)
+            test.assert(ix.data_at == 10)
+            test.assert(fontcff.index_end(wider, ix) == 12)
+            match fontcff.index_entry(wider, ix, 0)
+                Some(r) => test.assert(r.len == 1)
+                None    => test.assert(false)
+
+    test.case("THE EMPTY INDEX IS TWO BYTES, and an offset size is not read for it")
+    let empty = bytes_of([0, 0, 9, 9])
+    match fontcff.index_at(empty, 0)
+        Err(_) => test.assert(false)
+        Ok(ix) =>
+            test.assert(ix.count == 0)
+            test.assert(ix.off_size == 0)
+            test.assert(ix.range.len == 2)
+            test.assert(fontcff.index_end(empty, ix) == 2)
+            test.assert(fontcff.index_entry(empty, ix, 0) == None)
+
+    test.case("an INDEX whose offsets run backwards answers an empty entry, not a negative one")
+    let bent = bytes_of([0, 1, 1, 5, 3, 65, 66, 67, 68, 69])
+    match fontcff.index_at(bent, 0)
+        Err(_) => test.assert(false)
+        Ok(ix) =>
+            match fontcff.index_entry(bent, ix, 0)
+                Some(r) => test.assert(r.len == 0)
+                None    => test.assert(false)
+
+@test
+fn test_an_index_refuses_a_header_it_cannot_read() [io]
+    test.case("THE CLAIM: an INDEX with no room for its count is short by that count")
+    match fontcff.index_at(bytes_of([0]), 0)
+        Err(FontShort(t, want, have)) =>
+            test.assert(t == fontdir.tag_cff() and want == 2 and have == 1)
+        _                             => test.assert(false)
+
+    test.case("and one that stops right after its count has no offset size to read")
+    match fontcff.index_at(bytes_of([0, 1]), 0)
+        Err(FontBadField(_, field, v)) => test.assert(field == "offSize" and v == 0)
+        _                              => test.assert(false)
+
+    test.case("offSize is 1 to 4, and 0 and 5 are neither")
+    match fontcff.index_at(bytes_of([0, 1, 0, 1, 2, 65]), 0)
+        Err(FontBadField(t, field, v)) =>
+            test.assert(t == fontdir.tag_cff() and field == "offSize" and v == 0)
+        _                              => test.assert(false)
+    match fontcff.index_at(bytes_of([0, 1, 5, 1, 2, 65]), 0)
+        Err(FontBadField(_, "offSize", v)) => test.assert(v == 5)
+        _                                  => test.assert(false)
+
+    test.case("a count whose offsets do not fit is short by the last one's width")
+    // Two one-byte offsets need bytes 3, 4 and 5, and the INDEX ends at 5.
+    match fontcff.index_at(bytes_of([0, 2, 1, 1, 3]), 0)
+        Err(FontShort(_, want, have)) => test.assert(want == 6 and have == 5)
+        _                             => test.assert(false)
+
+    test.case("a last offset below 1 ends the data before it starts")
+    match fontcff.index_at(bytes_of([0, 1, 1, 1, 0, 65]), 0)
+        Err(FontBadField(_, field, v)) =>
+            test.assert(field == "last offset" and v == 0)
+        _                              => test.assert(false)
+
+    test.case("and a last offset pointing past the table is short by its own end")
+    // data_at is 4, so an offset of 9 ends the INDEX at 13 with 6 bytes.
+    match fontcff.index_at(bytes_of([0, 1, 1, 1, 9, 65]), 0)
+        Err(FontShort(_, want, have)) => test.assert(want == 13 and have == 6)
+        _                             => test.assert(false)
+
+// ── The top DICT ─────────────────────────────────────────────────────
+
+@test
+fn test_the_private_dict_is_named_by_size_and_offset_from_its_own_start() [io]
+    let (t, top) = fixture()
+
+    test.case("THE CLAIM: Private is two operands, a size and an offset, and the size is the range")
+    test.assert(top.private.at == 63)
+    test.assert(top.private.len == 14)
+    test.assert(fontsrc.range_end(top.private) == 77)
+
+    test.case("and the Subrs entry inside it is relative to the Private DICT, not the table")
+    test.assert(top.local_subrs.at == 77)
+    test.assert(top.local_subrs.len == 20)
+    test.assert(top.global_subrs.at == 54)
+    test.assert(top.global_subrs.len == 9)
+
+    test.case("so a reader that added the table's offset would find a four-entry INDEX at 140")
+    match fontcff.index_at(t, top.local_subrs.at)
+        Err(_) => test.assert(false)
+        Ok(ix) => test.assert(ix.count == 4)
+
+    test.case("the charset is below 3 and is therefore one of the predefined ones")
+    test.assert(top.charset.at == 0)
+    test.assert(top.charset.len == 0)
+    test.assert(fontsrc.is_empty(top.charset))
+
+    test.case("and ROS with three operands is what makes a font CID-keyed")
+    test.assert(top.is_cid)
+
+@test
+fn test_the_widths_are_dict_reals_and_dict_integers_read_apart() [io]
+    let (t, top) = fixture()
+
+    test.case("THE CLAIM: defaultWidthX is a real, and `E2 A5 B1 FF` is -2.5e1 = -25.0")
+    test.assert_approx(top.default_width, 0.0 - 25.0, 0.0)
+
+    test.case("nominalWidthX is a one-byte integer: 189 - 139 = 50")
+    test.assert_approx(top.nominal_width, 50.0, 0.0)
+
+    test.case("THE FONT MATRIX IS READ, not defaulted: six operands, two of them reals")
+    test.assert_approx(top.matrix.a, 0.001, 0.0)   // `1C 3F` is 1e-3
+    test.assert_approx(top.matrix.b, 0.0, 0.0)
+    test.assert_approx(top.matrix.c, 0.0, 0.0)
+    test.assert_approx(top.matrix.d, 0.5, 0.0)   // `0A 5F` is 0.5
+    test.assert_approx(top.matrix.e, 300.0, 0.0)   // 247, 192
+    test.assert_approx(top.matrix.f, 0.0 - 300.0, 0.0)   // 251, 192
+
+    test.case("and the default matrix is 0.001 per unit, which is what a font without one gets")
+    let plain = top_of(mini(bytes_of([])))
+    test.assert_approx(plain.matrix.a, 0.001, 0.0)
+    test.assert_approx(plain.matrix.d, 0.001, 0.0)
+    test.assert_approx(plain.default_width, 0.0, 0.0)
+    test.assert_approx(plain.nominal_width, 0.0, 0.0)
+    test.assert(fontsrc.is_empty(plain.private))
+    test.assert(fontsrc.is_empty(plain.charset))
+    test.assert(not plain.is_cid)
+    test.assert(fontcff.glyph_count(plain, mini(bytes_of([]))) == 1)
+
+    test.case("a byte that begins no DICT number is a zero the walk steps over")
+    // 255 begins no DICT operand — `28`, `29` and `30` cover the wide
+    // ones and 32..254 the rest — so it decodes as 0.0 in one byte and
+    // the operators after it stay aligned.  A walk that instead stopped
+    // or skipped to the next byte would read the entry that follows.
+    let stray = mini(bytes_of([255]))
+    let walked = top_of(stray)
+    test.assert(walked.charstrings.at == 22)   // one byte later than `mini`
+    test.assert(fontcff.glyph_count(walked, stray) == 1)
+
+@test
+fn test_a_charset_with_a_real_offset_is_a_range_at_that_offset() [io]
+    test.case("THE CLAIM: an offset of 3 or more is a charset table, not a predefined one")
+    let t = mini(i32(6) + op(15, []))
+    let top = top_of(t)
+    test.assert(top.charset.at == 6)
+    test.assert(top.charset.len == 0)
+
+    test.case("and a Private entry with one operand names no private dict at all")
+    let one = top_of(mini(nums([0]) + op(18, [])))
+    test.assert(fontsrc.is_empty(one.private))
+    test.assert(fontsrc.is_empty(one.local_subrs))
+    test.assert_approx(one.nominal_width, 0.0, 0.0)
+
+    test.case("ROS with two operands is not a CID font; three is")
+    test.assert(not top_of(mini(nums([0, 0]) + esc(30))).is_cid)
+    test.assert(top_of(mini(nums([0, 0, 0]) + esc(30))).is_cid)
+
+@test
+fn test_parse_top_refuses_a_table_it_cannot_parse() [io]
+    test.case("THE CLAIM: CFF2 is refused by its major version before anything is walked")
+    match fontcff.parse_top(bytes_of([2, 0, 4, 1]), fontsrc.range(0, 4))
+        Err(FontBadField(t, field, v)) =>
+            test.assert(t == fontdir.tag_cff() and field == "major" and v == 2)
+        _                              => test.assert(false)
+
+    test.case("and the predicate a caller screens with reads the same byte the parse does")
+    test.assert(fontcff.is_cff2(bytes_of([2, 0, 4, 1])))
+    test.assert(not fontcff.is_cff2(bytes_of([1, 0, 4, 1])))
+    test.assert(not fontcff.is_cff2(bytes.zeros(0)))
+
+    test.case("a header shorter than its own four bytes is a short read")
+    match fontcff.parse_top(bytes_of([1, 0, 4]), fontsrc.range(0, 3))
+        Err(FontShort(_, want, have)) => test.assert(want == 4 and have == 3)
+        _                             => test.assert(false)
+
+    test.case("hdrSize under 4 would put the name INDEX inside the header")
+    match fontcff.parse_top(bytes.zeros(12), fontsrc.range(0, 12))
+        Err(FontBadField(_, field, v)) => test.assert(field == "hdrSize" and v == 0)
+        _                              => test.assert(false)
+    match fontcff.parse_top(bytes_of([1, 0, 3, 1]) + bytes.zeros(8),
+                            fontsrc.range(0, 12))
+        Err(FontBadField(_, field, v)) => test.assert(field == "hdrSize" and v == 3)
+        _                              => test.assert(false)
+
+    test.case("four empty INDEXes leave no top DICT to read")
+    let bare = bytes_of([1, 0, 4, 1]) + bytes.u16_be(0) + bytes.u16_be(0)
+        + bytes.u16_be(0) + bytes.u16_be(0)
+    match fontcff.parse_top(bare, fontsrc.range(0, bytes.len(bare)))
+        Err(FontBadField(_, field, _)) => test.assert(field == "top DICT")
+        _                              => test.assert(false)
+
+    test.case("and a DICT with no CharStrings entry names no glyphs")
+    // The same six bytes the real DICT spends on its CharStrings entry — a
+    // four-byte operand and an operator — with `defaultWidthX` (20) where
+    // `CharStrings` (17) would be, so the table's shape is unchanged and
+    // only the entry is missing.
+    let no_cs = bytes_of([1, 0, 4, 1]) + bytes.u16_be(0)
+        + ix([i32(21) + op(20, [])]) + bytes.u16_be(0) + bytes.u16_be(0)
+        + bytes.u16_be(0)
+    match fontcff.parse_top(no_cs, fontsrc.range(0, bytes.len(no_cs)))
+        Err(FontBadField(_, field, _)) => test.assert(field == "CharStrings")
+        _                              => test.assert(false)
+
+// ── The width convention ─────────────────────────────────────────────
+
+@test
+fn test_the_width_is_the_first_operand_of_the_first_clearing_operator() [io]
+    let (t, top) = fixture()
+
+    test.case("THE CLAIM: three operands before an rmoveto are a width, and 50 + 200 = 250")
+    let a = fontcff.charstring_width(cs_of(t, top, 1), top)
+    test.assert_approx(a.width, 250.0, 0.0)
+    test.assert(a.explicit)
+
+    test.case("two operands are a move: the same operator, one operand short, carries none")
+    let b = fontcff.charstring_width(cs_of(t, top, 2), top)
+    test.assert_approx(b.width, 0.0 - 25.0, 0.0)
+    test.assert(not b.explicit)
+
+    test.case("a stem operator settles it too, and this one carries the width")
+    let c = fontcff.charstring_width(cs_of(t, top, 9), top)
+    test.assert_approx(c.width, 250.0, 0.0)
+    test.assert(c.explicit)
+
+    test.case("an operator with NO operands is not a width, and the default stands")
+    let d = fontcff.charstring_width(cs_of(t, top, 0), top)
+    test.assert_approx(d.width, 0.0 - 25.0, 0.0)
+    test.assert(not d.explicit)
+
+    test.case("THE ESCAPE MOVES NOTHING: `12 3` is skipped and the four operands after it are even")
+    let e = fontcff.charstring_width(cs_of(t, top, 21), top)
+    test.assert_approx(e.width, 0.0 - 25.0, 0.0)
+    test.assert(not e.explicit)
+
+    test.case("and the loop stops at the first settling operator rather than interpreting past it")
+    let short = fontcff.charstring_width(bytes_of([139, 139, 139, 21]),
+                                         top)
+    test.assert_approx(short.width, 50.0, 0.0)
+    test.assert(short.explicit)
+
+// ── The interpreter ──────────────────────────────────────────────────
+
+@test
+fn test_a_move_a_line_and_a_curve_land_where_the_deltas_add_up() [io]
+    let (t, top) = fixture()
+
+    test.case("THE CLAIM: rmoveto(100, 50) then rlineto(100, 0) and (0, 100) is three commands")
+    let p = outline_of(t, top, 1)
+    let cmds = commands_are(p, 3)
+    assert_cmd(cmds, 0, move_cmd(100.0, 50.0))
+    assert_cmd(cmds, 1, line_cmd(200.0, 50.0))
+    assert_cmd(cmds, 2, line_cmd(200.0, 150.0))
+
+    test.case("and hlineto and vlineto alternate the axis from the first operand on")
+    let q = outline_of(t, top, 2)
+    let lines = commands_are(q, 6)
+    assert_cmd(lines, 0, move_cmd(10.0, 0.0))
+    assert_cmd(lines, 1, line_cmd(110.0, 0.0))   // +100 on x
+    assert_cmd(lines, 2, line_cmd(110.0, 50.0))   // +50 on y
+    assert_cmd(lines, 3, line_cmd(210.0, 50.0))   // +100 on x
+    assert_cmd(lines, 4, line_cmd(210.0, 70.0))   // vlineto starts on y: +20
+    assert_cmd(lines, 5, line_cmd(240.0, 70.0))   // then +30 on x
+
+    test.case("a 255 is a 16.16 fixed: 0x000A0000 / 65536 = 10.0")
+    let r = outline_of(t, top, 3)
+    let curve = commands_are(r, 2)
+    assert_cmd(curve, 0, move_cmd(0.0, 50.0))
+    assert_cmd(curve, 1, cubic_cmd(10.0, 70.0, 40.0, 110.0, 90.0, 170.0))
+
+    test.case("a 28 is a signed sixteen-bit word and a 251 is a negative the same width")
+    let s = outline_of(t, top, 4)
+    let neg = commands_are(s, 3)
+    assert_cmd(neg, 0, move_cmd(100.0, 0.0))
+    assert_cmd(neg, 1, line_cmd(0.0 - 8.0, 0.0))   // 251, 0 is -108
+    assert_cmd(neg, 2, line_cmd(0.0 - 8.0, 0.0 - 5.0))   // 28, 255, 251 is -5
+
+@test
+fn test_every_curve_operator_is_a_rearrangement_of_the_same_six_numbers() [io]
+    let (t, top) = fixture()
+
+    test.case("THE CLAIM: hhcurveto's odd leading operand is the FIRST curve's height, and once")
+    let p = outline_of(t, top, 5)
+    let cmds = commands_are(p, 4)
+    assert_cmd(cmds, 0, move_cmd(100.0, 100.0))
+    assert_cmd(cmds, 1, cubic_cmd(120.0, 110.0, 123.0, 114.0, 128.0, 114.0))
+    test.case("vvcurveto takes four, and its odd leading operand is a width instead")
+    assert_cmd(cmds, 2, cubic_cmd(128.0, 120.0, 135.0, 128.0, 135.0, 137.0))
+    test.case("and a second vvcurveto with five operands carries the leading dx1 again")
+    assert_cmd(cmds, 3, cubic_cmd(137.0, 140.0, 141.0, 145.0, 141.0, 151.0))
+
+    test.case("THE TRAILING OPERAND BELONGS TO THE LAST CURVE: nine operands are two curves")
+    let q = outline_of(t, top, 6)
+    let hv = commands_are(q, 4)
+    assert_cmd(hv, 0, move_cmd(0.0, 0.0))
+    assert_cmd(hv, 1, cubic_cmd(10.0, 0.0, 30.0, 30.0, 30.0, 70.0))
+    test.case("the first curve ends where the second control point left it, with no fifth")
+    assert_cmd(hv, 2, cubic_cmd(30.0, 120.0, 90.0, 190.0, 170.0, 280.0))
+    test.case("and the five-operand vhcurveto takes its own trailing operand the same way")
+    assert_cmd(hv, 3, cubic_cmd(170.0, 285.0, 176.0, 292.0, 184.0, 301.0))
+
+    test.case("rcurveline is curves then ONE line, and rlinecurve is ONE line then a curve")
+    let r = outline_of(t, top, 7)
+    let cl = commands_are(r, 3)
+    assert_cmd(cl, 1, cubic_cmd(10.0, 10.0, 20.0, 20.0, 30.0, 30.0))
+    assert_cmd(cl, 2, line_cmd(50.0, 50.0))
+
+    test.case("and a vhcurveto whose trailing operand lands on the HORIZONTAL curve")
+    // Nine operands: curves alternate from the vertical, so the first
+    // takes (10, 20, 30, 40) — a VERTICAL curve, which is what the
+    // leading `v` of the operator's name means — and the second takes
+    // (50, 60, 70, 80) with the 90 left over.  A horizontal curve's
+    // endpoint is the one that moves in y alone, so the leftover goes
+    // on its x.  From (0, 0), hand count: curve one is (0, 10),
+    // (0 + 20, 10 + 30), (20 + 40, 40) = (0, 10), (20, 40), (60, 40);
+    // curve two runs from there — (60 + 50, 40), (110 + 60, 40 + 70),
+    // (170 + 90, 110 + 80) = (110, 40), (170, 110), (260, 190), and
+    // 170 + 90 = 260 is the trailing operand and nothing else.
+    let vh = fontcff.charstring_outline(
+        op(21, [0, 0]) + op(30, [10, 20, 30, 40, 50, 60, 70, 80, 90])
+            + bytes_of([14]),
+            t, top, 0)!
+    let pair = commands_are(vh, 3)
+    assert_cmd(pair, 0, move_cmd(0.0, 0.0))
+    assert_cmd(pair, 1, cubic_cmd(0.0, 10.0, 20.0, 40.0, 60.0, 40.0))
+    assert_cmd(pair, 2, cubic_cmd(110.0, 40.0, 170.0, 110.0, 260.0, 190.0))
+
+    let s = outline_of(t, top, 8)
+    let lc = commands_are(s, 3)
+    assert_cmd(lc, 1, line_cmd(10.0, 10.0))
+    assert_cmd(lc, 2, cubic_cmd(15.0, 15.0, 20.0, 20.0, 25.0, 25.0))
+
+    test.case("and a charstring that simply runs out of bytes answers the path it drew")
+    // No endchar: `139, 139, 21` is one rmoveto to (0, 0) and then the
+    // charstring ends, which is the machine's tail return rather than
+    // its endchar arm.  A well-formed charstring ends in endchar, so
+    // this is the shape a truncated one has.
+    let cut = fontcff.charstring_outline(bytes_of([139, 139, 21]), t, top, 0)!
+    let only = commands_are(cut, 1)
+    assert_cmd(only, 0, move_cmd(0.0, 0.0))
+
+@test
+fn test_a_hint_mask_is_stepped_over_by_the_width_a_stem_count_gives_it() [io]
+    let (t, top) = fixture()
+
+    test.case("THE CLAIM: one stem is one mask byte, and the 255 under it is DATA, not an operand")
+    let cmds = commands_are(outline_of(t, top, 9), 2)
+    assert_cmd(cmds, 0, move_cmd(10.0, 10.0))
+    assert_cmd(cmds, 1, line_cmd(20.0, 20.0))
+
+    test.case("and a stem count the mask does not fit is a state fault, not a read past the end")
+    match fontcff.charstring_outline(cs_of(t, top, 19), t, top, 0)
+        Err(FontCharstringState(why)) => test.assert(why == "a hintmask runs past the end of the charstring")
+        _                             => test.assert(false)
+
+@test
+fn test_a_subroutine_draws_into_its_caller_and_leaves_its_operands_there() [io]
+    let (t, top) = fixture()
+
+    test.case("THE CLAIM: a pushed -107 plus the bias of four entries is entry 0")
+    let a = commands_are(outline_of(t, top, 10), 2)
+    assert_cmd(a, 1, line_cmd(10.0, 10.0))
+
+    test.case("a subroutine may call another, and the bias applies at every level")
+    let b = commands_are(outline_of(t, top, 11), 2)
+    assert_cmd(b, 1, line_cmd(10.0, 10.0))
+
+    test.case("and an operand a subroutine leaves behind is the caller's to use")
+    test.assert(bytes.len(cs_of(t, top, 12)) == 8)   // 3 + 2 + 2 + 1
+    let c = commands_are(outline_of(t, top, 12), 2)
+    assert_cmd(c, 1, line_cmd(10.0, 10.0))
+
+    test.case("the GLOBAL index is a separate one, with its own bias and its own subroutines")
+    let d = commands_are(outline_of(t, top, 13), 2)
+    assert_cmd(d, 1, line_cmd(20.0, 20.0))
+
+    test.case("a call with no local INDEX behind it is refused rather than drawn without")
+    let none = mini_with(bytes_of([]), [bytes_of([139, 10, 14])])
+    match fontcff.charstring_outline(bytes_of([139, 10, 14]), none, top_of(none), 0)
+        Err(FontCharstringState(why)) =>
+            test.assert(why == "a subroutine number is past the end of its index")
+        _                             => test.assert(false)
+
+    test.case("and the bias the four-entry index above used is the SMALLEST of the three")
+    // The format's three bias widths change at 1240 and at 33900
+    // subroutines; both boundaries are pinned from below and above, so
+    // an off-by-one in either comparison is a red assertion rather than
+    // a font that draws a slightly wrong shape.  The hand count: four
+    // entries is under 1240, so the bias is 107 — which is the `-107`
+    // every call above added to reach entry 0.
+    test.assert(fontcff.bias(0) == 107)
+    test.assert(fontcff.bias(4) == 107)
+    test.assert(fontcff.bias(1239) == 107)
+    test.assert(fontcff.bias(1240) == 1131)
+    test.assert(fontcff.bias(33899) == 1131)
+    test.assert(fontcff.bias(33900) == 32768)
+
+@test
+fn test_the_interpreter_refuses_an_operator_it_does_not_implement_by_number() [io]
+    let (t, top) = fixture()
+
+    test.case("THE CLAIM: flex is escape 35, and the fault carries 3072 + 35")
+    match fontcff.charstring_outline(cs_of(t, top, 14), t, top, 0)
+        Err(FontCharstringOp(op)) => test.assert(op == 3072 + 35)
+        _                         => test.assert(false)
+    test.assert(fontcff.operator_name(3072 + 35) == "flex")
+
+    test.case("a reserved byte is refused by its own number, with no escape to add")
+    match fontcff.charstring_outline(cs_of(t, top, 15), t, top, 0)
+        Err(FontCharstringOp(op)) => test.assert(op == 9)
+        _                         => test.assert(false)
+
+    test.case("and an escape the interpreter never dispatches is still named by number")
+    match fontcff.charstring_outline(cs_of(t, top, 21), t, top, 0)
+        Err(FontCharstringOp(op)) => test.assert(op == 3072 + 3)
+        _                         => test.assert(false)
+
+@test
+fn test_the_interpreter_refuses_a_state_it_cannot_continue_from() [io]
+    let (t, top) = fixture()
+
+    test.case("THE CLAIM: an odd operand count is refused by the operator's own name")
+    match fontcff.charstring_outline(cs_of(t, top, 16), t, top, 0)
+        Err(FontCharstringState(why)) => test.assert(why == "rlineto takes pairs of operands")
+        _                             => test.assert(false)
+
+    test.case("endchar's four-argument form is seac, which needs a base and an accent glyph")
+    match fontcff.charstring_outline(cs_of(t, top, 17), t, top, 0)
+        Err(FontCharstringState(why)) =>
+            test.assert(why == "seac: endchar's four-argument form")
+        _                             => test.assert(false)
+
+    test.case("the stack is forty-eight operands, and the forty-ninth is a fault")
+    match fontcff.charstring_outline(cs_of(t, top, 18), t, top, 0)
+        Err(FontCharstringState(why)) =>
+            test.assert(why == "the stack holds more than 48 operands")
+        _                             => test.assert(false)
+
+    test.case("a subroutine number past the end of its index is a state fault")
+    match fontcff.charstring_outline(cs_of(t, top, 20), t, top, 0)
+        Err(FontCharstringState(why)) =>
+            test.assert(why == "a subroutine number is past the end of its index")
+        _                             => test.assert(false)
+
+    test.case("THE DEPTH LIMIT IS TEN, and a subroutine that calls itself reaches it")
+    match fontcff.charstring_outline(cs_of(t, top, 30), t, top, 0)
+        Err(FontCharstringState(why)) =>
+            test.assert(why == "a subroutine call nests more than 10 deep")
+        _                             => test.assert(false)
+
+    test.case("so does a call made with no depth left to give it")
+    match fontcff.charstring_outline(cs_of(t, top, 10), t, top, 10)
+        Err(FontCharstringState(why)) =>
+            test.assert(why == "a subroutine call nests more than 10 deep")
+        _                             => test.assert(false)
+
+    test.case("and every operand count the drawing operators have is checked before they draw")
+    match fontcff.charstring_outline(cs_of(t, top, 22), t, top, 0)
+        Err(FontCharstringState(why)) => test.assert(why == "rmoveto takes two operands")
+        _                             => test.assert(false)
+    match fontcff.charstring_outline(cs_of(t, top, 23), t, top, 0)
+        Err(FontCharstringState(why)) => test.assert(why == "hmoveto takes one operand")
+        _                             => test.assert(false)
+    match fontcff.charstring_outline(cs_of(t, top, 24), t, top, 0)
+        Err(FontCharstringState(why)) => test.assert(why == "hmoveto takes one operand")
+        _                             => test.assert(false)
+    // vmoveto is the third of the three moves and it is the one that
+    // reads its single operand as a `y`.  One byte and no operand at
+    // all: the width heuristic wants an even count for this operator,
+    // so an empty stack is not a width and the count is 0, not 1.
+    match fontcff.charstring_outline(bytes_of([4]), t, top, 0)
+        Err(FontCharstringState(why)) => test.assert(why == "vmoveto takes one operand")
+        _                             => test.assert(false)
+
+    test.case("a curve operator takes four operands per curve, and the refusals say which")
+    match fontcff.charstring_outline(cs_of(t, top, 25), t, top, 0)
+        Err(FontCharstringState(why)) =>
+            test.assert(why == "rrcurveto takes six operands per curve")
+        _                             => test.assert(false)
+    match fontcff.charstring_outline(cs_of(t, top, 26), t, top, 0)
+        Err(FontCharstringState(why)) =>
+            test.assert(why == "rcurveline takes six operands per curve and a final pair")
+        _                             => test.assert(false)
+    match fontcff.charstring_outline(cs_of(t, top, 27), t, top, 0)
+        Err(FontCharstringState(why)) =>
+            test.assert(why == "rlinecurve takes pairs and six operands for its last curve")
+        _                             => test.assert(false)
+    match fontcff.charstring_outline(cs_of(t, top, 28), t, top, 0)
+        Err(FontCharstringState(why)) =>
+            test.assert(why == "a curve operator takes four operands per curve")
+        _                             => test.assert(false)
+    match fontcff.charstring_outline(cs_of(t, top, 29), t, top, 0)
+        Err(FontCharstringState(why)) =>
+            test.assert(why == "hlineto and vlineto take at least one operand")
+        _                             => test.assert(false)
+
+// ── The dry run and the names ────────────────────────────────────────
+
+@test
+fn test_is_interpretable_walks_the_same_machine_without_drawing() [io]
+    test.case("THE CLAIM: a charstring of operators this module draws is interpretable")
+    test.assert(fontcff.is_interpretable(op(21, [10, 10]) + op(5, [0, 0])
+                                          + bytes_of([14])))
+    test.assert(fontcff.is_interpretable(nums([0, 0, 0]) + bytes_of([1])))
+
+    test.case("a refusal is a refusal here too, by operator number and by byte")
+    test.assert(not fontcff.is_interpretable(nums([0, 0]) + esc(35)))
+    test.assert(not fontcff.is_interpretable(nums([0, 0]) + esc(10)))
+    test.assert(not fontcff.is_interpretable(bytes_of([9])))
+
+    test.case("an escape past the end of the charstring is read as escape 0 and refused")
+    test.assert(not fontcff.is_interpretable(bytes_of([12])))
+
+    test.case("return ends the walk as an endchar would, and a call is taken as interpreted")
+    test.assert(fontcff.is_interpretable(op(10, [0 - 107]) + bytes_of([11])))
+    test.assert(fontcff.is_interpretable(op(21, [0, 0]) + op(29, [0 - 107])
+                                          + bytes_of([14])))
+
+    test.case("a mask is skipped by the stems declared before it, width operand and all")
+    test.assert(fontcff.is_interpretable(nums([0, 0, 0]) + bytes_of([1, 19, 255])))
+    test.assert(not fontcff.is_interpretable(nums([0, 0]) + bytes_of([1, 19])))
+
+    test.case("and a stack that overflows is a charstring no font may contain")
+    // Forty-nine operands and no operator to consume them: the limit is
+    // 48, so the forty-ninth push is what makes it uninterpretable.
+    test.assert(not fontcff.is_interpretable(many(49, 0)))
+    test.assert(fontcff.is_interpretable(many(48, 0) + bytes_of([14])))
+
+@test
+fn test_operator_name_names_what_the_two_lists_hold() [io]
+    test.case("THE CLAIM: a plain operator's name comes from the list at its own number")
+    test.assert(fontcff.operator_name(1) == "hstem")
+    test.assert(fontcff.operator_name(21) == "rmoveto")
+    test.assert(fontcff.operator_name(31) == "hvcurveto")
+    test.assert(fontcff.operator_name(26) == "vvcurveto")
+
+    test.case("an escape's name is at 3072 + x, where x is the byte after the 12")
+    test.assert(fontcff.operator_name(3072) == "dotsection")
+    test.assert(fontcff.operator_name(3072 + 34) == "hflex")
+
+    test.case("a number the format has no name for is answered as a NUMBER, in both lists")
+    test.assert(fontcff.operator_name(2) == "operator 2")
+    test.assert(fontcff.operator_name(9) == "operator 9")
+    test.assert(fontcff.operator_name(3072 + 1) == "operator 3073")
+    test.assert(fontcff.operator_name(3072 + 99) == "operator 3171")
+    test.assert(fontcff.operator_name(32) == "operator 32")
+    test.assert(fontcff.operator_name(0 - 1) == "operator -1")
+
+    test.case("and the two published lists are the interpreter's whole scope, with no overlap")
+    // The counts are the lists' own: twenty-three operators the
+    // interpreter dispatches and twenty-five it refuses.  Every
+    // covered number has a name a message can carry — the fallback is
+    // `operator N`, so a covered number whose name is the fallback is
+    // a dispatch arm with no entry in the name table — and no number
+    // is in both lists, which is what lets a caller screen a font
+    // library with them and get one answer per operator.
+    let covered = fontcff.operators_covered()
+    let refused = fontcff.operators_refused()
+    test.assert(list.len(covered) == 23)
+    test.assert(list.len(refused) == 25)
+    for op in covered
+        test.assert(fontcff.operator_name(op) != "operator ${op}")
+        test.assert(not list.contains(refused, op))
+
+@test
+fn test_a_top_dict_a_caller_built_is_read_defensively() [io]
+    // The struct is public and a caller may hold one that did not come
+    // out of `parse_top`: these are the guards that exist for it.
+    let (t, top) = fixture()
+    let bent = FontCffTop {
+        charstrings: fontsrc.range(5000, 4),
+        private: top.private,
+        local_subrs: fontsrc.range(5000, 4),
+        global_subrs: top.global_subrs,
+        charset: top.charset,
+        matrix: top.matrix,
+        default_width: top.default_width,
+        nominal_width: top.nominal_width,
+        is_cid: top.is_cid }
+
+    test.case("THE CLAIM: a CharStrings range that will not parse is no glyphs, not a fault")
+    test.assert(fontcff.glyph_count(bent, t) == 0)
+    test.assert(fontcff.charstring_range(t, bent, 0) == None)
+
+    test.case("and a local index with no INDEX behind it is a call that cannot be taken")
+    match fontcff.charstring_outline(cs_of(t, top, 10), t, bent, 0)
+        Err(FontCharstringState(why)) =>
+            test.assert(why == "a subroutine number is past the end of its index")
+        _                             => test.assert(false)
