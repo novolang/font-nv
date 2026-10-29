@@ -1,8 +1,6 @@
 // fontcff.nv — the `CFF ` table: an INDEX of INDEXes, two DICTs, and a
 // stack machine that draws.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // WHY THIS IS ITS OWN MODULE AND NOT PART OF `fontglyf`.  A font has
 // TrueType outlines or CFF outlines, never both, and the two share
 // nothing below the path they answer: `glyf` is a point list read with
@@ -31,6 +29,12 @@
 //             arithmetic and storage group (add sub div and or not
 //             abs neg sqrt drop exch index roll dup put get ifelse)
 //
+// A CID-keyed font keeps its subroutines in one private dictionary per
+// font dictionary and picks the dictionary for each glyph with an
+// FDSelect.  Neither is read: `parse_top` reports `is_cid`, and a
+// charstring of such a font that calls a local subroutine is refused
+// with `FontCharstringState`.
+//
 // The refusals are not equal and the README says which is which:
 // `flex` is a curve smoothing pair that a font DOES use and whose
 // absence loses a shallow curve, so it is the first thing the
@@ -47,6 +51,7 @@ use geomxform
 use svgpath
 use fonterror
 use fontsrc
+use fontdir
 
 // A CFF INDEX: a count, an offset size, and the offsets that follow.
 //
@@ -121,35 +126,266 @@ struct FontCharWidth
 // How many bytes the `CFF ` header is: 4, then `hdrSize` says the
 // rest.
 pub fn header_len() -> Int []
-    todo("font-nv.fontcff.header_len")
+    4
 
 // Read an INDEX header at an offset inside the table.
 pub fn index_at(data: Bytes, at: Int) -> Result<FontCffIndex, fonterror.FontFault> []
-    todo("font-nv.fontcff.index_at")
+    let have = bytes.len(data)
+    if at < 0 or have < at + 2
+        return Err(fontsrc.short(fontdir.tag_cff(), at + 2, have))
+    let count = u16_at(data, at)
+    if count == 0
+        return Ok(FontCffIndex { count: 0, off_size: 0, range: fontsrc.range(at, 2), data_at: at + 2 })
+    let off_size = bytes.byte_at(data, at + 2) ?? 0
+    if off_size < 1 or off_size > 4
+        return Err(FontBadField(fontdir.tag_cff(), "offSize", off_size))
+    let offsets_end = at + 3 + (count + 1) * off_size
+    if have < offsets_end
+        return Err(fontsrc.short(fontdir.tag_cff(), offsets_end, have))
+    let data_at = offsets_end - 1
+    let last = offset_at(data, at + 3 + count * off_size, off_size)
+    if last < 1
+        return Err(FontBadField(fontdir.tag_cff(), "last offset", last))
+    let end = data_at + last
+    if have < end
+        return Err(fontsrc.short(fontdir.tag_cff(), end, have))
+    Ok(FontCffIndex { count: count, off_size: off_size, range: fontsrc.range(at, end - at),
+                      data_at: data_at })
+// The unsigned 16-bit number at `off`, or 0 past the end.
+fn u16_at(data: Bytes, off: Int) -> Int
+    bytes.u16_be_at(data, off) ?? 0
+
+// The big-endian offset of `size` bytes at `pos`, or 0 past the end.
+fn offset_at(data: Bytes, pos: Int, size: Int) -> Int
+    var v = 0
+    for k in 0..size
+        v = v * 256 + (bytes.byte_at(data, pos + k) ?? 0)
+    v
 
 // Where entry `i` of an INDEX lives.
 //
 // Nothing when `i` is past the count.  A zero-length entry is legal
 // and means an empty glyph, the same way an empty `glyf` record does.
 pub fn index_entry(data: Bytes, ix: FontCffIndex, i: Int) -> ?fontsrc.FontRange []
-    todo("font-nv.fontcff.index_entry")
+    if i < 0 or i >= ix.count
+        return None
+    let a = offset_at(data, ix.range.at + 3 + i * ix.off_size, ix.off_size)
+    let b = offset_at(data, ix.range.at + 3 + (i + 1) * ix.off_size, ix.off_size)
+    var n = b - a
+    if n < 0
+        n = 0
+    Some(fontsrc.range(ix.data_at + a, n))
 
 // Where the whole INDEX ends, so the next one can be found.
 pub fn index_end(data: Bytes, ix: FontCffIndex) -> Int []
-    todo("font-nv.fontcff.index_end")
+    fontsrc.range_end(ix.range)
 
 // Parse the header and the top DICT into the fields a reader needs.
 pub fn parse_top(data: Bytes,
                  table: fontsrc.FontRange) -> Result<FontCffTop, fonterror.FontFault> []
-    todo("font-nv.fontcff.parse_top")
+    let have = bytes.len(data)
+    if have < 4
+        return Err(fontsrc.short(fontdir.tag_cff(), 4, have))
+    if is_cff2(data)
+        return Err(FontBadField(fontdir.tag_cff(), "major", 2))
+    let header_size = bytes.byte_at(data, 2) ?? 0
+    if header_size < 4
+        return Err(FontBadField(fontdir.tag_cff(), "hdrSize", header_size))
+    let names = index_at(data, header_size)!
+    let tops = index_at(data, index_end(data, names))!
+    let strings = index_at(data, index_end(data, tops))!
+    let globals = index_at(data, index_end(data, strings))!
+    let entry = match index_entry(data, tops, 0)
+        Some(r) => r
+        None    =>
+            return Err(FontBadField(fontdir.tag_cff(), "top DICT", 0))
+    let dict = read_dict(fontsrc.slice(data, entry))
+    if dict.charstrings < 0
+        return Err(FontBadField(fontdir.tag_cff(), "CharStrings", 0))
+    let charstrings = index_at(data, dict.charstrings)!
+    var private = fontsrc.empty(0)
+    var local_subrs = fontsrc.empty(0)
+    var default_width = dict.default_width
+    var nominal_width = dict.nominal_width
+    if dict.has_private
+        private = fontsrc.sub(fontsrc.range(0, have), dict.private_at, dict.private_size)
+        let inner = read_dict(fontsrc.slice(data, private))
+        default_width = inner.default_width
+        nominal_width = inner.nominal_width
+        if inner.subrs >= 0
+            match index_at(data, private.at + inner.subrs)
+                Ok(ix) =>
+                    local_subrs = ix.range
+                Err(_) => ()
+    var charset = fontsrc.empty(0)
+    if dict.charset >= 3
+        charset = fontsrc.range(dict.charset, 0)
+    Ok(FontCffTop { charstrings: charstrings.range, private: private, local_subrs: local_subrs,
+                    global_subrs: globals.range, charset: charset, matrix: dict.matrix,
+                    default_width: default_width, nominal_width: nominal_width,
+                    is_cid: dict.is_cid })
+// What a DICT said about the fields a reader needs; -1 or the default
+// where it was silent.
+struct Dict
+    var charset: Int
+    var charstrings: Int
+    var has_private: Bool
+    var private_size: Int
+    var private_at: Int
+    var subrs: Int
+    var default_width: Float
+    var nominal_width: Float
+    var matrix: geomxform.GeomXform
+    var is_cid: Bool
+
+// Read the operators of a DICT that matter, each with the operands
+// that preceded it.  A byte that begins no number and is no operator
+// reads as the operand 0, so the operators after it stay aligned.
+fn read_dict(bytes_: Bytes) -> Dict
+    var d = Dict { charset: 0 - 1, charstrings: 0 - 1, has_private: false, private_size: 0,
+                   private_at: 0, subrs: 0 - 1, default_width: 0.0, nominal_width: 0.0,
+                   matrix: geomxform.of_matrix(0.001, 0.0, 0.0, 0.001, 0.0, 0.0), is_cid: false }
+    let n = bytes.len(bytes_)
+    var operands: [Float] = []
+    var i = 0
+    while i < n
+        let b = bytes.byte_at(bytes_, i) ?? 0
+        i += 1
+        if b <= 21
+            var op = b
+            if b == 12
+                op = 1200 + (bytes.byte_at(bytes_, i) ?? 0)
+                i += 1
+            apply_operator(var d, op, operands)
+            operands = []
+        else
+            let (v, next) = dict_operand(bytes_, b, i)
+            i = next
+            list.push(operands, v)
+    d
+
+// Record one DICT operator's operands in the fields it names.
+fn apply_operator(var d: Dict, op: Int, operands: [Float])
+    let k = list.len(operands)
+    if k == 0
+        return
+    let last = operands[k - 1]
+    if op == 15
+        d.charset = whole(last)
+    else if op == 17
+        d.charstrings = whole(last)
+    else if op == 18 and k >= 2
+        d.has_private = true
+        d.private_size = whole(operands[k - 2])
+        d.private_at = whole(last)
+    else if op == 19
+        d.subrs = whole(last)
+    else if op == 20
+        d.default_width = last
+    else if op == 21
+        d.nominal_width = last
+    else if op == 1207 and k >= 6
+        d.matrix = geomxform.of_matrix(operands[k - 6], operands[k - 5], operands[k - 4],
+                                       operands[k - 3], operands[k - 2], last)
+    else if op == 1230
+        d.is_cid = k >= 3
+
+// A DICT number as a whole number, 0 where it is not finite or does not fit.
+fn whole(v: Float) -> Int
+    math.checked_to_int(v) ?? 0
+
+// One DICT operand that begins with `b`, and where the next byte is.
+fn dict_operand(data: Bytes, b: Int, i: Int) -> (Float, Int)
+    if b == 28
+        return (signed16(u16_at(data, i)) as Float, i + 2)
+    if b == 29
+        return (signed32(bytes.u32_be_at(data, i) ?? 0) as Float, i + 4)
+    if b == 30
+        return read_real(data, i)
+    if b >= 32 and b <= 246
+        return ((b - 139) as Float, i)
+    if b >= 247 and b <= 250
+        return (((b - 247) * 256 + (bytes.byte_at(data, i) ?? 0) + 108) as Float, i + 1)
+    if b >= 251 and b <= 254
+        return ((0 - (b - 251) * 256 - (bytes.byte_at(data, i) ?? 0) - 108) as Float, i + 1)
+    (0.0, i)
+
+// A 16-bit pattern as the signed number it stands for.
+fn signed16(v: Int) -> Int
+    if v >= 32768
+        return v - 65536
+    v
+
+// A 32-bit pattern as the signed number it stands for.
+fn signed32(v: Int) -> Int
+    if v >= 2147483648
+        return v - 4294967296
+    v
+
+// A DICT real: nibbles up to the end nibble, as a decimal mantissa and
+// an exponent.  An exponent past 400 in either direction is held there,
+// so the result is a huge or tiny number rather than a long loop.
+fn read_real(data: Bytes, start: Int) -> (Float, Int)
+    let n = bytes.len(data)
+    var i = start
+    var mantissa = 0.0
+    var scale = 0
+    var negative = false
+    var point = false
+    var in_exp = false
+    var exp_negative = false
+    var exp = 0
+    var done = false
+    while not done and i < n
+        let byte = bytes.byte_at(data, i) ?? 0
+        i += 1
+        for half in 0..2
+            let nib = if half == 0
+                byte >> 4
+            else
+                byte & 15
+            if done
+                continue
+            if nib <= 9
+                if in_exp
+                    exp = if exp > 400
+                        exp
+                    else
+                        exp * 10 + nib
+                else
+                    mantissa = mantissa * 10.0 + nib as Float
+                    if point
+                        scale += 1
+            else if nib == 10
+                point = true
+            else if nib == 11 or nib == 12
+                in_exp = true
+                exp_negative = nib == 12
+            else if nib == 14
+                negative = true
+            else if nib == 15
+                done = true
+    var v = mantissa
+    let shift = (if exp_negative then 0 - exp else exp) - scale
+    if shift < 0
+        v = v / math.pow(10.0, (0 - shift) as Float)
+    else
+        v = v * math.pow(10.0, shift as Float)
+    if negative
+        v = 0.0 - v
+    (v, i)
 
 // How many glyphs the CharStrings INDEX holds.
 pub fn glyph_count(top: FontCffTop, data: Bytes) -> Int []
-    todo("font-nv.fontcff.glyph_count")
+    match index_at(data, top.charstrings.at)
+        Ok(ix) => ix.count
+        Err(_) => 0
 
 // Where one glyph's charstring lives.
 pub fn charstring_range(data: Bytes, top: FontCffTop, glyph: Int) -> ?fontsrc.FontRange []
-    todo("font-nv.fontcff.charstring_range")
+    match index_at(data, top.charstrings.at)
+        Ok(ix) => index_entry(data, ix, glyph)
+        Err(_) => None
 
 // ── The subroutine bias ──────────────────────────────────────────────
 
@@ -169,7 +405,11 @@ pub fn charstring_range(data: Bytes, top: FontCffTop, glyph: Int) -> ?fontsrc.Fo
 //     println("${fontcff.bias(200)}")      // 107
 // ```
 pub fn bias(subr_count: Int) -> Int []
-    todo("font-nv.fontcff.bias")
+    if subr_count < 1240
+        return 107
+    if subr_count < 33900
+        return 1131
+    32768
 
 // ── The interpreter ──────────────────────────────────────────────────
 
@@ -186,7 +426,298 @@ pub fn bias(subr_count: Int) -> Int []
 // should know which it has, and `fontdir.flavour` is how.
 pub fn charstring_outline(cs: Bytes, data: Bytes, top: FontCffTop,
                           depth: Int) -> Result<svgpath.SvgPath, fonterror.FontFault> []
-    todo("font-nv.fontcff.charstring_outline")
+    var m = Machine { stack: [], cmds: [], x: 0.0, y: 0.0, stems: 0, width_done: false,
+                      calls: 0, finished: false }
+    run(var m, cs, data, top, depth)!
+    Ok(svgpath.of_commands(m.cmds))
+// The state of an interpretation.  The operand stack is shared with
+// subroutines, and the width and the stem count belong to the glyph.
+struct Machine
+    var stack: [Float]
+    var cmds: [SvgPathCmd]
+    var x: Float
+    var y: Float
+    var stems: Int
+    var width_done: Bool
+    var calls: Int
+    var finished: Bool
+
+// How many subroutine calls one glyph may make.  A subroutine may call
+// others many times over, and the depth limit alone still allows a tree
+// of calls no glyph is worth.
+fn call_budget() -> Int
+    10000
+
+// Run one charstring, or one subroutine of it, against the machine.
+fn run(var m: Machine, cs: Bytes, data: Bytes, top: FontCffTop,
+       depth: Int) -> Result<Unit, fonterror.FontFault>
+    let n = bytes.len(cs)
+    var i = 0
+    while i < n and not m.finished
+        let b = bytes.byte_at(cs, i) ?? 0
+        i += 1
+        if b >= 32 or b == 28
+            let (v, next) = charstring_operand(cs, b, i)
+            i = next
+            if list.len(m.stack) >= stack_limit()
+                return Err(FontCharstringState("the stack holds more than ${stack_limit()} operands"))
+            list.push(m.stack, v)
+        else if b == 12
+            return Err(FontCharstringOp(3072 + (bytes.byte_at(cs, i) ?? 0)))
+        else if b == 11
+            return Ok()
+        else if b == 19 or b == 20
+            take_stem_width(var m)
+            m.stems += list.len(m.stack) / 2
+            m.stack = []
+            let mask = (m.stems + 7) / 8
+            if i + mask > n
+                return Err(FontCharstringState("a hintmask runs past the end of the charstring"))
+            i += mask
+        else if b == 10 or b == 29
+            call_subr(var m, data, top, depth, b == 10)!
+        else
+            operate(var m, b)!
+    Ok()
+
+// One operand that begins with `b`, and where the next byte is.
+fn charstring_operand(cs: Bytes, b: Int, i: Int) -> (Float, Int)
+    if b == 28
+        return (signed16(u16_at(cs, i)) as Float, i + 2)
+    if b == 255
+        return (signed32(bytes.u32_be_at(cs, i) ?? 0) as Float / 65536.0, i + 4)
+    if b <= 246
+        return ((b - 139) as Float, i)
+    let b1 = bytes.byte_at(cs, i) ?? 0
+    if b <= 250
+        return (((b - 247) * 256 + b1 + 108) as Float, i + 1)
+    ((0 - (b - 251) * 256 - b1 - 108) as Float, i + 1)
+
+// Take the width off the front of the stack before a stem operator
+// when the count is odd, which is the only sign a width is there.
+fn take_stem_width(var m: Machine)
+    if not m.width_done
+        m.width_done = true
+        if list.len(m.stack) % 2 == 1
+            m.stack = rest(m.stack)
+
+// The stack without its first operand.
+fn rest(stack: [Float]) -> [Float]
+    var out: [Float] = []
+    for k in 1..list.len(stack)
+        list.push(out, stack[k])
+    out
+
+// Call a local or global subroutine with the number on top of the stack.
+fn call_subr(var m: Machine, data: Bytes, top: FontCffTop, depth: Int,
+             local: Bool) -> Result<Unit, fonterror.FontFault>
+    if depth >= call_depth_limit()
+        return Err(FontCharstringState("a subroutine call nests more than ${call_depth_limit()} deep"))
+    m.calls += 1
+    if m.calls > call_budget()
+        return Err(FontCharstringState("a glyph makes more than ${call_budget()} subroutine calls"))
+    let missing = "a subroutine number is past the end of its index"
+    let where_ = if local
+        top.local_subrs
+    else
+        top.global_subrs
+    if where_.len == 0 or list.len(m.stack) == 0
+        return Err(FontCharstringState(missing))
+    let ix = match index_at(data, where_.at)
+        Ok(ix) => ix
+        Err(_) =>
+            return Err(FontCharstringState(missing))
+    let number = whole(m.stack[list.len(m.stack) - 1]) + bias(ix.count)
+    m.stack = shorten(m.stack)
+    match index_entry(data, ix, number)
+        Some(r) => run(var m, fontsrc.slice(data, r), data, top, depth + 1)
+        None    => Err(FontCharstringState(missing))
+
+// The stack without its last operand.
+fn shorten(stack: [Float]) -> [Float]
+    var out: [Float] = []
+    for k in 0..list.len(stack) - 1
+        list.push(out, stack[k])
+    out
+
+// Run one operator that moves, draws or ends the glyph.
+fn operate(var m: Machine, b: Int) -> Result<Unit, fonterror.FontFault>
+    let n = list.len(m.stack)
+    if b == 1 or b == 3 or b == 18 or b == 23
+        take_stem_width(var m)
+        m.stems += list.len(m.stack) / 2
+        m.stack = []
+        return Ok()
+    if b == 21
+        move_by(var m, 2, "rmoveto takes two operands")!
+        return Ok()
+    if b == 22
+        move_by(var m, 1, "hmoveto takes one operand")!
+        return Ok()
+    if b == 4
+        move_by(var m, 1, "vmoveto takes one operand")!
+        return Ok()
+    if b == 14
+        return end_glyph(var m)
+    if b == 5
+        if n % 2 != 0
+            return Err(FontCharstringState("rlineto takes pairs of operands"))
+        lines(var m, 0, n)
+    else if b == 6 or b == 7
+        if n < 1
+            return Err(FontCharstringState("hlineto and vlineto take at least one operand"))
+        alternate_lines(var m, b == 6)
+    else if b == 8
+        if n == 0 or n % 6 != 0
+            return Err(FontCharstringState("rrcurveto takes six operands per curve"))
+        curves(var m, 0, n)
+    else if b == 24
+        if n < 8 or (n - 2) % 6 != 0
+            return Err(FontCharstringState("rcurveline takes six operands per curve and a final pair"))
+        curves(var m, 0, n - 2)
+        lines(var m, n - 2, n)
+    else if b == 25
+        if n < 8 or (n - 6) % 2 != 0
+            return Err(FontCharstringState("rlinecurve takes pairs and six operands for its last curve"))
+        lines(var m, 0, n - 6)
+        curves(var m, n - 6, n)
+    else if b == 26 or b == 27 or b == 30 or b == 31
+        if n < 4 or n % 4 > 1
+            return Err(FontCharstringState("a curve operator takes four operands per curve"))
+        if b == 27
+            half_curves(var m, true)
+        else if b == 26
+            half_curves(var m, false)
+        else
+            turning_curves(var m, b == 31)
+    else
+        return Err(FontCharstringOp(b))
+    m.stack = []
+    Ok()
+
+// Move by the operands, after the width has been taken off.  `want` is
+// how many operands the move has: 2 for a relative move, 1 for the others.
+fn move_by(var m: Machine, want: Int, refusal: Str) -> Result<Unit, fonterror.FontFault>
+    if not m.width_done
+        m.width_done = true
+        if list.len(m.stack) == want + 1
+            m.stack = rest(m.stack)
+    if list.len(m.stack) != want
+        return Err(FontCharstringState(refusal))
+    let a = m.stack[0]
+    if want == 2
+        m.x += a
+        m.y += m.stack[1]
+    else if refusal == "hmoveto takes one operand"
+        m.x += a
+    else
+        m.y += a
+    m.stack = []
+    list.push(m.cmds, SvgMoveTo(m.x, m.y))
+    Ok()
+
+// End the glyph, refusing the four-operand form that names two others.
+fn end_glyph(var m: Machine) -> Result<Unit, fonterror.FontFault>
+    var n = list.len(m.stack)
+    if not m.width_done
+        m.width_done = true
+        if n == 1 or n == 5
+            n -= 1
+    if n == 4
+        return Err(FontCharstringState("seac: endchar's four-argument form"))
+    m.finished = true
+    m.stack = []
+    Ok()
+
+// Start a subpath at the current point when none has been started.
+fn ensure_started(var m: Machine)
+    if list.len(m.cmds) == 0
+        list.push(m.cmds, SvgMoveTo(m.x, m.y))
+
+// Straight lines for the operand pairs from `from` up to `upto`.
+fn lines(var m: Machine, from: Int, upto: Int)
+    ensure_started(var m)
+    var k = from
+    while k + 2 <= upto
+        m.x += m.stack[k]
+        m.y += m.stack[k + 1]
+        list.push(m.cmds, SvgLineTo(m.x, m.y))
+        k += 2
+
+// Lines that alternate between the two axes, one operand each.
+fn alternate_lines(var m: Machine, horizontal_first: Bool)
+    ensure_started(var m)
+    var horizontal = horizontal_first
+    for k in 0..list.len(m.stack)
+        if horizontal
+            m.x += m.stack[k]
+        else
+            m.y += m.stack[k]
+        horizontal = not horizontal
+        list.push(m.cmds, SvgLineTo(m.x, m.y))
+
+// Curves of six operands each, from `from` up to `upto`.
+fn curves(var m: Machine, from: Int, upto: Int)
+    var k = from
+    while k + 6 <= upto
+        add_curve(var m, m.stack[k], m.stack[k + 1], m.stack[k + 2], m.stack[k + 3],
+                  m.stack[k + 4], m.stack[k + 5])
+        k += 6
+
+// One cubic from relative control and end points.
+fn add_curve(var m: Machine, dx1: Float, dy1: Float, dx2: Float, dy2: Float, dx3: Float, dy3: Float)
+    ensure_started(var m)
+    let x1 = m.x + dx1
+    let y1 = m.y + dy1
+    let x2 = x1 + dx2
+    let y2 = y1 + dy2
+    m.x = x2 + dx3
+    m.y = y2 + dy3
+    list.push(m.cmds, SvgCubicTo(x1, y1, x2, y2, m.x, m.y))
+
+// hhcurveto and vvcurveto: four operands per curve, with an odd leading
+// operand that is the first curve's offset across the main axis.
+fn half_curves(var m: Machine, horizontal: Bool)
+    let n = list.len(m.stack)
+    var k = 0
+    var across = 0.0
+    if n % 4 == 1
+        across = m.stack[0]
+        k = 1
+    while k + 4 <= n
+        let a = m.stack[k]
+        let b = m.stack[k + 1]
+        let c = m.stack[k + 2]
+        let d = m.stack[k + 3]
+        if horizontal
+            add_curve(var m, a, across, b, c, d, 0.0)
+        else
+            add_curve(var m, across, a, b, c, 0.0, d)
+        across = 0.0
+        k += 4
+
+// hvcurveto and vhcurveto: four operands per curve, starting along one
+// axis and turning to the other for each curve after, with an odd
+// trailing operand that goes to the last curve's end.
+fn turning_curves(var m: Machine, horizontal_first: Bool)
+    let n = list.len(m.stack)
+    var horizontal = horizontal_first
+    var k = 0
+    while k + 4 <= n
+        let extra = if k + 5 == n
+            m.stack[k + 4]
+        else
+            0.0
+        let a = m.stack[k]
+        let b = m.stack[k + 1]
+        let c = m.stack[k + 2]
+        let d = m.stack[k + 3]
+        if horizontal
+            add_curve(var m, a, 0.0, b, c, extra, d)
+        else
+            add_curve(var m, 0.0, a, b, c, d, extra)
+        horizontal = not horizontal
+        k += 4
 
 // The advance width a charstring implied, and whether it carried one.
 //
@@ -194,12 +725,46 @@ pub fn charstring_outline(cs: Bytes, data: Bytes, top: FontCffTop,
 // not want the path, and because reading the width means interpreting
 // only the first operator rather than the whole charstring.
 pub fn charstring_width(cs: Bytes, top: FontCffTop) -> FontCharWidth []
-    todo("font-nv.fontcff.charstring_width")
+    let n = bytes.len(cs)
+    var i = 0
+    var count = 0
+    var first = 0.0
+    while i < n
+        let b = bytes.byte_at(cs, i) ?? 0
+        i += 1
+        if b >= 32 or b == 28
+            let (v, next) = charstring_operand(cs, b, i)
+            i = next
+            if count == 0
+                first = v
+            count += 1
+        else if b == 12
+            i += 1
+        else if settles_width(b, count)
+            return FontCharWidth { width: top.nominal_width + first, explicit: true }
+        else if is_clearing(b)
+            return FontCharWidth { width: top.default_width, explicit: false }
+    FontCharWidth { width: top.default_width, explicit: false }
+// Whether the operator takes a leading width given this many operands.
+fn settles_width(b: Int, count: Int) -> Bool
+    if b == 1 or b == 3 or b == 18 or b == 23 or b == 19 or b == 20
+        return count % 2 == 1
+    if b == 21
+        return count == 3
+    if b == 22 or b == 4
+        return count == 2
+    if b == 14
+        return count == 1 or count == 5
+    false
+
+// Whether the operator is one of the first that can carry a width.
+fn is_clearing(b: Int) -> Bool
+    b == 1 or b == 3 or b == 18 or b == 23 or b == 19 or b == 20 or b == 21 or b == 22 or b == 4 or b == 14
 
 // How deep `callsubr` and `callgsubr` may nest: 10, which is the
 // specification's own limit.
 pub fn call_depth_limit() -> Int []
-    todo("font-nv.fontcff.call_depth_limit")
+    10
 
 // How many arguments the interpreter's stack may hold: 48.
 //
@@ -207,7 +772,7 @@ pub fn call_depth_limit() -> Int []
 // package refuses on a whim — it is one the specification forbids —
 // and a caller reading `FontCharstringState` deserves the number.
 pub fn stack_limit() -> Int []
-    todo("font-nv.fontcff.stack_limit")
+    48
 
 // The operator numbers this module interprets.
 //
@@ -215,7 +780,7 @@ pub fn stack_limit() -> Int []
 // one list covers both, which is what the interpreter's own dispatch
 // does.
 pub fn operators_covered() -> [Int] []
-    todo("font-nv.fontcff.operators_covered")
+    [1, 3, 4, 5, 6, 7, 8, 10, 11, 14, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 29, 30, 31]
 
 // The operator numbers it refuses, in the same encoding.
 //
@@ -223,11 +788,61 @@ pub fn operators_covered() -> [Int] []
 // survey over a font library can say which fonts this module would
 // refuse, before anything is drawn.
 pub fn operators_refused() -> [Int] []
-    todo("font-nv.fontcff.operators_refused")
+    [3072, 3075, 3076, 3077, 3081, 3082, 3083, 3084, 3086, 3087, 3090, 3092, 3093, 3094, 3095,
+     3096, 3098, 3099, 3100, 3101, 3102, 3106, 3107, 3108, 3109]
 
 // The name of an operator number, for a message a person reads.
 pub fn operator_name(op: Int) -> Str []
-    todo("font-nv.fontcff.operator_name")
+    match op
+        1    => "hstem"
+        3    => "vstem"
+        4    => "vmoveto"
+        5    => "rlineto"
+        6    => "hlineto"
+        7    => "vlineto"
+        8    => "rrcurveto"
+        10   => "callsubr"
+        11   => "return"
+        14   => "endchar"
+        18   => "hstemhm"
+        19   => "hintmask"
+        20   => "cntrmask"
+        21   => "rmoveto"
+        22   => "hmoveto"
+        23   => "vstemhm"
+        24   => "rcurveline"
+        25   => "rlinecurve"
+        26   => "vvcurveto"
+        27   => "hhcurveto"
+        29   => "callgsubr"
+        30   => "vhcurveto"
+        31   => "hvcurveto"
+        3072 => "dotsection"
+        3075 => "and"
+        3076 => "or"
+        3077 => "not"
+        3081 => "abs"
+        3082 => "add"
+        3083 => "sub"
+        3084 => "div"
+        3086 => "neg"
+        3087 => "eq"
+        3090 => "drop"
+        3092 => "put"
+        3093 => "get"
+        3094 => "ifelse"
+        3095 => "random"
+        3096 => "mul"
+        3098 => "sqrt"
+        3099 => "dup"
+        3100 => "exch"
+        3101 => "index"
+        3102 => "roll"
+        3106 => "hflex"
+        3107 => "flex"
+        3108 => "hflex1"
+        3109 => "flex1"
+        _    => "operator ${op}"
 
 // Whether a charstring uses only operators this module interprets.
 //
@@ -235,7 +850,36 @@ pub fn operator_name(op: Int) -> Str []
 // building a path.  For a font validator, and for a renderer that
 // would rather fall back to a different font than draw half a glyph.
 pub fn is_interpretable(cs: Bytes) -> Bool []
-    todo("font-nv.fontcff.is_interpretable")
+    let n = bytes.len(cs)
+    var i = 0
+    var count = 0
+    var stems = 0
+    while i < n
+        let b = bytes.byte_at(cs, i) ?? 0
+        i += 1
+        if b >= 32 or b == 28
+            let (_, next) = charstring_operand(cs, b, i)
+            i = next
+            count += 1
+            if count > stack_limit()
+                return false
+        else if b == 12 or not list.contains(operators_covered(), b)
+            return false
+        else if b == 11 or b == 14
+            return true
+        else if b == 10 or b == 29
+            count -= 1
+            if count < 0
+                count = 0
+        else
+            if b == 19 or b == 20 or b == 1 or b == 3 or b == 18 or b == 23
+                stems += count / 2
+            if b == 19 or b == 20
+                i += (stems + 7) / 8
+                if i > n
+                    return false
+            count = 0
+    true
 
 // Whether the table is CFF2 rather than CFF.
 //
@@ -245,4 +889,4 @@ pub fn is_interpretable(cs: Bytes) -> Bool []
 // needs a different package, and telling it so is more useful than a
 // parse error twenty bytes in.
 pub fn is_cff2(data: Bytes) -> Bool []
-    todo("font-nv.fontcff.is_cff2")
+    (bytes.byte_at(data, 0) ?? 0) == 2

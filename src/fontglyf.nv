@@ -1,8 +1,6 @@
 // fontglyf.nv — `loca` and `glyf`: where a glyph is, and what shape it
 // is when you get there.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // QUADRATICS, KEPT QUADRATIC.  A TrueType outline is a sequence of
 // points, each flagged on-curve or off-curve, and the curve between
 // two on-curve points with one off-curve point between them is a
@@ -32,6 +30,7 @@ use geomxform
 use svgpath
 use fonterror
 use fontsrc
+use fontdir
 
 // `loca`, parsed: one file offset per glyph, plus the terminator.
 //
@@ -94,7 +93,7 @@ pub struct FontComponent
 // naive reader recurse until the stack is gone — a hang rather than a
 // crash, which is worse.
 pub fn component_limit() -> Int []
-    todo("font-nv.fontglyf.component_limit")
+    5
 
 // ── `loca` ───────────────────────────────────────────────────────────
 
@@ -104,7 +103,7 @@ pub fn component_limit() -> Int []
 // `(num_glyphs + 1) * (2 or 4)`.  Published so a caller sizes its read
 // before it makes it.
 pub fn loca_len(num_glyphs: Int, long_format: Bool) -> Int []
-    todo("font-nv.fontglyf.loca_len")
+    (num_glyphs + 1) * (if long_format then 4 else 2)
 
 // Parse `loca`.
 //
@@ -113,7 +112,17 @@ pub fn loca_len(num_glyphs: Int, long_format: Bool) -> Int []
 // subset to exactly the wrong size.
 pub fn parse_loca(data: Bytes, num_glyphs: Int,
                   long_format: Bool) -> Result<FontLoca, fonterror.FontFault> []
-    todo("font-nv.fontglyf.parse_loca")
+    let want = loca_len(num_glyphs, long_format)
+    let have = bytes.len(data)
+    if have < want
+        return Err(fontsrc.short(fontdir.tag_loca(), want, have))
+    var offsets: [Int] = []
+    for i in 0..num_glyphs + 1
+        if long_format
+            list.push(offsets, bytes.u32_be_at(data, 4 * i) ?? 0)
+        else
+            list.push(offsets, 2 * (bytes.u16_be_at(data, 2 * i) ?? 0))
+    Ok(FontLoca { offsets: offsets, long_format: long_format })
 
 // Where a glyph's record lives, relative to the start of `glyf`.
 //
@@ -121,7 +130,13 @@ pub fn parse_loca(data: Bytes, num_glyphs: Int,
 // a space and not a failure.  Nothing when the id is past the end of
 // the font.
 pub fn glyph_range(loca: FontLoca, glyph: Int) -> ?fontsrc.FontRange []
-    todo("font-nv.fontglyf.glyph_range")
+    if glyph < 0 or glyph >= loca_glyph_count(loca)
+        return None
+    let at = loca.offsets[glyph]
+    var n = loca.offsets[glyph + 1] - at
+    if n < 0
+        n = 0
+    Some(fontsrc.range(at, n))
 
 // The same, as a file offset, given where `glyf` begins.
 //
@@ -130,11 +145,16 @@ pub fn glyph_range(loca: FontLoca, glyph: Int) -> ?fontsrc.FontRange []
 // source wants file offsets.
 pub fn glyph_file_range(loca: FontLoca, glyf: fontsrc.FontRange,
                         glyph: Int) -> ?fontsrc.FontRange []
-    todo("font-nv.fontglyf.glyph_file_range")
+    match glyph_range(loca, glyph)
+        Some(r) => Some(fontsrc.range(glyf.at + r.at, r.len))
+        None    => None
 
 // How many glyphs `loca` describes.
 pub fn loca_glyph_count(loca: FontLoca) -> Int []
-    todo("font-nv.fontglyf.loca_glyph_count")
+    let n = list.len(loca.offsets) - 1
+    if n < 0
+        return 0
+    n
 
 // ── A glyph record ───────────────────────────────────────────────────
 
@@ -143,7 +163,12 @@ pub fn loca_glyph_count(loca: FontLoca) -> Int []
 // Reads the first two bytes: a negative contour count is a composite,
 // zero bytes is empty, anything else is simple.
 pub fn glyph_kind(glyph: Bytes) -> FontGlyphKind []
-    todo("font-nv.fontglyf.glyph_kind")
+    let n = contour_count(glyph)
+    if bytes.len(glyph) < 2
+        return FontGlyphEmpty
+    if n < 0
+        return FontGlyphComposite
+    FontGlyphSimple
 
 // The glyph's own bounding box, in font units.
 //
@@ -154,12 +179,36 @@ pub fn glyph_kind(glyph: Bytes) -> FontGlyphKind []
 // `bounds_from_points` is the honest one for a caller that has already
 // read the outline.
 pub fn glyph_bounds(glyph: Bytes) -> geomrect.GeomRectF []
-    todo("font-nv.fontglyf.glyph_bounds")
+    if bytes.len(glyph) < 10
+        return geomrect.empty()
+    let x0 = i16_at(glyph, 2)
+    let y0 = i16_at(glyph, 4)
+    geomrect.of_xywh(x0 as Float, y0 as Float, (i16_at(glyph, 6) - x0) as Float,
+                     (i16_at(glyph, 8) - y0) as Float)
+// The signed 16-bit number at `off`, or 0 past the end.
+fn i16_at(data: Bytes, off: Int) -> Int
+    let v = bytes.u16_be_at(data, off) ?? 0
+    if v >= 32768
+        return v - 65536
+    v
+
+// The unsigned 16-bit number at `off`, or 0 past the end.
+fn u16_at(data: Bytes, off: Int) -> Int
+    bytes.u16_be_at(data, off) ?? 0
+
+// F2Dot14: a signed 16-bit number counted in sixteen-thousand-three-hundred-and-eighty-fourths.
+fn f2dot14(data: Bytes, off: Int) -> Float
+    i16_at(data, off) as Float / 16384.0
 
 // How many contours a simple glyph has; 0 for empty, -1 for a
 // composite.
 pub fn contour_count(glyph: Bytes) -> Int []
-    todo("font-nv.fontglyf.contour_count")
+    if bytes.len(glyph) < 2
+        return 0
+    let n = i16_at(glyph, 0)
+    if n < 0
+        return 0 - 1
+    n
 
 // A simple glyph's outline, in font units.
 //
@@ -183,7 +232,147 @@ pub fn contour_count(glyph: Bytes) -> Int []
 //         Err(e) => println(e.message())
 // ```
 pub fn outline(glyph: Bytes) -> Result<svgpath.SvgPath, fonterror.FontFault> []
-    todo("font-nv.fontglyf.outline")
+    let have = bytes.len(glyph)
+    if have == 0
+        return Ok(svgpath.empty())
+    if have < 10
+        return Err(fontsrc.short(fontdir.tag_glyf(), 10, have))
+    let n = i16_at(glyph, 0)
+    if n <= 0
+        return Ok(svgpath.empty())
+    let ends_end = 10 + 2 * n
+    if have < ends_end
+        return Err(fontsrc.short(fontdir.tag_glyf(), ends_end, have))
+    if have < ends_end + 2
+        return Err(FontBadField(fontdir.tag_glyf(), "instructionLength", ends_end))
+    let instructions = u16_at(glyph, ends_end)
+    let flags_at = ends_end + 2 + instructions
+    if flags_at > have
+        return Err(FontBadField(fontdir.tag_glyf(), "instructions", instructions))
+    let count = u16_at(glyph, ends_end - 2) + 1
+    let flags = read_flags(glyph, flags_at, count)!
+    let (xs, ys, ons) = read_points(glyph, flags.0, flags.1, count)!
+    var cmds: [SvgPathCmd] = []
+    var start = 0
+    for c in 0..n
+        let end = u16_at(glyph, 10 + 2 * c)
+        if end >= start
+            contour(var cmds, xs, ys, ons, start, end)
+            start = end + 1
+    Ok(svgpath.of_commands(cmds))
+// The flag of every point, and where the coordinates begin.
+//
+// A flag with the repeat bit set is followed by a count of further
+// points that share it; a run that would pass the last point is cut
+// there.
+fn read_flags(glyph: Bytes, at: Int, count: Int) -> Result<([Int], Int), fonterror.FontFault>
+    let have = bytes.len(glyph)
+    var flags: [Int] = []
+    var pos = at
+    while list.len(flags) < count
+        if pos >= have
+            return Err(FontBadField(fontdir.tag_glyf(), "flags", list.len(flags)))
+        let flag = bytes.byte_at(glyph, pos) ?? 0
+        pos += 1
+        list.push(flags, flag)
+        if (flag & 8) != 0
+            if pos >= have
+                return Err(FontBadField(fontdir.tag_glyf(), "flags", list.len(flags)))
+            var again = bytes.byte_at(glyph, pos) ?? 0
+            pos += 1
+            while again > 0 and list.len(flags) < count
+                list.push(flags, flag)
+                again -= 1
+    Ok((flags, pos))
+
+// The absolute coordinates of every point, read from the two delta runs.
+fn read_points(glyph: Bytes, flags: [Int], at: Int,
+               count: Int) -> Result<([Float], [Float], [Bool]), fonterror.FontFault>
+    let xs_run = read_axis(glyph, flags, at, 2, 16, "xCoordinates")!
+    let ys_run = read_axis(glyph, flags, xs_run.1, 4, 32, "yCoordinates")!
+    var ons: [Bool] = []
+    for f in flags
+        list.push(ons, (f & 1) != 0)
+    Ok((xs_run.0, ys_run.0, ons))
+
+// One axis of the coordinate runs.  `short_bit` says a delta is one byte
+// and `same_bit` says its sign when it is short, or that there is no
+// delta at all when it is not.
+fn read_axis(glyph: Bytes, flags: [Int], at: Int, short_bit: Int, same_bit: Int,
+             field: Str) -> Result<([Float], Int), fonterror.FontFault>
+    let have = bytes.len(glyph)
+    var out: [Float] = []
+    var pos = at
+    var value = 0
+    for f in flags
+        if (f & short_bit) != 0
+            if pos >= have
+                return Err(FontBadField(fontdir.tag_glyf(), field, pos))
+            let b = bytes.byte_at(glyph, pos) ?? 0
+            pos += 1
+            if (f & same_bit) != 0
+                value += b
+            else
+                value -= b
+        else if (f & same_bit) == 0
+            if pos + 2 > have
+                return Err(FontBadField(fontdir.tag_glyf(), field, pos))
+            value += i16_at(glyph, pos)
+            pos += 2
+        list.push(out, value as Float)
+    Ok((out, pos))
+
+// Append one contour, the points `first` to `last` inclusive, as a
+// closed run of lines and quadratics.  A point past the end of the data
+// is the origin, on the curve.
+fn contour(var cmds: [SvgPathCmd], xs: [Float], ys: [Float], ons: [Bool], first: Int, last: Int)
+    var px: [Float] = []
+    var py: [Float] = []
+    var pon: [Bool] = []
+    for i in first..last + 1
+        if i < list.len(xs)
+            list.push(px, xs[i])
+            list.push(py, ys[i])
+            list.push(pon, ons[i])
+        else
+            list.push(px, 0.0)
+            list.push(py, 0.0)
+            list.push(pon, true)
+    let n = list.len(px)
+    var sx = px[0]
+    var sy = py[0]
+    var from = 1
+    var upto = n
+    if not pon[0]
+        if pon[n - 1]
+            sx = px[n - 1]
+            sy = py[n - 1]
+            from = 0
+            upto = n - 1
+        else
+            sx = (px[0] + px[n - 1]) / 2.0
+            sy = (py[0] + py[n - 1]) / 2.0
+            from = 0
+    list.push(cmds, SvgMoveTo(sx, sy))
+    var pending = false
+    var cx = 0.0
+    var cy = 0.0
+    for i in from..upto
+        if pon[i]
+            if pending
+                list.push(cmds, SvgQuadTo(cx, cy, px[i], py[i]))
+                pending = false
+            else
+                list.push(cmds, SvgLineTo(px[i], py[i]))
+        else
+            if pending
+                list.push(cmds, SvgQuadTo(cx, cy, (cx + px[i]) / 2.0, (cy + py[i]) / 2.0))
+            cx = px[i]
+            cy = py[i]
+            pending = true
+    if pending
+        list.push(cmds, SvgQuadTo(cx, cy, sx, sy))
+    list.push(cmds, SvgClosePath)
 
 // The outline's own bounding box, computed from the points.
 //
@@ -191,14 +380,97 @@ pub fn outline(glyph: Bytes) -> Result<svgpath.SvgPath, fonterror.FontFault> []
 // tight and correct where `glyph_bounds` is fast and occasionally
 // wrong.
 pub fn bounds_from_points(p: svgpath.SvgPath) -> geomrect.GeomRectF []
-    todo("font-nv.fontglyf.bounds_from_points")
+    var px: [Float] = []
+    var py: [Float] = []
+    var cx = 0.0
+    var cy = 0.0
+    for c in svgpath.commands_of(p)
+        match c
+            SvgMoveTo(x, y)                  =>
+                cx = x
+                cy = y
+                list.push(px, x)
+                list.push(py, y)
+            SvgLineTo(x, y)                  =>
+                cx = x
+                cy = y
+                list.push(px, x)
+                list.push(py, y)
+            SvgQuadTo(x1, y1, x, y)          =>
+                quad_extremes(var px, var py, cx, cy, x1, y1, x, y)
+                cx = x
+                cy = y
+                list.push(px, x)
+                list.push(py, y)
+            SvgCubicTo(x1, y1, x2, y2, x, y) =>
+                list.push(px, x1)
+                list.push(py, y1)
+                list.push(px, x2)
+                list.push(py, y2)
+                cx = x
+                cy = y
+                list.push(px, x)
+                list.push(py, y)
+            _                                => ()
+    if list.len(px) == 0
+        return geomrect.empty()
+    var lo_x = px[0]
+    var hi_x = px[0]
+    var lo_y = py[0]
+    var hi_y = py[0]
+    for i in 1..list.len(px)
+        lo_x = if px[i] < lo_x
+            px[i]
+        else
+            lo_x
+        hi_x = if px[i] > hi_x
+            px[i]
+        else
+            hi_x
+        lo_y = if py[i] < lo_y
+            py[i]
+        else
+            lo_y
+        hi_y = if py[i] > hi_y
+            py[i]
+        else
+            hi_y
+    geomrect.of_xywh(lo_x, lo_y, hi_x - lo_x, hi_y - lo_y)
+// Add the points where a quadratic from `(x0, y0)` through the control
+// `(x1, y1)` to `(x2, y2)` reaches an extreme along either axis.
+fn quad_extremes(var px: [Float], var py: [Float], x0: Float, y0: Float, x1: Float, y1: Float,
+                 x2: Float, y2: Float)
+    let tx = turning(x0, x1, x2)
+    if tx > 0.0 and tx < 1.0
+        list.push(px, quad_at(x0, x1, x2, tx))
+        list.push(py, quad_at(y0, y1, y2, tx))
+    let ty = turning(y0, y1, y2)
+    if ty > 0.0 and ty < 1.0
+        list.push(px, quad_at(x0, x1, x2, ty))
+        list.push(py, quad_at(y0, y1, y2, ty))
+
+// The parameter where one coordinate of a quadratic stops rising or
+// falling, or -1 when it never does.
+fn turning(a: Float, b: Float, c: Float) -> Float
+    let denom = a - 2.0 * b + c
+    if denom == 0.0
+        return 0.0 - 1.0
+    (a - b) / denom
+
+// One coordinate of a quadratic at parameter `t`.
+fn quad_at(a: Float, b: Float, c: Float, t: Float) -> Float
+    let u = 1.0 - t
+    u * u * a + 2.0 * u * t * b + t * t * c
 
 // How many points a simple glyph has, without building its outline.
 //
 // For a subsetter or a reporter measuring a font; also the number a
 // caller sizing a buffer needs.
 pub fn point_count(glyph: Bytes) -> Int []
-    todo("font-nv.fontglyf.point_count")
+    let n = contour_count(glyph)
+    if n <= 0 or bytes.len(glyph) < 10 + 2 * n
+        return 0
+    u16_at(glyph, 10 + 2 * n - 2) + 1
 
 // ── Composites ───────────────────────────────────────────────────────
 
@@ -207,7 +479,94 @@ pub fn point_count(glyph: Bytes) -> Int []
 // Empty for a simple or empty glyph, so a caller can ask without
 // checking the kind first.
 pub fn components(glyph: Bytes) -> Result<[FontComponent], fonterror.FontFault> []
-    todo("font-nv.fontglyf.components")
+    if contour_count(glyph) >= 0
+        return Ok([])
+    let have = bytes.len(glyph)
+    var out: [FontComponent] = []
+    var at = 10
+    var more = true
+    while more
+        if at + 4 > have
+            return Err(fontsrc.short(fontdir.tag_glyf(), at + 4, have))
+        let flags = u16_at(glyph, at)
+        let id = u16_at(glyph, at + 2)
+        at += 4
+        let words = (flags & 1) != 0
+        let width = if words
+            2
+        else
+            1
+        let transform_len = if (flags & 8) != 0
+            2
+        else
+            if (flags & 64) != 0
+                4
+            else
+                if (flags & 128) != 0
+                    8
+                else
+                    0
+        if at + 2 * width + transform_len > have
+            return Err(fontsrc.short(fontdir.tag_glyf(), at + 2 * width + transform_len, have))
+        let xy = (flags & 2) != 0
+        var arg1 = 0
+        var arg2 = 0
+        if words
+            arg1 = if xy
+                i16_at(glyph, at)
+            else
+                u16_at(glyph, at)
+            arg2 = if xy
+                i16_at(glyph, at + 2)
+            else
+                u16_at(glyph, at + 2)
+        else
+            arg1 = if xy
+                signed8(glyph, at)
+            else
+                bytes.byte_at(glyph, at) ?? 0
+            arg2 = if xy
+                signed8(glyph, at + 1)
+            else
+                bytes.byte_at(glyph, at + 1) ?? 0
+        at += 2 * width
+        var a = 1.0
+        var b = 0.0
+        var c = 0.0
+        var d = 1.0
+        if (flags & 8) != 0
+            a = f2dot14(glyph, at)
+            d = a
+        else if (flags & 64) != 0
+            a = f2dot14(glyph, at)
+            d = f2dot14(glyph, at + 2)
+        else if (flags & 128) != 0
+            a = f2dot14(glyph, at)
+            b = f2dot14(glyph, at + 2)
+            c = f2dot14(glyph, at + 4)
+            d = f2dot14(glyph, at + 6)
+        at += transform_len
+        var e = 0.0
+        var f = 0.0
+        if xy
+            e = arg1 as Float
+            f = arg2 as Float
+            if (flags & 0x800) != 0 and (flags & 0x1000) == 0
+                e = a * arg1 as Float + c * arg2 as Float
+                f = b * arg1 as Float + d * arg2 as Float
+        list.push(out, FontComponent { glyph: id, xform: geomxform.of_matrix(a, b, c, d, e, f),
+                                       point_match: not xy, parent_point: (if xy then 0 else arg1),
+                                       child_point: (if xy then 0 else arg2),
+                                       use_my_metrics: (flags & 0x200) != 0,
+                                       scaled_offset: (flags & 0x800) != 0 and (flags & 0x1000) == 0 })
+        more = (flags & 0x20) != 0
+    Ok(out)
+// The signed byte at `off`, or 0 past the end.
+fn signed8(data: Bytes, off: Int) -> Int
+    let v = bytes.byte_at(data, off) ?? 0
+    if v >= 128
+        return v - 256
+    v
 
 // Place resolved component outlines into one path.
 //
@@ -223,7 +582,18 @@ pub fn components(glyph: Bytes) -> Result<[FontComponent], fonterror.FontFault> 
 // `FontBadField`.
 pub fn compose(glyph: Bytes,
                parts: [svgpath.SvgPath]) -> Result<svgpath.SvgPath, fonterror.FontFault> []
-    todo("font-nv.fontglyf.compose")
+    let comps = components(glyph)!
+    if list.len(parts) > list.len(comps)
+        return Err(FontComponentMissing(list.len(comps), list.len(parts)))
+    if list.len(parts) < list.len(comps)
+        return Err(FontComponentMissing(comps[list.len(parts)].glyph, list.len(parts)))
+    var cmds: [SvgPathCmd] = []
+    for i in 0..list.len(comps)
+        if comps[i].point_match
+            return Err(FontBadField(fontdir.tag_glyf(), "pointMatch", comps[i].glyph))
+        for cmd in svgpath.commands_of(svgpath.transform(parts[i], comps[i].xform))
+            list.push(cmds, cmd)
+    Ok(svgpath.of_commands(cmds))
 
 // Which component's metrics the composite takes, or -1 when none is
 // flagged.
@@ -233,14 +603,20 @@ pub fn compose(glyph: Bytes,
 // out with the accent's advance is a visible bug that only appears in
 // the fonts that use the flag.
 pub fn metrics_component(comps: [FontComponent]) -> Int []
-    todo("font-nv.fontglyf.metrics_component")
+    for i in 0..list.len(comps)
+        if comps[i].use_my_metrics
+            return i
+    0 - 1
 
 // Every glyph id a composite names, one level deep.
 //
 // The list a caller feeds back to its source, and what a subsetter
 // walks transitively to find a glyph's closure.
 pub fn component_glyphs(comps: [FontComponent]) -> [Int] []
-    todo("font-nv.fontglyf.component_glyphs")
+    var out: [Int] = []
+    for c in comps
+        list.push(out, c.glyph)
+    out
 
 // Whether a composite names itself at this level.
 //
@@ -248,4 +624,7 @@ pub fn component_glyphs(comps: [FontComponent]) -> [Int] []
 // through two glyphs — is what `component_limit` catches, and
 // `FontCompositeTooDeep` is what both answer with.
 pub fn names_itself(glyph_id: Int, comps: [FontComponent]) -> Bool []
-    todo("font-nv.fontglyf.names_itself")
+    for c in comps
+        if c.glyph == glyph_id
+            return true
+    false
